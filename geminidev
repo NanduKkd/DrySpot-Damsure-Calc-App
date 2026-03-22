@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export GEMINI_SYSTEM_MD="$SCRIPT_DIR/.gemini/system-dev.md"
+
+exec gemini "$@"

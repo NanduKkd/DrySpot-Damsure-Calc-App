@@ -1,0 +1,34 @@
+{
+  "name": "orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Development orchestrator for Flutter + Node.js AI agents",
+  "scripts": {
+    "ba": "./geminiba",
+    "bugs": "./geminibug-reproducer",
+    "flow:feature": "./scripts/run-post-ba-flow.sh",
+    "flow:bug": "./scripts/run-post-bug-flow.sh",
+    "dev": "./scripts/run-dev.sh",
+    "dev:detach": "./scripts/run-dev.sh --detach",
+    "dev:stop": "./scripts/run-dev.sh --stop",
+    "dev:flutter": "cd flutter && flutter run",
+    "dev:backend": "cd backend && npm run dev",
+    "logs": "./scripts/view-logs.sh",
+    "logs:flutter": "./scripts/view-logs.sh flutter -f",
+    "logs:backend": "./scripts/view-logs.sh backend -f",
+    "test": "./scripts/test-summary.sh",
+    "test:flutter": "./scripts/test-summary.sh flutter",
+    "test:backend": "./scripts/test-summary.sh backend",
+    "test:flutter:unit": "./scripts/test-summary.sh flutter unit",
+    "test:flutter:integration": "./scripts/test-summary.sh flutter integration",
+    "test:backend:unit": "./scripts/test-summary.sh backend unit",
+    "test:backend:integration": "./scripts/test-summary.sh backend integration",
+    "setup": "./setup.sh",
+    "lint": "npm run lint:flutter && npm run lint:backend",
+    "lint:flutter": "cd flutter && flutter analyze",
+    "lint:backend": "cd backend && npm run lint"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}

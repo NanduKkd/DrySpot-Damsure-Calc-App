@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUG_REPORT_FILE="$SCRIPT_DIR/docs/current/bug-report.md"
+export GEMINI_SYSTEM_MD="$SCRIPT_DIR/.gemini/system-bug-reproducer.md"
+
+gemini "$@"
+
+if [ "${GEMINI_AUTO_CHAIN:-1}" = "1" ] && [ -f "$BUG_REPORT_FILE" ] && grep -q 'READY_FOR_BUGFIX' "$BUG_REPORT_FILE"; then
+	"$SCRIPT_DIR/scripts/run-post-bug-flow.sh"
+fi
