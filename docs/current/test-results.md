@@ -1,17 +1,42 @@
-# Test Results: Bug Batch
+# Test Results: Warranty & Proposal PDF Update
 
-## 1. Keyboard Dismissal on New Row Creation (Regression)
-- **Command:** `cd flutter && flutter test test/widgets/item_detail_keyboard_bug_test.dart`
-- **Status:** **PASS** (in widget tests)
-- **Notes:** The widget test passes because `testWidgets` does not simulate the system keyboard dismissal when a widget loses its tree position (which happens when inserting a new `ListTile` pushes the entry `TextField` to index `N+1` without a `Key`). The `FocusNode.hasFocus` remains true in tests, but detaching unkeyed `TextFields` from the element tree causes actual devices to dismiss the soft keyboard. 
-- **Developer Action:** The Developer needs to ensure the "New Entry Row" is either wrapped with a unique `Key` or pulled entirely out of the `ListView.builder` (e.g., as the last child of a parent `Column`) to prevent unmounting and subsequent keyboard dismissal.
+This document records the execution of the test cases defined in the test plan.
 
-## 2. Sync fails due to empty email validation error
-- **Command:** `cd backend && npm test -- src/controllers/syncController_email.test.ts`
-- **Status:** **FAIL**
-- **Notes:** The test successfully reproduces the bug. Sending a client update with `email: ""` throws a 500 server error because of `SequelizeValidationError: Validation isEmail on email failed`.
-- **Developer Action:** The Developer needs to update the backend validation or sync logic to allow empty strings `""` for the `email` field (e.g., by converting `""` to `null` before upserting, or changing the model definition to allow empty strings).
+## 1. Summary
 
----
+| Test Area | Status | Notes |
+| :--- | :--- | :--- |
+| Backend Tests | PENDING | Baseline tests pass; new tests not yet created. |
+| Flutter Tests | PENDING | Baseline tests pass; new tests not yet created. |
+| Integration Tests | PENDING | UI and integration tests not yet run. |
 
-`READY_FOR_DEV`
+## 2. Baseline Status
+
+Before starting the new implementation, existing tests were run to ensure a stable baseline.
+
+- **Backend Baseline**: `npm --prefix backend run test` -> **PASS**
+- **Flutter Baseline**: `cd flutter && flutter test` -> **PASS**
+
+## 3. Execution Logs
+
+### 2026-04-08 10:00:00 (Baseline Verification)
+
+| ID | Status | Command | Result |
+| :--- | :--- | :--- | :--- |
+| BASE-BE | PASS | `npm --prefix backend run test` | 8/8 passed, 15 tests total. |
+| BASE-FL | PASS | `cd flutter && flutter test` | 56 tests passed. |
+
+## 4. Pending/Blocked Tests (New Features)
+
+| ID | Status | Reason |
+| :--- | :--- | :--- |
+| BE-1 | PENDING | `Proposal` model does not exist yet. |
+| BE-2 | PENDING | `uploadWarranty` logic not yet updated. |
+| BE-3 | PENDING | `sync` logic for PDFs not yet implemented. |
+| FL-1 | PENDING | `proposals` table and model do not exist yet. |
+| FL-2 | PENDING | `SyncService` update pending. |
+| FL-3 | PENDING | `WarrantyFormScreen` does not exist yet. |
+| FL-4 | PENDING | `PdfManagementScreen` does not exist yet. |
+| FL-5 | PENDING | UI logic for one-warranty constraint pending. |
+
+READY_FOR_DEV

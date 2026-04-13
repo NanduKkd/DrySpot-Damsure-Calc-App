@@ -1,27 +1,19 @@
 # Bugfix Status
 
-## Fixed Bugs
-1. **Keyboard not appearing for a new row in the item details screen:** Fixed by pulling the "New Entry Row" out of the `ListView.builder` in `item_detail_screen.dart` and placing it below inside the `Column`. This ensures the input fields maintain their widget identity and don't unmount, allowing them to retain keyboard focus seamlessly.
-2. **Sync fails due to empty email validation error:** Fixed by adding a setter to the `email` field in the `backend/src/models/Client.ts` model. The setter gracefully converts empty strings (`""`) to `null`, ensuring the input correctly passes the strict `isEmail` validation schema.
+## Issue Addressed
+Sync Failure: `NoSuchMethodError` calling `toDouble` on `String`.
 
-## Commands Run
-- `cd backend && npm test -- src/controllers/syncController_email.test.ts`
-- `npm run lint`
-- `cd flutter && flutter test`
-- `cd flutter && flutter test integration_test`
-- `cd backend && npm test -- --runInBand`
-- `cd backend && npm run build`
+## Root Cause
+The `fromMap` and `fromJson` constructors for the Flutter models (`Client`, `Item`, `Rectangle`, and `DefaultPrice`) were strictly casting numeric fields dynamically or calling `.toDouble()` blindly. This caused crashes during deserialization when string representations of numbers were processed.
 
-## Results
-- `cd backend && npm test -- src/controllers/syncController_email.test.ts`: PASS
-- `npm run lint`: PASS (Flutter cleanly passes, minor standard ESLint warnings present in backend)
-- `cd flutter && flutter test`: PASS
-- `cd flutter && flutter test integration_test`: PASS
-- `cd backend && npm test -- --runInBand`: PASS
-- `cd backend && npm run build`: PASS
+## Fix Implemented
+Updated the parsing logic across affected models to robustly handle both string and numeric types using `double.tryParse`.
 
-## Remaining Blockers
-- None.
+## Verification Commands
+1. `npm run lint` (PASS)
+2. `cd flutter && flutter test` (PASS)
+3. `cd flutter && flutter test integration_test` (PASS)
+4. `cd backend && npm test -- --runInBand` (PASS)
+5. `cd backend && npm run build` (PASS)
 
-## Status
-`READY_FOR_APP_TESTING`
+READY_FOR_APP_TESTING

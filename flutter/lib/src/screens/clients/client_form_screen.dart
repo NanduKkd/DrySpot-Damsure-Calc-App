@@ -17,6 +17,7 @@ class _ClientFormScreenState extends State<ClientFormScreen> {
   final _formKey = GlobalKey<FormState>();
   late String _name;
   String? _address;
+  String? _siteAddress;
   String? _email;
   String? _phone;
   double? _latitude;
@@ -27,6 +28,7 @@ class _ClientFormScreenState extends State<ClientFormScreen> {
     super.initState();
     _name = widget.client?.name ?? '';
     _address = widget.client?.address;
+    _siteAddress = widget.client?.siteAddress;
     _email = widget.client?.email;
     _phone = widget.client?.phone;
     _latitude = widget.client?.latitude;
@@ -59,6 +61,7 @@ class _ClientFormScreenState extends State<ClientFormScreen> {
         franchiseeId: auth.franchiseeId,
         name: _name,
         address: _address,
+        siteAddress: _siteAddress,
         email: _email,
         phone: _phone,
         latitude: _latitude,
@@ -96,6 +99,11 @@ class _ClientFormScreenState extends State<ClientFormScreen> {
                 initialValue: _address,
                 decoration: const InputDecoration(labelText: 'Address'),
                 onSaved: (v) => _address = v,
+              ),
+              TextFormField(
+                initialValue: _siteAddress,
+                decoration: const InputDecoration(labelText: 'Site Address'),
+                onSaved: (v) => _siteAddress = v,
               ),
               TextFormField(
                 initialValue: _email,

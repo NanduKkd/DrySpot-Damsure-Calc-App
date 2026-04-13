@@ -6,6 +6,7 @@ export class Client extends Model {
   public franchiseeId!: string;
   public name!: string;
   public address!: string;
+  public siteAddress!: string | null;
   public email!: string;
   public phone!: string;
   public latitude!: number;
@@ -32,6 +33,10 @@ Client.init(
       allowNull: false,
     },
     address: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    siteAddress: {
       type: DataTypes.STRING,
       allowNull: true,
     },

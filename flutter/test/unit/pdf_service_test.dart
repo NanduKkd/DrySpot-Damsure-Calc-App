@@ -7,7 +7,8 @@ import 'package:app_client/src/models/rectangle.dart';
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
-class MockPathProvider extends PathProviderPlatform with MockPlatformInterfaceMixin {
+class MockPathProvider extends PathProviderPlatform
+    with MockPlatformInterfaceMixin {
   @override
   Future<String?> getTemporaryPath() async {
     return Directory.systemTemp.path;
@@ -27,6 +28,7 @@ void main() {
       remoteId: 'c1',
       name: 'John Doe',
       address: '123 Main St',
+      siteAddress: '456 Site Rd',
       email: 'john@example.com',
       updatedAt: DateTime.now(),
       items: [
@@ -39,11 +41,21 @@ void main() {
       ],
     );
 
-    final file = await pdfService.generateWarrantyPdf(client, DateTime.now(), 5);
-    
+    final file = await pdfService.generateWarrantyPdf(
+      client: client,
+      customerName: client.name,
+      customerAddress: client.address ?? '',
+      siteAddress: client.siteAddress ?? '',
+      mobileNumber: client.phone ?? '',
+      startDate: DateTime.now(),
+      durationYears: 5,
+      franchiseeName: 'Test Franchisee',
+      warrantyCardNumber: 'WARR-001',
+    );
+
     expect(await file.exists(), isTrue);
     expect(file.path, contains('warranty_c1.pdf'));
-    
+
     // Clean up
     await file.delete();
   });
@@ -68,10 +80,10 @@ void main() {
     );
 
     final file = await pdfService.generateProposalPdf(client);
-    
+
     expect(await file.exists(), isTrue);
     expect(file.path, contains('proposal_c2.pdf'));
-    
+
     // Clean up
     await file.delete();
   });

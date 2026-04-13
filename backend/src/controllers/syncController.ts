@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import { Op } from 'sequelize';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { Client, Item, Rectangle, DefaultPrice, sequelize } from '../models';
+import { Client, Item, Rectangle, DefaultPrice, Warranty, Proposal, sequelize } from '../models';
 
 export const sync = async (req: AuthRequest, res: Response) => {
   const { last_sync_time, changes } = req.body;
@@ -21,7 +21,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
       // Upsert Clients
       if (changes.clients && changes.clients.length > 0) {
         for (const clientData of changes.clients) {
-          const { remote_id, deleted_at, discounted_price, ...rest } = clientData;
+          const { remote_id, deleted_at, discounted_price, site_address, ...rest } = clientData;
           
           if (deleted_at) {
               await Client.destroy({ where: { id: remote_id, franchiseeId }, transaction });
@@ -30,6 +30,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
                   id: remote_id,
                   franchiseeId,
                   discountedPrice: discounted_price,
+                  siteAddress: site_address,
                   ...rest
               }, { transaction });
           }
@@ -86,6 +87,45 @@ export const sync = async (req: AuthRequest, res: Response) => {
           }
         }
       }
+
+      // Upsert Warranties
+      if (changes.warranties && changes.warranties.length > 0) {
+        for (const wData of changes.warranties) {
+          const { remote_id, client_id, deleted_at, start_date, duration_years, pdf_url, warranty_card_number, ...rest } = wData;
+          
+          if (deleted_at) {
+            await Warranty.destroy({ where: { id: remote_id }, transaction });
+          } else {
+            await Warranty.upsert({
+              id: remote_id,
+              clientId: client_id,
+              startDate: start_date,
+              durationYears: duration_years,
+              pdfUrl: pdf_url,
+              warrantyCardNumber: warranty_card_number,
+              ...rest
+            }, { transaction });
+          }
+        }
+      }
+
+      // Upsert Proposals
+      if (changes.proposals && changes.proposals.length > 0) {
+        for (const pData of changes.proposals) {
+          const { remote_id, client_id, deleted_at, pdf_url, ...rest } = pData;
+          
+          if (deleted_at) {
+            await Proposal.destroy({ where: { id: remote_id }, transaction });
+          } else {
+            await Proposal.upsert({
+              id: remote_id,
+              clientId: client_id,
+              pdfUrl: pdf_url,
+              ...rest
+            }, { transaction });
+          }
+        }
+      }
     }
 
     await transaction.commit();
@@ -101,13 +141,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
       paranoid: false,
     });
 
-    // Also need items and rectangles related to the franchisee's clients
-    // But since clients can be updated without their items being updated,
-    // and items can be updated without their clients being updated,
-    // we should ideally fetch all items/rectangles updated after syncTime
-    // that belong to the franchisee's clients.
-
-    // Get all client IDs for this franchisee to filter items and rectangles
+    // Get all client IDs for this franchisee to filter child entities
     const allFranchiseeClients = await Client.findAll({
         where: { franchiseeId },
         attributes: ['id'],
@@ -146,6 +180,22 @@ export const sync = async (req: AuthRequest, res: Response) => {
       paranoid: false,
     });
 
+    const updatedWarranties = await Warranty.findAll({
+      where: {
+        clientId: { [Op.in]: allClientIds },
+        updatedAt: { [Op.gt]: syncTime },
+      },
+      paranoid: false,
+    });
+
+    const updatedProposals = await Proposal.findAll({
+      where: {
+        clientId: { [Op.in]: allClientIds },
+        updatedAt: { [Op.gt]: syncTime },
+      },
+      paranoid: false,
+    });
+
     return res.json({
       server_time: serverTime,
       updates: {
@@ -159,6 +209,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
           longitude: c.longitude,
           photos: c.photos,
           discounted_price: c.discountedPrice,
+          site_address: (c as any).siteAddress,
           updated_at: c.updatedAt.toISOString(),
           deleted_at: c.deletedAt ? c.deletedAt.toISOString() : null,
         })),
@@ -186,10 +237,27 @@ export const sync = async (req: AuthRequest, res: Response) => {
           updated_at: dp.updatedAt.toISOString(),
           deleted_at: dp.deletedAt ? dp.deletedAt.toISOString() : null,
         })),
+        warranties: updatedWarranties.map(w => ({
+          remote_id: w.id,
+          client_id: w.clientId,
+          start_date: w.startDate.toISOString(),
+          duration_years: w.durationYears,
+          pdf_url: w.pdfUrl,
+          warranty_card_number: w.warrantyCardNumber,
+          updated_at: w.updatedAt.toISOString(),
+          deleted_at: w.deletedAt ? w.deletedAt.toISOString() : null,
+        })),
+        proposals: updatedProposals.map(p => ({
+          remote_id: p.id,
+          client_id: p.clientId,
+          pdf_url: p.pdfUrl,
+          updated_at: p.updatedAt.toISOString(),
+          deleted_at: p.deletedAt ? p.deletedAt.toISOString() : null,
+        })),
       },
     });
   } catch (error) {
-    await transaction.rollback();
+    if (transaction) await transaction.rollback();
     console.error('Sync error:', error);
     return res.status(500).json({ error: 'An error occurred during sync' });
   }

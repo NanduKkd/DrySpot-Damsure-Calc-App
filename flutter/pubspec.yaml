@@ -20,6 +20,8 @@ dependencies:
   path_provider: ^2.1.2
   geolocator: ^11.0.0
   share_plus: ^9.0.0
+  printing: ^5.13.1
+  open_filex: ^4.7.0
 
 dev_dependencies:
   flutter_test:
@@ -35,3 +37,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/pdf-images/

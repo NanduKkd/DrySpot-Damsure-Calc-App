@@ -13,6 +13,7 @@ build/
 *.tgz
 flutter/build/
 flutter/.dart_tool/
+artifacts/
 
 # Logs
 logs/
@@ -45,3 +46,6 @@ Thumbs.db
 
 # Misc
 *.tsbuildinfo
+.codex/
+.gemini/
+backend/uploads/

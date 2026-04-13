@@ -1,19 +1,88 @@
 import 'dart:convert';
+
 import 'package:http/http.dart' as http;
-import '../models/warranty.dart';
+import 'package:http_parser/http_parser.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../config/app_config.dart';
 
 class ApiService {
-  final String baseUrl = 'http://localhost:3000/api';
+  static const _serverUrlKey = 'server_url';
+
+  ApiService({String? serverUrl})
+      : _serverUrl = normalizeServerUrl(
+          serverUrl ?? AppConfig.defaultServerUrl,
+        );
+
+  String _serverUrl;
   String? _token;
+
+  String get serverUrl => _serverUrl;
+  String get baseUrl => '$_serverUrl/api';
 
   void setToken(String token) {
     _token = token;
   }
 
+  Future<void> loadServerUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedServerUrl = prefs.getString(_serverUrlKey);
+
+    if (savedServerUrl == null || savedServerUrl.trim().isEmpty) {
+      return;
+    }
+
+    _serverUrl = normalizeServerUrl(savedServerUrl);
+  }
+
+  Future<void> setServerUrl(String serverUrl) async {
+    _serverUrl = normalizeServerUrl(serverUrl);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_serverUrlKey, _serverUrl);
+  }
+
+  static String normalizeServerUrl(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      throw const FormatException('Server URL cannot be empty.');
+    }
+
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      throw const FormatException(
+        'Enter a valid http:// or https:// server URL.',
+      );
+    }
+
+    if (uri.scheme != 'http' && uri.scheme != 'https') {
+      throw const FormatException(
+        'Only http:// and https:// server URLs are supported.',
+      );
+    }
+
+    final segments =
+        uri.pathSegments.where((segment) => segment.isNotEmpty).toList();
+    if (segments.isNotEmpty && segments.last == 'api') {
+      segments.removeLast();
+    }
+
+    final normalizedPath = segments.isEmpty ? '' : '/${segments.join('/')}';
+
+    return uri
+        .replace(
+          path: normalizedPath,
+          query: null,
+          fragment: null,
+        )
+        .toString()
+        .replaceFirst(RegExp(r'/$'), '');
+  }
+
   Map<String, String> get _headers => {
-    'Content-Type': 'application/json',
-    if (_token != null) 'Authorization': 'Bearer $_token',
-  };
+        'Content-Type': 'application/json',
+        if (_token != null) 'Authorization': 'Bearer $_token',
+      };
 
   Future<Map<String, dynamic>> login(String email, String password) async {
     final response = await http.post(
@@ -43,32 +112,65 @@ class ApiService {
     }
   }
 
-  Future<Warranty> uploadWarranty(Map<String, dynamic> data) async {
-    // In a real app, this would be a multipart request
-    final response = await http.post(
-      Uri.parse('$baseUrl/warranty/upload'),
-      headers: _headers,
-      body: jsonEncode(data),
-    );
+  Future<Map<String, dynamic>> uploadWarranty(
+      String filePath, Map<String, String> fields) async {
+    final request =
+        http.MultipartRequest('POST', Uri.parse('$baseUrl/warranty/upload'));
+    request.headers.addAll({
+      if (_token != null) 'Authorization': 'Bearer $_token',
+    });
+    request.files.add(await http.MultipartFile.fromPath(
+      'file',
+      filePath,
+      contentType: MediaType('application', 'pdf'),
+    ));
+    request.fields.addAll(fields);
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
 
     if (response.statusCode == 201) {
-      return Warranty.fromJson(jsonDecode(response.body));
+      return jsonDecode(response.body);
     } else {
-      throw Exception(jsonDecode(response.body)['error'] ?? 'Failed to upload warranty');
+      throw Exception(
+          jsonDecode(response.body)['error'] ?? 'Failed to upload warranty');
     }
   }
 
-  Future<List<Warranty>> getWarranties(String clientId) async {
-    final response = await http.get(
-      Uri.parse('$baseUrl/warranty/client/$clientId'),
+  Future<Map<String, dynamic>> uploadProposal(
+      String filePath, Map<String, String> fields) async {
+    final request =
+        http.MultipartRequest('POST', Uri.parse('$baseUrl/proposal/upload'));
+    request.headers.addAll({
+      if (_token != null) 'Authorization': 'Bearer $_token',
+    });
+    request.files.add(await http.MultipartFile.fromPath(
+      'file',
+      filePath,
+      contentType: MediaType('application', 'pdf'),
+    ));
+    request.fields.addAll(fields);
+
+    final streamedResponse = await request.send();
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 201) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception(
+          jsonDecode(response.body)['error'] ?? 'Failed to upload proposal');
+    }
+  }
+
+  Future<void> deleteProposal(String id) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/proposal/$id'),
       headers: _headers,
     );
 
-    if (response.statusCode == 200) {
-      final List<dynamic> data = jsonDecode(response.body);
-      return data.map((json) => Warranty.fromJson(json)).toList();
-    } else {
-      throw Exception(jsonDecode(response.body)['error'] ?? 'Failed to get warranties');
+    if (response.statusCode != 204) {
+      throw Exception(
+          jsonDecode(response.body)['error'] ?? 'Failed to delete proposal');
     }
   }
 }

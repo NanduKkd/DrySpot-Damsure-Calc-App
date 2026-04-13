@@ -8,6 +8,7 @@ class Client {
   final String? franchiseeId;
   final String name;
   final String? address;
+  final String? siteAddress;
   final String? email;
   final String? phone;
   final double? latitude;
@@ -25,6 +26,7 @@ class Client {
     this.franchiseeId,
     required this.name,
     this.address,
+    this.siteAddress,
     this.email,
     this.phone,
     this.latitude,
@@ -62,6 +64,7 @@ class Client {
       'franchisee_id': franchiseeId,
       'name': name,
       'address': address,
+      'site_address': siteAddress,
       'email': email,
       'phone': phone,
       'latitude': latitude,
@@ -82,12 +85,13 @@ class Client {
       franchiseeId: map['franchisee_id']?.toString(),
       name: map['name'] ?? 'Unknown',
       address: map['address'],
+      siteAddress: map['site_address'],
       email: map['email'],
       phone: map['phone'],
-      latitude: map['latitude']?.toDouble(),
-      longitude: map['longitude']?.toDouble(),
+      latitude: map['latitude'] != null ? double.tryParse(map['latitude'].toString()) : null,
+      longitude: map['longitude'] != null ? double.tryParse(map['longitude'].toString()) : null,
       photos: List<String>.from(jsonDecode(map['photos'] ?? '[]')),
-      discountedPrice: map['discounted_price']?.toDouble(),
+      discountedPrice: map['discounted_price'] != null ? double.tryParse(map['discounted_price'].toString()) : null,
       isDirty: map['is_dirty'] == 1,
       updatedAt: DateTime.parse(map['updated_at']),
       deletedAt:
@@ -102,6 +106,7 @@ class Client {
     String? franchiseeId,
     String? name,
     String? address,
+    String? siteAddress,
     String? email,
     String? phone,
     double? latitude,
@@ -120,6 +125,7 @@ class Client {
       franchiseeId: franchiseeId ?? this.franchiseeId,
       name: name ?? this.name,
       address: address ?? this.address,
+      siteAddress: siteAddress ?? this.siteAddress,
       email: email ?? this.email,
       phone: phone ?? this.phone,
       latitude: latitude ?? this.latitude,

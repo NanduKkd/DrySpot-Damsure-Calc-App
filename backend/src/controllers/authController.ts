@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
+import { Franchisee } from '../models/Franchisee';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
 
@@ -9,7 +10,10 @@ export const login = async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   try {
-    const user = await User.findOne({ where: { email } });
+    const user = await User.findOne({ 
+      where: { email },
+      include: [{ model: Franchisee }]
+    });
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -34,6 +38,7 @@ export const login = async (req: Request, res: Response) => {
         name: user.name,
         email: user.email,
         franchisee_id: user.franchiseeId,
+        franchisee_name: (user as any).Franchisee?.name,
       },
     });
   } catch (error) {

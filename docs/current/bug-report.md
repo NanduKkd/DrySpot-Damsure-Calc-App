@@ -1,54 +1,29 @@
 # Bug Report
 
-## Bug 1: Keyboard not appearing for a new row in the item details screen (Regression)
+## 1. Bug Title
+Sync Failure: NoSuchMethodError calling `toDouble` on String
 
-### Steps to Reproduce
-1. Navigate to an item details screen.
-2. Enter a value in the length input field.
-3. Enter a value in the width input field.
-4. Tap the "Next" or "Done" key on the soft keyboard.
+## 2. Steps to reproduce
+1. Ensure there is existing data containing decimal/numerical values stored as strings (e.g., "60.00") in the backend database.
+2. Log into the app on the emulator.
+3. Navigate to the "Sync" page.
+4. Press the "Sync now" button.
 
-### Expected Behavior
-A new row is added, focus automatically shifts to the first input of the new row, and the soft keyboard remains visible.
+## 3. Expected behavior
+The synchronization should complete successfully, and all data from the database should be visible on the phone.
 
-### Actual Behavior
-A new row appears with the previously entered length and width, but the keyboard dismisses/does not appear for the newly focused row. (Note: This is a regression / not fully fixed from a previous attempt).
+## 4. Actual behavior
+The sync process fails with the following error message:
+`Error: NoSuchMethodError: Class String has no instance methof toDouble. Receiver: "60.00"`
 
-### Environment
-* Platform: Flutter App (iOS/Android UI)
+## 5. Environment
+- **Device/Platform:** Android Emulator
 
-### Severity / Impact
-* Moderate - Disrupts the user's data entry flow, requiring them to manually tap the next field to bring the keyboard back up.
+## 6. Severity / impact
+High - Prevents data synchronization from the backend to the mobile app, blocking core data retrieval functionality.
 
-### Evidence
-* User reported that previous fix did not resolve the issue.
-
----
-
-## Bug 2: Sync fails due to empty email validation error
-
-### Steps to Reproduce
-1. Have a client record with an empty or missing email address (or other non-required fields).
-2. Go to the Sync screen in the app.
-3. Press the "Sync Now" button.
-
-### Expected Behavior
-The sync process should complete successfully. Empty optional fields (like email) should be accepted or properly handled as `null`/empty strings without failing validation.
-
-### Actual Behavior
-Sync fails with the error message: 
-`Sync error: ValidationError [SequelizeValidationError]: Validation error: Validation isEmail on email failed`
-
-### Environment
-* Backend: Node.js (Sequelize ORM)
-* App: Flutter Sync Module
-
-### Severity / Impact
-* High - Blocks synchronization entirely for users who have created clients without an email address.
-
-### Evidence
-* Error log: `ValidationError [SequelizeValidationError]: Validation error: Validation isEmail on email failed`
-
----
+## 7. Evidence or missing evidence
+- Error trace: `Error: NoSuchMethodError: Class String has no instance methof toDouble. Receiver: "60.00"`
+- Note for developer: Indicates a Dart type parsing issue. A string value is receiving a `.toDouble()` call, which doesn't exist on the `String` class. `double.parse()` or `double.tryParse()` should likely be used instead.
 
 READY_FOR_BUGFIX

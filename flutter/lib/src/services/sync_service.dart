@@ -4,12 +4,15 @@ import 'db_service.dart';
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/rectangle.dart';
+import '../models/warranty.dart';
+import '../models/proposal.dart';
 
 class SyncService {
   final ApiService apiService;
   final DbService dbService;
 
-  SyncService({required this.apiService, DbService? dbService}) : dbService = dbService ?? DbService();
+  SyncService({required this.apiService, DbService? dbService})
+      : dbService = dbService ?? DbService();
 
   Future<void> sync() async {
     final prefs = await SharedPreferences.getInstance();
@@ -19,37 +22,61 @@ class SyncService {
     final dirtyClients = await dbService.getDirtyClients();
     final dirtyItems = await dbService.getDirtyItems();
     final dirtyRectangles = await dbService.getDirtyRectangles();
+    final dirtyWarranties = await dbService.getDirtyWarranties();
+    final dirtyProposals = await dbService.getDirtyProposals();
 
     // Wait for mapping if they were async
     final resolvedItems = await Future.wait(dirtyItems.map((i) async {
-        final client = (await dbService.getClients()).firstWhere((c) => c.localId == i.clientId);
-        var map = i.toMap();
-        map['remote_id'] = i.remoteId;
-        map['client_id'] = client.remoteId;
-        return map;
+      final client = (await dbService.getClients())
+          .firstWhere((c) => c.localId == i.clientId);
+      var map = i.toMap();
+      map['remote_id'] = i.remoteId;
+      map['client_id'] = client.remoteId;
+      return map;
     }));
 
     final resolvedRectangles = await Future.wait(dirtyRectangles.map((r) async {
-        // Find item
-        final db = await dbService.database;
-        final List<Map<String, dynamic>> maps = await db.query('items', where: 'local_id = ?', whereArgs: [r.itemId]);
-        final itemRemoteId = maps.first['remote_id'];
-        var map = r.toMap();
-        map['remote_id'] = r.remoteId;
-        map['item_id'] = itemRemoteId;
-        return map;
+      // Find item
+      final db = await dbService.database;
+      final List<Map<String, dynamic>> maps = await db
+          .query('items', where: 'local_id = ?', whereArgs: [r.itemId]);
+      final itemRemoteId = maps.first['remote_id'];
+      var map = r.toMap();
+      map['remote_id'] = r.remoteId;
+      map['item_id'] = itemRemoteId;
+      return map;
+    }));
+
+    final resolvedWarranties = await Future.wait(dirtyWarranties.map((w) async {
+      final client = (await dbService.getClients())
+          .firstWhere((c) => c.localId == w.clientId);
+      var map = w.toMap();
+      map['remote_id'] = w.remoteId;
+      map['client_id'] = client.remoteId;
+      return map;
+    }));
+
+    final resolvedProposals = await Future.wait(dirtyProposals.map((p) async {
+      final client = (await dbService.getClients())
+          .firstWhere((c) => c.localId == p.clientId);
+      var map = p.toMap();
+      map['remote_id'] = p.remoteId;
+      map['client_id'] = client.remoteId;
+      return map;
     }));
 
     final syncData = {
       'last_sync_time': lastSyncTime,
       'changes': {
         'clients': dirtyClients.map((c) {
-            var map = c.toMap();
-            map['remote_id'] = c.remoteId;
-            return map;
+          var map = c.toMap();
+          map['remote_id'] = c.remoteId;
+          return map;
         }).toList(),
         'items': resolvedItems,
         'rectangles': resolvedRectangles,
+        'warranties': resolvedWarranties,
+        'proposals': resolvedProposals,
       }
     };
 
@@ -64,77 +91,136 @@ class SyncService {
       for (var clientMap in updates['clients']) {
         final remoteId = clientMap['remote_id'];
         final existingClient = await dbService.getClientByRemoteId(remoteId);
-        
+
         if (clientMap['deleted_at'] != null) {
-            if (existingClient != null) {
-                // In a real app, we might want to hard delete if it's already soft deleted on server
-                // For now, just mark it.
-                await dbService.softDeleteClient(existingClient.localId!);
-            }
+          if (existingClient != null) {
+            await dbService.softDeleteClient(existingClient.localId!);
+          }
         } else {
-            final client = Client.fromMap(clientMap);
-            if (existingClient != null) {
-                await dbService.updateClient(client.copyWith(localId: existingClient.localId, isDirty: false));
-            } else {
-                await dbService.insertClient(client.copyWith(isDirty: false));
-            }
+          final client = Client.fromMap(clientMap);
+          if (existingClient != null) {
+            await dbService.updateClient(
+                client.copyWith(localId: existingClient.localId, isDirty: false));
+          } else {
+            await dbService.insertClient(client.copyWith(isDirty: false));
+          }
         }
       }
 
       // Items
       for (var itemMap in updates['items']) {
-          final remoteId = itemMap['remote_id'];
-          final existingItem = await dbService.getItemByRemoteId(remoteId);
-          final client = await dbService.getClientByRemoteId(itemMap['client_id']);
-          
-          if (client != null) {
-              if (itemMap['deleted_at'] != null) {
-                  if (existingItem != null) {
-                      await dbService.softDeleteItem(existingItem.localId!);
-                  }
-              } else {
-                  final item = Item.fromMap(itemMap).copyWith(clientId: client.localId, isDirty: false);
-                  if (existingItem != null) {
-                      await dbService.updateItem(item.copyWith(localId: existingItem.localId));
-                  } else {
-                      await dbService.insertItem(item);
-                  }
-              }
+        final remoteId = itemMap['remote_id'];
+        final existingItem = await dbService.getItemByRemoteId(remoteId);
+        final client = await dbService.getClientByRemoteId(itemMap['client_id']);
+
+        if (client != null) {
+          if (itemMap['deleted_at'] != null) {
+            if (existingItem != null) {
+              await dbService.softDeleteItem(existingItem.localId!);
+            }
+          } else {
+            final item = Item.fromMap(itemMap)
+                .copyWith(clientId: client.localId, isDirty: false);
+            if (existingItem != null) {
+              await dbService
+                  .updateItem(item.copyWith(localId: existingItem.localId));
+            } else {
+              await dbService.insertItem(item);
+            }
           }
+        }
       }
 
       // Rectangles
       for (var rectMap in updates['rectangles']) {
-          final remoteId = rectMap['remote_id'];
-          final existingRect = await dbService.getRectangleByRemoteId(remoteId);
-          final item = await dbService.getItemByRemoteId(rectMap['item_id']);
+        final remoteId = rectMap['remote_id'];
+        final existingRect = await dbService.getRectangleByRemoteId(remoteId);
+        final item = await dbService.getItemByRemoteId(rectMap['item_id']);
 
-          if (item != null) {
-              if (rectMap['deleted_at'] != null) {
-                  if (existingRect != null) {
-                      await dbService.softDeleteRectangle(existingRect.localId!);
-                  }
-              } else {
-                  final rect = Rectangle.fromMap(rectMap).copyWith(itemId: item.localId, isDirty: false);
-                  if (existingRect != null) {
-                      await dbService.updateRectangle(rect.copyWith(localId: existingRect.localId));
-                  } else {
-                      await dbService.insertRectangle(rect);
-                  }
-              }
+        if (item != null) {
+          if (rectMap['deleted_at'] != null) {
+            if (existingRect != null) {
+              await dbService.softDeleteRectangle(existingRect.localId!);
+            }
+          } else {
+            final rect = Rectangle.fromMap(rectMap)
+                .copyWith(itemId: item.localId, isDirty: false);
+            if (existingRect != null) {
+              await dbService
+                  .updateRectangle(rect.copyWith(localId: existingRect.localId));
+            } else {
+              await dbService.insertRectangle(rect);
+            }
           }
+        }
+      }
+
+      // Warranties
+      for (var warrantyMap in updates['warranties'] ?? []) {
+        final remoteId = warrantyMap['remote_id'];
+        final existingWarranty = await dbService.getWarrantyByRemoteId(remoteId);
+        final client =
+            await dbService.getClientByRemoteId(warrantyMap['client_id']);
+
+        if (client != null) {
+          if (warrantyMap['deleted_at'] != null) {
+            if (existingWarranty != null) {
+              await dbService.softDeleteWarranty(existingWarranty.localId!);
+            }
+          } else {
+            final warranty = Warranty.fromMap(warrantyMap)
+                .copyWith(clientId: client.localId!, isDirty: false);
+            if (existingWarranty != null) {
+              await dbService.updateWarranty(
+                  warranty.copyWith(localId: existingWarranty.localId));
+            } else {
+              await dbService.insertWarranty(warranty);
+            }
+          }
+        }
+      }
+
+      // Proposals
+      for (var proposalMap in updates['proposals'] ?? []) {
+        final remoteId = proposalMap['remote_id'];
+        final existingProposal = await dbService.getProposalByRemoteId(remoteId);
+        final client =
+            await dbService.getClientByRemoteId(proposalMap['client_id']);
+
+        if (client != null) {
+          if (proposalMap['deleted_at'] != null) {
+            if (existingProposal != null) {
+              await dbService.softDeleteProposal(existingProposal.localId!);
+            }
+          } else {
+            final proposal = Proposal.fromMap(proposalMap)
+                .copyWith(clientId: client.localId!, isDirty: false);
+            if (existingProposal != null) {
+              await dbService.updateProposal(
+                  proposal.copyWith(localId: existingProposal.localId));
+            } else {
+              await dbService.insertProposal(proposal);
+            }
+          }
+        }
       }
     }
 
     // 4. Clear dirty flags for records we just sent
     for (var c in dirtyClients) {
-        await dbService.markAsSynced('clients', c.remoteId);
+      await dbService.markAsSynced('clients', c.remoteId);
     }
     for (var i in dirtyItems) {
-        await dbService.markAsSynced('items', i.remoteId);
+      await dbService.markAsSynced('items', i.remoteId);
     }
     for (var r in dirtyRectangles) {
-        await dbService.markAsSynced('rectangles', r.remoteId);
+      await dbService.markAsSynced('rectangles', r.remoteId);
+    }
+    for (var w in dirtyWarranties) {
+      await dbService.markAsSynced('warranties', w.remoteId);
+    }
+    for (var p in dirtyProposals) {
+      await dbService.markAsSynced('proposals', p.remoteId);
     }
 
     // 5. Save sync time

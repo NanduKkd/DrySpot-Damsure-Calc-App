@@ -58,6 +58,9 @@ class MockAuthProvider extends ChangeNotifier implements AuthProvider {
   @override
   String? get userName => 'User';
   @override
+  String? get franchiseeName => null;
+
+  @override
   bool get isAuthenticated => true;
   @override
   Future<void> login(String email, String password) async {}

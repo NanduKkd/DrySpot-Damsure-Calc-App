@@ -1,13 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
 import '../../models/client.dart';
 import '../../models/item.dart';
 import '../../providers/client_provider.dart';
 import '../../providers/settings_provider.dart';
-import '../../services/pdf_service.dart';
-import '../../services/api_service.dart';
 import 'item_detail_screen.dart';
+import 'pdf_management_screen.dart';
 
 class MeasurementScreen extends StatelessWidget {
   final Client client;
@@ -156,37 +154,6 @@ class MeasurementScreen extends StatelessWidget {
       );
   }
 
-  Future<void> _generatePdf(BuildContext context, Client currentClient) async {
-      try {
-          final file = await PdfService().generateWarrantyPdf(currentClient, DateTime.now(), 5);
-          await Share.shareXFiles([XFile(file.path)], text: 'Warranty for ${currentClient.name}');
-          
-          // Also upload to API
-          if (context.mounted) {
-            await context.read<ApiService>().uploadWarranty({
-                'client_id': currentClient.remoteId,
-                'start_date': DateTime.now().toIso8601String(),
-                'duration_years': 5,
-            });
-          }
-      } catch (e) {
-          if (context.mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-          }
-      }
-  }
-
-  Future<void> _generateProposal(BuildContext context, Client currentClient) async {
-      try {
-          final file = await PdfService().generateProposalPdf(currentClient);
-          await Share.shareXFiles([XFile(file.path)], text: 'Proposal for ${currentClient.name}');
-      } catch (e) {
-          if (context.mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-          }
-      }
-  }
-
   Future<void> _showDiscountDialog(BuildContext context, Client currentClient) async {
       final discountController = TextEditingController(text: currentClient.finalTotalPrice.toStringAsFixed(2));
       
@@ -276,14 +243,16 @@ class MeasurementScreen extends StatelessWidget {
                   onPressed: () => _applyBulkPrice(context)
                 ),
                 IconButton(
-                  tooltip: 'Generate Proposal',
-                  icon: const Icon(Icons.description), 
-                  onPressed: () => _generateProposal(context, currentClient)
-                ),
-                IconButton(
-                  tooltip: 'Generate Warranty',
-                  icon: const Icon(Icons.picture_as_pdf), 
-                  onPressed: () => _generatePdf(context, currentClient)
+                  tooltip: 'PDF Management',
+                  icon: const Icon(Icons.folder_shared), 
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => PdfManagementScreen(client: currentClient),
+                      ),
+                    );
+                  }
                 ),
             ],
           ),

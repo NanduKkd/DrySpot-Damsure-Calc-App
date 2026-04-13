@@ -5,6 +5,7 @@ import { Client } from './Client';
 import { Item } from './Item';
 import { Rectangle } from './Rectangle';
 import { Warranty } from './Warranty';
+import { Proposal } from './Proposal';
 import { DefaultPrice } from './DefaultPrice';
 
 // Associations
@@ -26,6 +27,9 @@ Rectangle.belongsTo(Item, { foreignKey: 'itemId' });
 Client.hasMany(Warranty, { foreignKey: 'clientId' });
 Warranty.belongsTo(Client, { foreignKey: 'clientId' });
 
+Client.hasMany(Proposal, { foreignKey: 'clientId' });
+Proposal.belongsTo(Client, { foreignKey: 'clientId' });
+
 export {
   sequelize,
   Franchisee,
@@ -34,5 +38,6 @@ export {
   Item,
   Rectangle,
   Warranty,
+  Proposal,
   DefaultPrice,
 };

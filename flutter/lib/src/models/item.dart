@@ -57,7 +57,7 @@ class Item {
       remoteId: map['remote_id'] ?? '',
       clientId: map['client_id'] is int ? map['client_id'] : null,
       name: map['name'],
-      price: map['price']?.toDouble() ?? 0.0,
+      price: double.tryParse(map['price']?.toString() ?? '') ?? 0.0,
       enabled: map['enabled'] == 1 || map['enabled'] == true,
       isDirty: map['is_dirty'] == 1,
       updatedAt: DateTime.parse(map['updated_at']),

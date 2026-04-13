@@ -21,6 +21,7 @@ void main() {
             franchisee_id TEXT,
             name TEXT NOT NULL,
             address TEXT,
+            site_address TEXT,
             email TEXT,
             phone TEXT,
             latitude REAL,

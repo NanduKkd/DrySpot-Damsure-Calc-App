@@ -43,8 +43,8 @@ void main() {
       final file = await pdfService.generateProposalPdf(client);
       expect(file, isNotNull);
       expect(await file.exists(), isTrue);
-      
-      // Note: We cannot easily verify if the Rupee symbol rendered correctly 
+
+      // Note: We cannot easily verify if the Rupee symbol rendered correctly
       // without visual inspection or complex PDF parsing, but we verify no crash.
       // print('PDF generated at: ${file.path}');
     });
@@ -64,7 +64,17 @@ void main() {
         ],
       );
 
-      final file = await pdfService.generateWarrantyPdf(client, DateTime.now(), 5);
+      final file = await pdfService.generateWarrantyPdf(
+        client: client,
+        customerName: client.name,
+        customerAddress: client.address ?? '',
+        siteAddress: client.siteAddress ?? '',
+        mobileNumber: client.phone ?? '',
+        startDate: DateTime.now(),
+        durationYears: 5,
+        franchiseeName: 'Test Franchisee',
+        warrantyCardNumber: 'WARR-001',
+      );
       expect(file, isNotNull);
       expect(await file.exists(), isTrue);
     });

@@ -33,6 +33,7 @@ describe('syncController', () => {
             remote_id: 'c1-id',
             name: 'Client 1',
             address: 'Address 1',
+            siteAddress: 'Site 1',
             is_dirty: true,
             updated_at: new Date().toISOString()
           }]
@@ -52,6 +53,7 @@ describe('syncController', () => {
       const client = await Client.findOne({ where: { id: 'c1-id' } });
       expect(client).toBeDefined();
       expect(client?.franchiseeId).toBe(franchisee1.id);
+      expect((client as any).siteAddress).toBe('Site 1');
     });
 
     it('isolates data by franchisee', async () => {

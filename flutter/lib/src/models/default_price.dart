@@ -36,7 +36,7 @@ class DefaultPrice {
     return DefaultPrice(
       localId: map['local_id'] is int ? map['local_id'] : null,
       remoteId: map['remote_id'],
-      price: (map['price'] as num).toDouble(),
+      price: double.tryParse(map['price']?.toString() ?? '') ?? 0.0,
       enabled: (map['enabled'] is int) ? (map['enabled'] == 1) : map['enabled'] == true,
       updatedAt: DateTime.parse(map['updated_at']),
     );
@@ -54,7 +54,7 @@ class DefaultPrice {
   factory DefaultPrice.fromJson(Map<String, dynamic> json) {
     return DefaultPrice(
       remoteId: json['remote_id'],
-      price: (json['price'] as num).toDouble(),
+      price: double.tryParse(json['price']?.toString() ?? '') ?? 0.0,
       enabled: json['enabled'] ?? true,
       updatedAt: DateTime.parse(json['updated_at']),
     );

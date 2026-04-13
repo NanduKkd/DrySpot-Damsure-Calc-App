@@ -7,18 +7,21 @@ class AuthProvider extends ChangeNotifier {
   String? _token;
   String? _userName;
   String? _franchiseeId;
+  String? _franchiseeName;
 
   AuthProvider({required this.apiService});
 
   bool get isAuthenticated => _token != null;
   String? get userName => _userName;
   String? get franchiseeId => _franchiseeId;
+  String? get franchiseeName => _franchiseeName;
 
   Future<void> login(String email, String password) async {
     final response = await apiService.login(email, password);
     _token = response['token'];
     _userName = response['user']['name'];
     _franchiseeId = response['user']['franchisee_id'];
+    _franchiseeName = response['user']['franchisee_name'];
     
     apiService.setToken(_token!);
     
@@ -26,6 +29,7 @@ class AuthProvider extends ChangeNotifier {
     await prefs.setString('token', _token!);
     await prefs.setString('user_name', _userName!);
     await prefs.setString('franchisee_id', _franchiseeId!);
+    if (_franchiseeName != null) await prefs.setString('franchisee_name', _franchiseeName!);
     
     notifyListeners();
   }
@@ -37,6 +41,7 @@ class AuthProvider extends ChangeNotifier {
     _token = prefs.getString('token');
     _userName = prefs.getString('user_name');
     _franchiseeId = prefs.getString('franchisee_id');
+    _franchiseeName = prefs.getString('franchisee_name');
 
     if (_token != null) {
       apiService.setToken(_token!);
@@ -48,6 +53,7 @@ class AuthProvider extends ChangeNotifier {
     _token = null;
     _userName = null;
     _franchiseeId = null;
+    _franchiseeName = null;
     
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();

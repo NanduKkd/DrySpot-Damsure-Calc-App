@@ -36,6 +36,7 @@ describe('authController', () => {
       expect(response.body.user).toMatchObject({
         email: 'test@example.com',
         franchisee_id: franchisee.id,
+        franchisee_name: franchisee.name,
       });
     });
 
