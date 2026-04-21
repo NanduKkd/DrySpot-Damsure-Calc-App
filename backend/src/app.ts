@@ -9,6 +9,7 @@ import { sequelize } from './models';
 import path from 'path';
 
 const app: Application = express();
+const requestBodyLimit = process.env.REQUEST_BODY_LIMIT || '20mb';
 
 app.use(
 	helmet({
@@ -17,8 +18,8 @@ app.use(
 );
 app.use(cors());
 app.use(morgan('dev'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: requestBodyLimit }));
+app.use(express.urlencoded({ extended: true, limit: requestBodyLimit }));
 
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/api', routes);
@@ -27,7 +28,22 @@ app.get('/health', (_req: Request, res: Response) => {
 	res.json({ message: 'API is running' });
 });
 
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+	const payloadError = err as Error & { type?: string; status?: number; statusCode?: number };
+	const isPayloadTooLarge =
+		err.name === 'PayloadTooLargeError' ||
+		payloadError.type === 'entity.too.large' ||
+		payloadError.status === 413 ||
+		payloadError.statusCode === 413 ||
+		err.message.toLowerCase().includes('request entity too large');
+
+	if (isPayloadTooLarge) {
+		console.warn(`Payload too large: ${req.method} ${req.originalUrl}`);
+		return res
+			.status(413)
+			.json({ error: 'Sync payload too large. Please sync fewer or smaller images.' });
+	}
+
 	console.error(err.stack);
 
 	if (err instanceof multer.MulterError) {
