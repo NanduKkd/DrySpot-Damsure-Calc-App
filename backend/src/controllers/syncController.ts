@@ -231,17 +231,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			paranoid: false,
 		});
 
-		return res.json({
-			server_time: serverTime,
-			updates: {
-				clients: updatedClients.map((c) => ({
-					remote_id: c.id,
-					name: c.name,
-					address: c.address,
-					email: c.email,
-					phone: c.phone,
-					latitude: c.latitude,
-					longitude: c.longitude,
+			return res.json({
+				server_time: serverTime,
+				updates: {
+					clients: updatedClients.map((c) => ({
+						remote_id: c.id,
+						franchisee_id: c.franchiseeId,
+						name: c.name,
+						address: c.address,
+						email: c.email,
+						phone: c.phone,
+						latitude: c.latitude,
+						longitude: c.longitude,
 					photos: c.photos,
 					discounted_price: c.discountedPrice,
 					site_address: (c as any).siteAddress,
