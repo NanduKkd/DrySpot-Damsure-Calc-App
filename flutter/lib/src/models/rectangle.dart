@@ -6,6 +6,7 @@ class Rectangle {
   final int? itemId;
   final double length;
   final double width;
+  final String? imageData;
   final bool isDirty;
   final DateTime updatedAt;
   final DateTime? deletedAt;
@@ -16,6 +17,7 @@ class Rectangle {
     this.itemId,
     required this.length,
     required this.width,
+    this.imageData,
     this.isDirty = true,
     DateTime? updatedAt,
     this.deletedAt,
@@ -34,6 +36,7 @@ class Rectangle {
       'item_id': itemId,
       'length': length,
       'width': width,
+      'image_data': imageData,
       'is_dirty': isDirty ? 1 : 0,
       'updated_at': updatedAt.toIso8601String(),
       'deleted_at': deletedAt?.toIso8601String(),
@@ -47,9 +50,13 @@ class Rectangle {
       itemId: map['item_id'] is int ? map['item_id'] : null,
       length: double.tryParse(map['length']?.toString() ?? '') ?? 0.0,
       width: double.tryParse(map['width']?.toString() ?? '') ?? 0.0,
+      imageData: map['image_data']?.toString().trim().isNotEmpty == true
+          ? map['image_data'].toString()
+          : null,
       isDirty: map['is_dirty'] == 1,
       updatedAt: DateTime.parse(map['updated_at']),
-      deletedAt: map['deleted_at'] != null ? DateTime.parse(map['deleted_at']) : null,
+      deletedAt:
+          map['deleted_at'] != null ? DateTime.parse(map['deleted_at']) : null,
     );
   }
 
@@ -59,6 +66,8 @@ class Rectangle {
     int? itemId,
     double? length,
     double? width,
+    String? imageData,
+    bool clearImageData = false,
     bool? isDirty,
     DateTime? updatedAt,
     DateTime? deletedAt,
@@ -69,6 +78,7 @@ class Rectangle {
       itemId: itemId ?? this.itemId,
       length: length ?? this.length,
       width: width ?? this.width,
+      imageData: clearImageData ? null : (imageData ?? this.imageData),
       isDirty: isDirty ?? this.isDirty,
       updatedAt: updatedAt ?? this.updatedAt,
       deletedAt: deletedAt ?? this.deletedAt,

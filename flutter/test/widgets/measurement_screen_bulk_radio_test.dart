@@ -6,8 +6,10 @@ import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/providers/settings_provider.dart';
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/item.dart';
+import 'package:app_client/src/models/proposal.dart';
 import 'package:app_client/src/models/rectangle.dart';
 import 'package:app_client/src/models/default_price.dart';
+import 'package:app_client/src/models/warranty.dart';
 
 class MockClientProvider extends ChangeNotifier implements ClientProvider {
   double? appliedPrice;
@@ -24,38 +26,76 @@ class MockClientProvider extends ChangeNotifier implements ClientProvider {
   }
 
   // Other stubs
-  @override bool get isLoading => false;
-  @override Future<void> loadClients() async {}
-  @override Future<void> addClient(Client client) async {}
-  @override Future<void> updateClient(Client client) async {}
-  @override Future<void> deleteClient(int localId) async {}
-  @override Future<int> addItem(Item item) async => 0;
-  @override Future<Item?> getItemByLocalId(int localId) async => null;
-  @override Future<void> updateItem(Item item) async {}
-  @override Future<void> deleteItem(int localId) async {}
-  @override Future<void> addRectangle(Rectangle rectangle) async {}
-  @override Future<void> updateRectangle(Rectangle rectangle) async {}
-  @override Future<void> deleteRectangle(int localId) async {}
+  @override
+  bool get isLoading => false;
+  @override
+  Future<void> loadClients() async {}
+  @override
+  Future<void> addClient(Client client) async {}
+  @override
+  Future<void> updateClient(Client client) async {}
+  @override
+  Future<void> deleteClient(int localId) async {}
+  @override
+  Future<int> addItem(Item item) async => 0;
+  @override
+  Future<Item?> getItemByLocalId(int localId) async => null;
+  @override
+  Future<void> updateItem(Item item) async {}
+  @override
+  Future<void> deleteItem(int localId) async {}
+  @override
+  Future<void> addRectangle(Rectangle rectangle) async {}
+  @override
+  Future<void> updateRectangle(Rectangle rectangle) async {}
+  @override
+  Future<void> deleteRectangle(int localId) async {}
+  @override
+  List<Warranty> get currentClientWarranties => [];
+  @override
+  List<Proposal> get currentClientProposals => [];
+  @override
+  Future<void> loadWarranties(int clientLocalId) async {}
+  @override
+  Future<void> loadProposals(int clientLocalId) async {}
+  @override
+  Future<void> addWarranty(Warranty warranty) async {}
+  @override
+  Future<void> addProposal(Proposal proposal) async {}
+  @override
+  Future<void> deleteWarranty(int localId, int clientLocalId) async {}
+  @override
+  Future<void> deleteProposal(int localId, int clientLocalId) async {}
 }
 
 class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
   final List<DefaultPrice> _defaultPrices = [
-    DefaultPrice(localId: 1, price: 45.0, enabled: true, updatedAt: DateTime.now()),
-    DefaultPrice(localId: 2, price: 50.0, enabled: true, updatedAt: DateTime.now()),
-    DefaultPrice(localId: 3, price: 60.0, enabled: true, updatedAt: DateTime.now()),
+    DefaultPrice(
+        localId: 1, price: 45.0, enabled: true, updatedAt: DateTime.now()),
+    DefaultPrice(
+        localId: 2, price: 50.0, enabled: true, updatedAt: DateTime.now()),
+    DefaultPrice(
+        localId: 3, price: 60.0, enabled: true, updatedAt: DateTime.now()),
   ];
 
-  @override List<DefaultPrice> get defaultPrices => _defaultPrices;
+  @override
+  List<DefaultPrice> get defaultPrices => _defaultPrices;
 
-  @override Future<void> loadSettings() async {}
-  @override double get firstDefaultPrice => 45.0;
-  @override Future<void> addDefaultPrice(double price) async {}
-  @override Future<void> updateDefaultPrice(DefaultPrice defaultPrice) async {}
-  @override Future<void> deleteDefaultPrice(int localId) async {}
+  @override
+  Future<void> loadSettings() async {}
+  @override
+  double get firstDefaultPrice => 45.0;
+  @override
+  Future<void> addDefaultPrice(double price) async {}
+  @override
+  Future<void> updateDefaultPrice(DefaultPrice defaultPrice) async {}
+  @override
+  Future<void> deleteDefaultPrice(int localId) async {}
 }
 
 void main() {
-  testWidgets('MeasurementScreen bulk apply shows radio buttons', (WidgetTester tester) async {
+  testWidgets('MeasurementScreen bulk apply shows radio buttons',
+      (WidgetTester tester) async {
     final client = Client(name: 'Test Client', localId: 1, items: []);
     final mockClientProvider = MockClientProvider(client);
     final mockSettingsProvider = MockSettingsProvider();
@@ -63,8 +103,10 @@ void main() {
     await tester.pumpWidget(
       MultiProvider(
         providers: [
-          ChangeNotifierProvider<ClientProvider>.value(value: mockClientProvider),
-          ChangeNotifierProvider<SettingsProvider>.value(value: mockSettingsProvider),
+          ChangeNotifierProvider<ClientProvider>.value(
+              value: mockClientProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: mockSettingsProvider),
         ],
         child: MaterialApp(
           home: MeasurementScreen(client: client),

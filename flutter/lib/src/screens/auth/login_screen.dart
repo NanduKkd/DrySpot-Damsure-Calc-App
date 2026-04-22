@@ -125,7 +125,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final apiService = context.read<ApiService>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Damsure Login')),
+      appBar: AppBar(title: const Text('DrySpot Uppala Login')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16.0),
         child: Column(

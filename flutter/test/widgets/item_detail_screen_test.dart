@@ -28,16 +28,23 @@ class MockClientProvider extends ClientProvider {
 }
 
 class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
-  @override List<DefaultPrice> get defaultPrices => [];
-  @override Future<void> loadSettings() async {}
-  @override double get firstDefaultPrice => 45.0;
-  @override Future<void> addDefaultPrice(double price) async {}
-  @override Future<void> updateDefaultPrice(DefaultPrice defaultPrice) async {}
-  @override Future<void> deleteDefaultPrice(int localId) async {}
+  @override
+  List<DefaultPrice> get defaultPrices => [];
+  @override
+  Future<void> loadSettings() async {}
+  @override
+  double get firstDefaultPrice => 45.0;
+  @override
+  Future<void> addDefaultPrice(double price) async {}
+  @override
+  Future<void> updateDefaultPrice(DefaultPrice defaultPrice) async {}
+  @override
+  Future<void> deleteDefaultPrice(int localId) async {}
 }
 
 void main() {
-  testWidgets('ItemDetailScreen focus movement test', (WidgetTester tester) async {
+  testWidgets('ItemDetailScreen focus movement test',
+      (WidgetTester tester) async {
     // Setup a dummy item
     final item = Item(name: 'Test Item', price: 10.0, localId: 1);
 
@@ -49,7 +56,8 @@ void main() {
       MultiProvider(
         providers: [
           ChangeNotifierProvider<ClientProvider>.value(value: mockProvider),
-          ChangeNotifierProvider<SettingsProvider>.value(value: mockSettingsProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: mockSettingsProvider),
         ],
         child: const MaterialApp(
           home: ItemDetailScreen(itemLocalId: 1),
@@ -62,7 +70,7 @@ void main() {
     // Initial focus should be on length field of first row (the new entry row)
     final lengthFieldFinder = find.widgetWithText(TextField, 'Length');
     expect(lengthFieldFinder, findsOneWidget);
-    
+
     // Type Length and press Next
     await tester.enterText(lengthFieldFinder, '10');
     await tester.testTextInput.receiveAction(TextInputAction.next);
@@ -71,7 +79,7 @@ void main() {
     // Focus should be on width field
     final widthFieldFinder = find.widgetWithText(TextField, 'Width');
     expect(widthFieldFinder, findsOneWidget);
-    
+
     // Type Width and press Done/Enter
     await tester.enterText(widthFieldFinder, '20');
     await tester.testTextInput.receiveAction(TextInputAction.done);
@@ -80,12 +88,86 @@ void main() {
     await tester.pump();
 
     // Verify focus is back on Length
-    // In my implementation, I don't automatically add a NEW row of TextFields, 
+    // In my implementation, I don't automatically add a NEW row of TextFields,
     // I just have ONE new entry row at the bottom that clears itself.
     // The test expects 2 Length fields, but my implementation has one existing (if any) and one new.
     // Wait, existing rectangles in my ItemDetailScreen are shown as Text in ListTile, not as TextFields.
     // So there will always be only ONE 'Length' field (the new entry one).
-    
+
     expect(find.widgetWithText(TextField, 'Length'), findsOneWidget);
+  });
+
+  testWidgets('ItemDetailScreen shows total area for entered rectangles',
+      (WidgetTester tester) async {
+    final item = Item(
+      name: 'Test Item',
+      price: 10.0,
+      localId: 1,
+      rectangles: [
+        Rectangle(itemId: 1, length: 10, width: 10),
+        Rectangle(itemId: 1, length: 4, width: 10),
+      ],
+    );
+
+    final mockProvider = MockClientProvider(item);
+    final mockSettingsProvider = MockSettingsProvider();
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: mockProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: mockSettingsProvider),
+        ],
+        child: const MaterialApp(
+          home: ItemDetailScreen(itemLocalId: 1),
+        ),
+      ),
+    );
+
+    await tester.pumpAndSettle();
+
+    expect(find.text('Total Area: 140.00 sqft'), findsOneWidget);
+    expect(find.text('Total Cost: ₹1400.00'), findsOneWidget);
+  });
+
+  testWidgets('ItemDetailScreen shows when a rectangle image is attached',
+      (WidgetTester tester) async {
+    const rectangleImage =
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Vm9sAAAAASUVORK5CYII=';
+
+    final item = Item(
+      name: 'Test Item',
+      price: 10.0,
+      localId: 1,
+      rectangles: [
+        Rectangle(
+          itemId: 1,
+          length: 10,
+          width: 10,
+          imageData: rectangleImage,
+        ),
+      ],
+    );
+
+    final mockProvider = MockClientProvider(item);
+    final mockSettingsProvider = MockSettingsProvider();
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: mockProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: mockSettingsProvider),
+        ],
+        child: const MaterialApp(
+          home: ItemDetailScreen(itemLocalId: 1),
+        ),
+      ),
+    );
+
+    await tester.pumpAndSettle();
+
+    expect(find.text('Image attached'), findsOneWidget);
   });
 }

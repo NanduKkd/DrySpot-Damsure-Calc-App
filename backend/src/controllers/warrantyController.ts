@@ -12,30 +12,61 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
     return res.status(400).json({ error: 'No PDF file uploaded' });
   }
 
+  if (!franchiseeId) {
+    return res.status(401).json({ error: 'Unauthorized: Franchisee ID not found in token' });
+  }
+
+  if (typeof client_id !== 'string' || client_id.trim().length === 0) {
+    return res.status(400).json({ error: 'client_id is required' });
+  }
+
+  const parsedStartDate = new Date(start_date);
+  if (Number.isNaN(parsedStartDate.getTime())) {
+    return res.status(400).json({ error: 'start_date must be a valid date' });
+  }
+
+  const parsedDurationYears = Number.parseInt(duration_years, 10);
+  if (Number.isNaN(parsedDurationYears) || parsedDurationYears <= 0) {
+    return res.status(400).json({ error: 'duration_years must be a positive integer' });
+  }
+
+  if (typeof warranty_card_number !== 'string' || warranty_card_number.trim().length === 0) {
+    return res.status(400).json({ error: 'warranty_card_number is required' });
+  }
+
   try {
-    // Verify client belongs to franchisee
-    const client = await Client.findOne({
-      where: { id: client_id, franchiseeId }
+    // Resolve the target client first so we can return accurate error messages.
+    const client = await Client.findByPk(client_id, {
+      paranoid: false,
+      attributes: ['id', 'franchiseeId', 'deletedAt'],
     });
 
     if (!client) {
+      return res.status(404).json({ error: 'Client not found. Please sync client data and try again' });
+    }
+
+    if (client.franchiseeId !== franchiseeId) {
       return res.status(403).json({ error: 'Unauthorized: Client does not belong to your franchisee' });
+    }
+
+    if (client.deletedAt) {
+      return res.status(409).json({ error: 'Client is deleted and cannot receive a warranty' });
     }
 
     // Enforce one-warranty rule: soft-delete any existing warranty for this client
     await Warranty.destroy({
-      where: { clientId: client_id }
+      where: { clientId: client.id }
     });
 
     // The pdfUrl should be accessible via /uploads/:filename
     const pdfUrl = `${req.protocol}://${req.get('host')}/uploads/${file.filename}`;
 
     const warranty = await Warranty.create({
-      clientId: client_id,
-      startDate: new Date(start_date),
-      durationYears: parseInt(duration_years),
+      clientId: client.id,
+      startDate: parsedStartDate,
+      durationYears: parsedDurationYears,
       pdfUrl: pdfUrl,
-      warrantyCardNumber: warranty_card_number,
+      warrantyCardNumber: warranty_card_number.trim(),
     });
 
     return res.status(201).json(warranty);

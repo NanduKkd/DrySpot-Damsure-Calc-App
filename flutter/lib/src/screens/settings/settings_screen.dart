@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../../providers/auth_provider.dart';
 import '../../providers/theme_provider.dart';
 import 'default_prices_screen.dart';
 
@@ -24,8 +25,16 @@ class SettingsScreen extends StatelessWidget {
             onTap: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (context) => const DefaultPricesScreen()),
+                MaterialPageRoute(
+                    builder: (context) => const DefaultPricesScreen()),
               );
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.logout),
+            title: const Text('Sign Out'),
+            onTap: () async {
+              await context.read<AuthProvider>().logout();
             },
           ),
         ],

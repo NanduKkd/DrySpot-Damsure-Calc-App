@@ -33,6 +33,12 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app connects to a backend server on your local network.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>This app lets you take client photos on site.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>This app captures your location to tag new clients accurately.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>This app lets you attach existing photos to a client.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

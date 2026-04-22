@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../models/client.dart';
 import '../models/item.dart';
@@ -10,6 +12,9 @@ class ClientProvider extends ChangeNotifier {
   final DbService _dbService = DbService();
   List<Client> _clients = [];
   bool _isLoading = false;
+  bool _sessionBound = false;
+  bool _isAuthenticated = false;
+  String? _activeFranchiseeId;
 
   List<Warranty> _currentClientWarranties = [];
   List<Proposal> _currentClientProposals = [];
@@ -20,10 +25,52 @@ class ClientProvider extends ChangeNotifier {
   List<Warranty> get currentClientWarranties => _currentClientWarranties;
   List<Proposal> get currentClientProposals => _currentClientProposals;
 
+  void updateSession({
+    required bool isAuthenticated,
+    String? franchiseeId,
+  }) {
+    final normalizedFranchiseeId = franchiseeId?.trim().isNotEmpty == true
+        ? franchiseeId!.trim()
+        : null;
+    final hasChanged = !_sessionBound ||
+        _isAuthenticated != isAuthenticated ||
+        _activeFranchiseeId != normalizedFranchiseeId;
+
+    if (!hasChanged) {
+      return;
+    }
+
+    _sessionBound = true;
+    _isAuthenticated = isAuthenticated;
+    _activeFranchiseeId = normalizedFranchiseeId;
+
+    if (!_isAuthenticated || _activeFranchiseeId == null) {
+      _clients = [];
+      _currentClientWarranties = [];
+      _currentClientProposals = [];
+      _isLoading = false;
+      notifyListeners();
+      return;
+    }
+
+    unawaited(loadClients());
+  }
+
   Future<void> loadClients() async {
     _isLoading = true;
     notifyListeners();
-    _clients = await _dbService.getClients();
+
+    final allClients = await _dbService.getClients();
+    if (_sessionBound && _isAuthenticated && _activeFranchiseeId != null) {
+      _clients = allClients
+          .where((client) => client.franchiseeId == _activeFranchiseeId)
+          .toList();
+    } else if (_sessionBound && !_isAuthenticated) {
+      _clients = [];
+    } else {
+      _clients = allClients;
+    }
+
     _isLoading = false;
     notifyListeners();
   }
@@ -81,7 +128,8 @@ class ClientProvider extends ChangeNotifier {
   Future<void> applyBulkPrice(int clientLocalId, double price) async {
     final client = _clients.firstWhere((c) => c.localId == clientLocalId);
     for (var item in client.items) {
-      await _dbService.updateItem(item.copyWith(price: price, updatedAt: DateTime.now()));
+      await _dbService
+          .updateItem(item.copyWith(price: price, updatedAt: DateTime.now()));
     }
     await loadClients();
   }

@@ -6,6 +6,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/app_config.dart';
 
+class ApiException implements Exception {
+  const ApiException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 class ApiService {
   static const _serverUrlKey = 'server_url';
 
@@ -19,6 +28,7 @@ class ApiService {
 
   String get serverUrl => _serverUrl;
   String get baseUrl => '$_serverUrl/api';
+  bool get _hasToken => _token?.isNotEmpty ?? false;
 
   void setToken(String token) {
     _token = token;
@@ -81,8 +91,53 @@ class ApiService {
 
   Map<String, String> get _headers => {
         'Content-Type': 'application/json',
-        if (_token != null) 'Authorization': 'Bearer $_token',
+        if (_hasToken) 'Authorization': 'Bearer $_token',
       };
+
+  Map<String, dynamic> _decodeObjectBody(
+    String body, {
+    required String fallbackMessage,
+  }) {
+    final trimmed = body.trim();
+    if (trimmed.isEmpty) {
+      throw ApiException(fallbackMessage);
+    }
+
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } on FormatException {
+      throw ApiException(fallbackMessage);
+    }
+
+    throw ApiException(fallbackMessage);
+  }
+
+  String _extractErrorMessage(http.Response response, String fallbackMessage) {
+    final trimmed = response.body.trim();
+    if (trimmed.isEmpty) {
+      return '$fallbackMessage (HTTP ${response.statusCode})';
+    }
+
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map) {
+        final error = decoded['error'] ?? decoded['message'];
+        if (error is String && error.trim().isNotEmpty) {
+          return error.trim();
+        }
+      }
+    } on FormatException {
+      return trimmed;
+    }
+
+    return trimmed;
+  }
 
   Future<Map<String, dynamic>> login(String email, String password) async {
     final response = await http.post(
@@ -92,9 +147,12 @@ class ApiService {
     );
 
     if (response.statusCode == 200) {
-      return jsonDecode(response.body);
+      return _decodeObjectBody(
+        response.body,
+        fallbackMessage: 'Login succeeded but the server response was invalid.',
+      );
     } else {
-      throw Exception(jsonDecode(response.body)['error'] ?? 'Failed to login');
+      throw ApiException(_extractErrorMessage(response, 'Failed to login'));
     }
   }
 
@@ -106,9 +164,12 @@ class ApiService {
     );
 
     if (response.statusCode == 200) {
-      return jsonDecode(response.body);
+      return _decodeObjectBody(
+        response.body,
+        fallbackMessage: 'Sync succeeded but the server response was invalid.',
+      );
     } else {
-      throw Exception(jsonDecode(response.body)['error'] ?? 'Failed to sync');
+      throw ApiException(_extractErrorMessage(response, 'Failed to sync'));
     }
   }
 
@@ -117,7 +178,7 @@ class ApiService {
     final request =
         http.MultipartRequest('POST', Uri.parse('$baseUrl/warranty/upload'));
     request.headers.addAll({
-      if (_token != null) 'Authorization': 'Bearer $_token',
+      if (_hasToken) 'Authorization': 'Bearer $_token',
     });
     request.files.add(await http.MultipartFile.fromPath(
       'file',
@@ -130,10 +191,15 @@ class ApiService {
     final response = await http.Response.fromStream(streamedResponse);
 
     if (response.statusCode == 201) {
-      return jsonDecode(response.body);
+      return _decodeObjectBody(
+        response.body,
+        fallbackMessage:
+            'Warranty upload succeeded but the server response was invalid.',
+      );
     } else {
-      throw Exception(
-          jsonDecode(response.body)['error'] ?? 'Failed to upload warranty');
+      throw ApiException(
+        _extractErrorMessage(response, 'Failed to upload warranty'),
+      );
     }
   }
 
@@ -142,7 +208,7 @@ class ApiService {
     final request =
         http.MultipartRequest('POST', Uri.parse('$baseUrl/proposal/upload'));
     request.headers.addAll({
-      if (_token != null) 'Authorization': 'Bearer $_token',
+      if (_hasToken) 'Authorization': 'Bearer $_token',
     });
     request.files.add(await http.MultipartFile.fromPath(
       'file',
@@ -155,10 +221,15 @@ class ApiService {
     final response = await http.Response.fromStream(streamedResponse);
 
     if (response.statusCode == 201) {
-      return jsonDecode(response.body);
+      return _decodeObjectBody(
+        response.body,
+        fallbackMessage:
+            'Proposal upload succeeded but the server response was invalid.',
+      );
     } else {
-      throw Exception(
-          jsonDecode(response.body)['error'] ?? 'Failed to upload proposal');
+      throw ApiException(
+        _extractErrorMessage(response, 'Failed to upload proposal'),
+      );
     }
   }
 
@@ -169,8 +240,9 @@ class ApiService {
     );
 
     if (response.statusCode != 204) {
-      throw Exception(
-          jsonDecode(response.body)['error'] ?? 'Failed to delete proposal');
+      throw ApiException(
+        _extractErrorMessage(response, 'Failed to delete proposal'),
+      );
     }
   }
 }

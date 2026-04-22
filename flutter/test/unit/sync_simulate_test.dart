@@ -7,6 +7,7 @@ import 'package:app_client/src/services/api_service.dart';
 import 'package:mockito/mockito.dart';
 
 class MockApiService extends Mock implements ApiService {}
+
 class MockDbService extends Mock implements DbService {}
 
 void main() {
@@ -29,15 +30,17 @@ void main() {
       'item_id': 'i-1',
       'length': 10,
       'width': 10,
+      'image_data': 'data:image/png;base64,ZmFrZQ==',
       'updated_at': DateTime.now().toIso8601String(),
     };
-    
+
     final client = Client.fromMap(clientMap);
     final item = Item.fromMap(itemMap).copyWith(clientId: 1, isDirty: false);
     final rect = Rectangle.fromMap(rectMap).copyWith(itemId: 1, isDirty: false);
-    
+
     expect(client.remoteId, 'c-1');
     expect(item.remoteId, 'i-1');
     expect(rect.remoteId, 'r-1');
+    expect(rect.imageData, 'data:image/png;base64,ZmFrZQ==');
   });
 }

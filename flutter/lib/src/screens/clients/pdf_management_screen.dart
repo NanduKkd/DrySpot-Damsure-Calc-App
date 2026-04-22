@@ -103,38 +103,6 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
   }
 
   Future<void> _createWarranty() async {
-    final clientProvider = context.read<ClientProvider>();
-    final existingWarranties = clientProvider.currentClientWarranties;
-
-    if (existingWarranties.isNotEmpty) {
-      final confirm = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Warranty Exists'),
-          content: const Text(
-              'A warranty already exists for this client. Creating a new one will delete the existing one. Continue?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Delete & Continue',
-                  style: TextStyle(color: Colors.red)),
-            ),
-          ],
-        ),
-      );
-
-      if (confirm != true) return;
-
-      // Soft delete existing warranty before proceeding
-      for (var w in existingWarranties) {
-        await clientProvider.deleteWarranty(w.localId!, widget.client.localId!);
-      }
-    }
-
     if (!mounted) return;
 
     final result = await Navigator.push<bool>(
@@ -251,42 +219,42 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
     return Consumer<ClientProvider>(
       builder: (context, provider, _) {
         final warranties = provider.currentClientWarranties;
-        if (warranties.isEmpty) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Text('No warranty generated yet.'),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _createWarranty,
-                  child: const Text('Create Warranty'),
-                ),
-              ],
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: ElevatedButton.icon(
+                onPressed: _isGenerating ? null : _createWarranty,
+                icon: const Icon(Icons.add),
+                label: const Text('Create Warranty'),
+              ),
             ),
-          );
-        }
-
-        return ListView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: warranties.length,
-          itemBuilder: (context, index) {
-            final warranty = warranties[index];
-            return PdfListItem(
-              title: 'Warranty - ${warranty.warrantyCardNumber}',
-              subtitle:
-                  'Created: ${warranty.updatedAt.toLocal().toString().split('.')[0]}',
-              pdfUrl: warranty.pdfUrl,
-              onDelete: () => _deleteWarranty(warranty),
-              onShare: () {
-                _sharePdf(
-                  pdfUrl: warranty.pdfUrl,
-                  fallbackFileName:
-                      'warranty_${warranty.warrantyCardNumber}.pdf',
-                );
-              },
-            );
-          },
+            Expanded(
+              child: warranties.isEmpty
+                  ? const Center(child: Text('No warranties generated yet.'))
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      itemCount: warranties.length,
+                      itemBuilder: (context, index) {
+                        final warranty = warranties[index];
+                        return PdfListItem(
+                          title: 'Warranty - ${warranty.warrantyCardNumber}',
+                          subtitle:
+                              'Created: ${warranty.updatedAt.toLocal().toString().split('.')[0]}',
+                          pdfUrl: warranty.pdfUrl,
+                          onDelete: () => _deleteWarranty(warranty),
+                          onShare: () {
+                            _sharePdf(
+                              pdfUrl: warranty.pdfUrl,
+                              fallbackFileName:
+                                  'warranty_${warranty.warrantyCardNumber}.pdf',
+                            );
+                          },
+                        );
+                      },
+                    ),
+            ),
+          ],
         );
       },
     );

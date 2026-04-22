@@ -4,6 +4,8 @@ import 'package:app_client/src/services/db_service.dart';
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/services/sync_service.dart';
 import 'package:app_client/src/models/client.dart';
+import 'package:app_client/src/models/item.dart';
+import 'package:app_client/src/models/rectangle.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class MockApiService extends ApiService {
@@ -35,8 +37,9 @@ void main() {
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
-    database = await openDatabase(inMemoryDatabasePath, version: 1, onCreate: (db, version) async {
-         await db.execute('''
+    database = await openDatabase(inMemoryDatabasePath, version: 1,
+        onCreate: (db, version) async {
+      await db.execute('''
           CREATE TABLE clients (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
@@ -55,7 +58,7 @@ void main() {
             deleted_at TEXT
           )
         ''');
-        await db.execute('''
+      await db.execute('''
           CREATE TABLE items (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
@@ -68,13 +71,39 @@ void main() {
             deleted_at TEXT
           )
         ''');
-        await db.execute('''
+      await db.execute('''
           CREATE TABLE rectangles (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
             item_id INTEGER,
             length REAL NOT NULL,
             width REAL NOT NULL,
+            image_data TEXT,
+            is_dirty INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT
+          )
+        ''');
+      await db.execute('''
+          CREATE TABLE warranties (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_id TEXT UNIQUE,
+            client_id INTEGER,
+            warranty_card_number TEXT,
+            start_date TEXT,
+            duration_years INTEGER,
+            pdf_url TEXT,
+            is_dirty INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT
+          )
+        ''');
+      await db.execute('''
+          CREATE TABLE proposals (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_id TEXT UNIQUE,
+            client_id INTEGER,
+            pdf_url TEXT,
             is_dirty INTEGER DEFAULT 1,
             updated_at TEXT NOT NULL,
             deleted_at TEXT
@@ -133,5 +162,94 @@ void main() {
     expect(clients[0].name, 'Server Client');
     expect(clients[0].remoteId, 'c2');
     expect(clients[0].isDirty, false);
+  });
+
+  test('Sync uploads dirty rectangle image data', () async {
+    final clientLocalId = await dbService.insertClient(Client(
+      remoteId: 'c1',
+      name: 'John Doe',
+      updatedAt: DateTime.now(),
+      isDirty: false,
+    ));
+
+    final itemLocalId = await dbService.insertItem(Item(
+      remoteId: 'i1',
+      clientId: clientLocalId,
+      name: 'Roof',
+      price: 10,
+      updatedAt: DateTime.now(),
+      isDirty: false,
+    ));
+
+    await dbService.insertRectangle(Rectangle(
+      remoteId: 'r1',
+      itemId: itemLocalId,
+      length: 10,
+      width: 20,
+      imageData: 'data:image/png;base64,ZmFrZQ==',
+      updatedAt: DateTime.now(),
+      isDirty: true,
+    ));
+
+    await syncService.sync();
+
+    final changes = apiService.lastSyncData!['changes'];
+    expect(changes['rectangles'], hasLength(1));
+    expect(
+      changes['rectangles'][0]['image_data'],
+      'data:image/png;base64,ZmFrZQ==',
+    );
+
+    final dirtyRectangles = await dbService.getDirtyRectangles();
+    expect(dirtyRectangles, isEmpty);
+  });
+
+  test('Sync downloads rectangle image data', () async {
+    apiService.response = {
+      'server_time': '2024-03-22T12:00:00Z',
+      'updates': {
+        'clients': [
+          {
+            'remote_id': 'c2',
+            'name': 'Server Client',
+            'updated_at': '2024-03-22T11:00:00Z',
+            'deleted_at': null,
+          }
+        ],
+        'items': [
+          {
+            'remote_id': 'i2',
+            'client_id': 'c2',
+            'name': 'Roof',
+            'price': 22.0,
+            'enabled': true,
+            'updated_at': '2024-03-22T11:00:00Z',
+            'deleted_at': null,
+          }
+        ],
+        'rectangles': [
+          {
+            'remote_id': 'r2',
+            'item_id': 'i2',
+            'length': 11.0,
+            'width': 12.0,
+            'image_data': 'data:image/png;base64,ZmFrZQ==',
+            'updated_at': '2024-03-22T11:00:00Z',
+            'deleted_at': null,
+          }
+        ],
+      }
+    };
+
+    await syncService.sync();
+
+    final clients = await dbService.getClients();
+    expect(clients, hasLength(1));
+    expect(clients[0].items, hasLength(1));
+    expect(clients[0].items[0].rectangles, hasLength(1));
+    expect(
+      clients[0].items[0].rectangles[0].imageData,
+      'data:image/png;base64,ZmFrZQ==',
+    );
   });
 }

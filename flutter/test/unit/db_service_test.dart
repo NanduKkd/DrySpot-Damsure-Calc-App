@@ -13,8 +13,9 @@ void main() {
   late Database database;
 
   setUp(() async {
-    database = await openDatabase(inMemoryDatabasePath, version: 1, onCreate: (db, version) async {
-        await db.execute('''
+    database = await openDatabase(inMemoryDatabasePath, version: 1,
+        onCreate: (db, version) async {
+      await db.execute('''
           CREATE TABLE clients (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
@@ -34,7 +35,7 @@ void main() {
           )
         ''');
 
-        await db.execute('''
+      await db.execute('''
           CREATE TABLE items (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
@@ -49,13 +50,14 @@ void main() {
           )
         ''');
 
-        await db.execute('''
+      await db.execute('''
           CREATE TABLE rectangles (
             local_id INTEGER PRIMARY KEY AUTOINCREMENT,
             remote_id TEXT UNIQUE,
             item_id INTEGER,
             length REAL NOT NULL,
             width REAL NOT NULL,
+            image_data TEXT,
             is_dirty INTEGER DEFAULT 1,
             updated_at TEXT NOT NULL,
             deleted_at TEXT,
@@ -123,6 +125,7 @@ void main() {
         itemId: itemLocalId,
         length: 10,
         width: 20,
+        imageData: 'data:image/png;base64,ZmFrZQ==',
         updatedAt: DateTime.now(),
       );
 
@@ -133,6 +136,10 @@ void main() {
       expect(clients[0].items.length, 1);
       expect(clients[0].items[0].rectangles.length, 1);
       expect(clients[0].items[0].rectangles[0].area, 200.0);
+      expect(
+        clients[0].items[0].rectangles[0].imageData,
+        'data:image/png;base64,ZmFrZQ==',
+      );
     });
   });
 }

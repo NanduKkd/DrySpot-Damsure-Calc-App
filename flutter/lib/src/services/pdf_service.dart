@@ -7,6 +7,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/client.dart';
+import '../utils/warranty_date_utils.dart';
 
 class PdfService {
   Future<File> generateWarrantyPdf({
@@ -15,13 +16,15 @@ class PdfService {
     required String customerAddress,
     required String siteAddress,
     required String mobileNumber,
+    required String areaOfApplication,
     required DateTime startDate,
     required int durationYears,
     required String franchiseeName,
     required String warrantyCardNumber,
   }) async {
+    // Use a compressed cover asset so warranty uploads stay under proxy limits.
     final blueBgData =
-        await rootBundle.load('assets/pdf-images/blueBuildingsBackground.png');
+        await rootBundle.load('assets/pdf-images/blueBuildingsBackground.jpg');
     final blueBg = pw.MemoryImage(blueBgData.buffer.asUint8List());
 
     final damsureLogoData =
@@ -144,11 +147,7 @@ class PdfService {
                                           padding:
                                               const pw.EdgeInsets.symmetric(
                                                   horizontal: 4, vertical: 10),
-                                          child: pw.Text(
-                                              client.items
-                                                  .where((i) => i.enabled)
-                                                  .map((i) => i.name)
-                                                  .join(', '),
+                                          child: pw.Text(areaOfApplication,
                                               style: const pw.TextStyle(
                                                   fontSize: 12))),
                                       pw.Padding(
@@ -496,18 +495,15 @@ class PdfService {
                                             franchiseeName),
                                         _buildCoverDetail(
                                             'WARRANTY COMMENCEMENT DATE:',
-                                            startDate
-                                                .toLocal()
-                                                .toString()
-                                                .split(' ')[0]),
+                                            formatWarrantyDate(startDate)),
                                         _buildCoverDetail(
                                             'VALID TILL:',
-                                            startDate
-                                                .add(Duration(
-                                                    days: 365 * durationYears))
-                                                .toLocal()
-                                                .toString()
-                                                .split(' ')[0]),
+                                            formatWarrantyDate(
+                                              addWarrantyYears(
+                                                startDate,
+                                                durationYears,
+                                              ),
+                                            )),
                                         _buildCoverDetail('TOTAL AREA:',
                                             '${client.totalArea.toStringAsFixed(2)} sqft'),
                                         pw.Spacer(),

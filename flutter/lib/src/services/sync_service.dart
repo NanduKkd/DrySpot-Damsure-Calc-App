@@ -14,56 +14,127 @@ class SyncService {
   SyncService({required this.apiService, DbService? dbService})
       : dbService = dbService ?? DbService();
 
+  String _syncKeyForFranchisee(String? franchiseeId) {
+    if (franchiseeId == null || franchiseeId.isEmpty) {
+      return 'last_sync_time';
+    }
+    return 'last_sync_time_$franchiseeId';
+  }
+
   Future<void> sync() async {
     final prefs = await SharedPreferences.getInstance();
-    final lastSyncTime = prefs.getString('last_sync_time');
+    final activeFranchiseeId = prefs.getString('franchisee_id')?.trim();
+    final shouldFilterByFranchise =
+        activeFranchiseeId != null && activeFranchiseeId.isNotEmpty;
+    final syncTimeKey = _syncKeyForFranchisee(activeFranchiseeId);
+    final lastSyncTime =
+        prefs.getString(syncTimeKey) ?? prefs.getString('last_sync_time');
+
+    // Build active-session maps once so all payloads resolve IDs consistently.
+    final allClients = await dbService.getClients();
+    final activeClients = shouldFilterByFranchise
+        ? allClients
+            .where((client) => client.franchiseeId == activeFranchiseeId)
+            .toList()
+        : allClients;
+    final clientsByLocalId = <int, Client>{
+      for (final client in activeClients)
+        if (client.localId != null) client.localId!: client,
+    };
+    final itemsByLocalId = <int, Item>{
+      for (final client in activeClients)
+        for (final item in client.items)
+          if (item.localId != null) item.localId!: item,
+    };
+    final activeClientLocalIds = clientsByLocalId.keys.toSet();
+    final activeItemLocalIds = itemsByLocalId.keys.toSet();
 
     // 1. Gather local changes
-    final dirtyClients = await dbService.getDirtyClients();
-    final dirtyItems = await dbService.getDirtyItems();
-    final dirtyRectangles = await dbService.getDirtyRectangles();
-    final dirtyWarranties = await dbService.getDirtyWarranties();
-    final dirtyProposals = await dbService.getDirtyProposals();
+    final dirtyClients = (await dbService.getDirtyClients())
+        .where((client) =>
+            !shouldFilterByFranchise ||
+            client.franchiseeId == activeFranchiseeId)
+        .toList();
+    final dirtyItems = (await dbService.getDirtyItems())
+        .where((item) =>
+            !shouldFilterByFranchise ||
+            (item.clientId != null && activeClientLocalIds.contains(item.clientId)))
+        .toList();
+    final dirtyRectangles = (await dbService.getDirtyRectangles())
+        .where((rect) =>
+            !shouldFilterByFranchise ||
+            (rect.itemId != null && activeItemLocalIds.contains(rect.itemId)))
+        .toList();
+    final dirtyWarranties = (await dbService.getDirtyWarranties())
+        .where((warranty) =>
+            !shouldFilterByFranchise ||
+            activeClientLocalIds.contains(warranty.clientId))
+        .toList();
+    final dirtyProposals = (await dbService.getDirtyProposals())
+        .where((proposal) =>
+            !shouldFilterByFranchise ||
+            activeClientLocalIds.contains(proposal.clientId))
+        .toList();
 
-    // Wait for mapping if they were async
-    final resolvedItems = await Future.wait(dirtyItems.map((i) async {
-      final client = (await dbService.getClients())
-          .firstWhere((c) => c.localId == i.clientId);
-      var map = i.toMap();
-      map['remote_id'] = i.remoteId;
+    final itemsToSync = <Item>[];
+    final resolvedItems = <Map<String, dynamic>>[];
+    for (final item in dirtyItems) {
+      final client = item.clientId == null ? null : clientsByLocalId[item.clientId!];
+      if (client == null || client.remoteId.isEmpty) {
+        continue;
+      }
+
+      final map = item.toMap();
+      map['remote_id'] = item.remoteId;
       map['client_id'] = client.remoteId;
-      return map;
-    }));
+      resolvedItems.add(map);
+      itemsToSync.add(item);
+    }
 
-    final resolvedRectangles = await Future.wait(dirtyRectangles.map((r) async {
-      // Find item
-      final db = await dbService.database;
-      final List<Map<String, dynamic>> maps = await db
-          .query('items', where: 'local_id = ?', whereArgs: [r.itemId]);
-      final itemRemoteId = maps.first['remote_id'];
-      var map = r.toMap();
-      map['remote_id'] = r.remoteId;
-      map['item_id'] = itemRemoteId;
-      return map;
-    }));
+    final rectanglesToSync = <Rectangle>[];
+    final resolvedRectangles = <Map<String, dynamic>>[];
+    for (final rect in dirtyRectangles) {
+      final item = rect.itemId == null ? null : itemsByLocalId[rect.itemId!];
+      if (item == null || item.remoteId.isEmpty) {
+        continue;
+      }
 
-    final resolvedWarranties = await Future.wait(dirtyWarranties.map((w) async {
-      final client = (await dbService.getClients())
-          .firstWhere((c) => c.localId == w.clientId);
-      var map = w.toMap();
-      map['remote_id'] = w.remoteId;
+      final map = rect.toMap();
+      map['remote_id'] = rect.remoteId;
+      map['item_id'] = item.remoteId;
+      resolvedRectangles.add(map);
+      rectanglesToSync.add(rect);
+    }
+
+    final warrantiesToSync = <Warranty>[];
+    final resolvedWarranties = <Map<String, dynamic>>[];
+    for (final warranty in dirtyWarranties) {
+      final client = clientsByLocalId[warranty.clientId];
+      if (client == null || client.remoteId.isEmpty) {
+        continue;
+      }
+
+      final map = warranty.toMap();
+      map['remote_id'] = warranty.remoteId;
       map['client_id'] = client.remoteId;
-      return map;
-    }));
+      resolvedWarranties.add(map);
+      warrantiesToSync.add(warranty);
+    }
 
-    final resolvedProposals = await Future.wait(dirtyProposals.map((p) async {
-      final client = (await dbService.getClients())
-          .firstWhere((c) => c.localId == p.clientId);
-      var map = p.toMap();
-      map['remote_id'] = p.remoteId;
+    final proposalsToSync = <Proposal>[];
+    final resolvedProposals = <Map<String, dynamic>>[];
+    for (final proposal in dirtyProposals) {
+      final client = clientsByLocalId[proposal.clientId];
+      if (client == null || client.remoteId.isEmpty) {
+        continue;
+      }
+
+      final map = proposal.toMap();
+      map['remote_id'] = proposal.remoteId;
       map['client_id'] = client.remoteId;
-      return map;
-    }));
+      resolvedProposals.add(map);
+      proposalsToSync.add(proposal);
+    }
 
     final syncData = {
       'last_sync_time': lastSyncTime,
@@ -210,20 +281,23 @@ class SyncService {
     for (var c in dirtyClients) {
       await dbService.markAsSynced('clients', c.remoteId);
     }
-    for (var i in dirtyItems) {
+    for (var i in itemsToSync) {
       await dbService.markAsSynced('items', i.remoteId);
     }
-    for (var r in dirtyRectangles) {
+    for (var r in rectanglesToSync) {
       await dbService.markAsSynced('rectangles', r.remoteId);
     }
-    for (var w in dirtyWarranties) {
+    for (var w in warrantiesToSync) {
       await dbService.markAsSynced('warranties', w.remoteId);
     }
-    for (var p in dirtyProposals) {
+    for (var p in proposalsToSync) {
       await dbService.markAsSynced('proposals', p.remoteId);
     }
 
     // 5. Save sync time
-    await prefs.setString('last_sync_time', serverTime);
+    await prefs.setString(syncTimeKey, serverTime);
+    if (syncTimeKey != 'last_sync_time') {
+      await prefs.remove('last_sync_time');
+    }
   }
 }

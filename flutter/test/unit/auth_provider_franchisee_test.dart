@@ -1,45 +1,57 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:mockito/mockito.dart';
-import 'package:mockito/annotations.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:app_client/src/providers/auth_provider.dart';
 import 'package:app_client/src/services/api_service.dart';
 
-import 'auth_provider_franchisee_test.mocks.dart';
+class FakeApiService extends ApiService {
+  FakeApiService() : super(serverUrl: 'http://localhost:3000');
 
-@GenerateMocks([ApiService])
+  Map<String, dynamic>? loginResponse;
+
+  @override
+  Future<Map<String, dynamic>> login(String email, String password) async {
+    if (loginResponse == null) {
+      throw StateError('loginResponse must be set before calling login');
+    }
+
+    return loginResponse!;
+  }
+}
+
 void main() {
   group('AuthProvider Franchisee Name', () {
-    late MockApiService mockApiService;
+    late FakeApiService mockApiService;
     late AuthProvider authProvider;
 
     setUp(() {
       SharedPreferences.setMockInitialValues({});
-      mockApiService = MockApiService();
+      mockApiService = FakeApiService();
       authProvider = AuthProvider(apiService: mockApiService);
     });
 
     test('login should parse and store franchisee_name', () async {
-      when(mockApiService.login('test@example.com', 'password')).thenAnswer(
-        (_) async => {
-          'token': 'mock_token',
-          'user': {
-            'name': 'Test User',
-            'franchisee_id': 'FRANCH-123',
-            'franchisee_name': 'Authorized Franchisee of Damsure'
-          }
-        },
-      );
+      mockApiService.loginResponse = {
+        'token': 'mock_token',
+        'user': {
+          'name': 'Test User',
+          'franchisee_id': 'FRANCH-123',
+          'franchisee_name': 'Authorized Franchisee of Damsure'
+        }
+      };
 
       await authProvider.login('test@example.com', 'password');
 
       expect(authProvider.franchiseeName, 'Authorized Franchisee of Damsure');
 
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('franchisee_name'), 'Authorized Franchisee of Damsure');
+      expect(
+        prefs.getString('franchisee_name'),
+        'Authorized Franchisee of Damsure',
+      );
     });
 
-    test('tryAutoLogin should retrieve franchisee_name from SharedPreferences', () async {
+    test('tryAutoLogin should retrieve franchisee_name from SharedPreferences',
+        () async {
       SharedPreferences.setMockInitialValues({
         'token': 'mock_token',
         'user_name': 'Test User',

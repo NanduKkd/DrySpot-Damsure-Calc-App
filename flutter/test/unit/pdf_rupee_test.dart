@@ -70,6 +70,7 @@ void main() {
         customerAddress: client.address ?? '',
         siteAddress: client.siteAddress ?? '',
         mobileNumber: client.phone ?? '',
+        areaOfApplication: 'Roof',
         startDate: DateTime.now(),
         durationYears: 5,
         franchiseeName: 'Test Franchisee',

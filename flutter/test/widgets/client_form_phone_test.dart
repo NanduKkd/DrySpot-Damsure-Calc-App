@@ -7,7 +7,9 @@ import 'package:app_client/src/providers/auth_provider.dart';
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/item.dart';
+import 'package:app_client/src/models/proposal.dart';
 import 'package:app_client/src/models/rectangle.dart';
+import 'package:app_client/src/models/warranty.dart';
 
 class MockClientProvider extends ChangeNotifier implements ClientProvider {
   Client? addedClient;
@@ -48,6 +50,22 @@ class MockClientProvider extends ChangeNotifier implements ClientProvider {
   Future<void> deleteItem(int localId) async {}
   @override
   Future<void> applyBulkPrice(int clientLocalId, double price) async {}
+  @override
+  List<Warranty> get currentClientWarranties => [];
+  @override
+  List<Proposal> get currentClientProposals => [];
+  @override
+  Future<void> loadWarranties(int clientLocalId) async {}
+  @override
+  Future<void> loadProposals(int clientLocalId) async {}
+  @override
+  Future<void> addWarranty(Warranty warranty) async {}
+  @override
+  Future<void> addProposal(Proposal proposal) async {}
+  @override
+  Future<void> deleteWarranty(int localId, int clientLocalId) async {}
+  @override
+  Future<void> deleteProposal(int localId, int clientLocalId) async {}
 }
 
 class MockAuthProvider extends ChangeNotifier implements AuthProvider {
@@ -71,14 +89,16 @@ class MockAuthProvider extends ChangeNotifier implements AuthProvider {
 }
 
 void main() {
-  testWidgets('ClientFormScreen shows phone field and saves it', (WidgetTester tester) async {
+  testWidgets('ClientFormScreen shows phone field and saves it',
+      (WidgetTester tester) async {
     final mockClientProvider = MockClientProvider();
     final mockAuthProvider = MockAuthProvider();
 
     await tester.pumpWidget(
       MultiProvider(
         providers: [
-          ChangeNotifierProvider<ClientProvider>.value(value: mockClientProvider),
+          ChangeNotifierProvider<ClientProvider>.value(
+              value: mockClientProvider),
           ChangeNotifierProvider<AuthProvider>.value(value: mockAuthProvider),
         ],
         child: const MaterialApp(
@@ -92,7 +112,8 @@ void main() {
     expect(phoneFieldFinder, findsOneWidget);
 
     // Enter details
-    await tester.enterText(find.widgetWithText(TextFormField, 'Client Name *'), 'John Doe');
+    await tester.enterText(
+        find.widgetWithText(TextFormField, 'Client Name *'), 'John Doe');
     await tester.enterText(phoneFieldFinder, '9998887776');
 
     // Tap Save

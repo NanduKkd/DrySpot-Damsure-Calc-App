@@ -30,7 +30,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 6,
+      version: 7,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -52,6 +52,9 @@ class DbService {
     if (oldVersion < 6) {
       await _createWarrantiesTable(db);
       await _createProposalsTable(db);
+    }
+    if (oldVersion < 7) {
+      await db.execute('ALTER TABLE rectangles ADD COLUMN image_data TEXT');
     }
   }
 
@@ -98,6 +101,7 @@ class DbService {
         item_id INTEGER,
         length REAL NOT NULL,
         width REAL NOT NULL,
+        image_data TEXT,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
@@ -165,8 +169,9 @@ class DbService {
 
   Future<List<Client>> getClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('clients', where: 'deleted_at IS NULL');
-    
+    final List<Map<String, dynamic>> maps =
+        await db.query('clients', where: 'deleted_at IS NULL');
+
     List<Client> clients = [];
     for (var map in maps) {
       final items = await getItemsByClientId(map['local_id']);
@@ -176,11 +181,12 @@ class DbService {
   }
 
   Future<Client?> getClientByRemoteId(String remoteId) async {
-      final db = await database;
-      final List<Map<String, dynamic>> maps = await db.query('clients', where: 'remote_id = ?', whereArgs: [remoteId]);
-      if (maps.isEmpty) return null;
-      final items = await getItemsByClientId(maps.first['local_id']);
-      return Client.fromMap(maps.first, items: items);
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db
+        .query('clients', where: 'remote_id = ?', whereArgs: [remoteId]);
+    if (maps.isEmpty) return null;
+    final items = await getItemsByClientId(maps.first['local_id']);
+    return Client.fromMap(maps.first, items: items);
   }
 
   Future<int> updateClient(Client client) async {
@@ -211,8 +217,9 @@ class DbService {
 
   Future<List<Item>> getItemsByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('items', where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
-    
+    final List<Map<String, dynamic>> maps = await db.query('items',
+        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+
     List<Item> items = [];
     for (var map in maps) {
       final rectangles = await getRectanglesByItemId(map['local_id']);
@@ -222,11 +229,12 @@ class DbService {
   }
 
   Future<Item?> getItemByRemoteId(String remoteId) async {
-      final db = await database;
-      final List<Map<String, dynamic>> maps = await db.query('items', where: 'remote_id = ?', whereArgs: [remoteId]);
-      if (maps.isEmpty) return null;
-      final rectangles = await getRectanglesByItemId(maps.first['local_id']);
-      return Item.fromMap(maps.first, rectangles: rectangles);
+    final db = await database;
+    final List<Map<String, dynamic>> maps =
+        await db.query('items', where: 'remote_id = ?', whereArgs: [remoteId]);
+    if (maps.isEmpty) return null;
+    final rectangles = await getRectanglesByItemId(maps.first['local_id']);
+    return Item.fromMap(maps.first, rectangles: rectangles);
   }
 
   Future<Item?> getItemByLocalId(int localId) async {
@@ -266,15 +274,17 @@ class DbService {
 
   Future<List<Rectangle>> getRectanglesByItemId(int itemId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('rectangles', where: 'item_id = ? AND deleted_at IS NULL', whereArgs: [itemId]);
+    final List<Map<String, dynamic>> maps = await db.query('rectangles',
+        where: 'item_id = ? AND deleted_at IS NULL', whereArgs: [itemId]);
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
   Future<Rectangle?> getRectangleByRemoteId(String remoteId) async {
-      final db = await database;
-      final List<Map<String, dynamic>> maps = await db.query('rectangles', where: 'remote_id = ?', whereArgs: [remoteId]);
-      if (maps.isEmpty) return null;
-      return Rectangle.fromMap(maps.first);
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db
+        .query('rectangles', where: 'remote_id = ?', whereArgs: [remoteId]);
+    if (maps.isEmpty) return null;
+    return Rectangle.fromMap(maps.first);
   }
 
   Future<int> updateRectangle(Rectangle rectangle) async {
@@ -415,19 +425,22 @@ class DbService {
   // Sync helpers
   Future<List<Client>> getDirtyClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('clients', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps =
+        await db.query('clients', where: 'is_dirty = 1');
     return List.generate(maps.length, (i) => Client.fromMap(maps[i]));
   }
 
   Future<List<Item>> getDirtyItems() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('items', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps =
+        await db.query('items', where: 'is_dirty = 1');
     return List.generate(maps.length, (i) => Item.fromMap(maps[i]));
   }
 
   Future<List<Rectangle>> getDirtyRectangles() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('rectangles', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps =
+        await db.query('rectangles', where: 'is_dirty = 1');
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
@@ -454,6 +467,7 @@ class DbService {
 
   Future<void> markAsSynced(String table, String remoteId) async {
     final db = await database;
-    await db.update(table, {'is_dirty': 0}, where: 'remote_id = ?', whereArgs: [remoteId]);
+    await db.update(table, {'is_dirty': 0},
+        where: 'remote_id = ?', whereArgs: [remoteId]);
   }
 }

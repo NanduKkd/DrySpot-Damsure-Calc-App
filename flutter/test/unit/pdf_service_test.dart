@@ -47,6 +47,7 @@ void main() {
       customerAddress: client.address ?? '',
       siteAddress: client.siteAddress ?? '',
       mobileNumber: client.phone ?? '',
+      areaOfApplication: 'Roof',
       startDate: DateTime.now(),
       durationYears: 5,
       franchiseeName: 'Test Franchisee',
@@ -55,6 +56,7 @@ void main() {
 
     expect(await file.exists(), isTrue);
     expect(file.path, contains('warranty_c1.pdf'));
+    expect(await file.length(), lessThan(1024 * 1024));
 
     // Clean up
     await file.delete();

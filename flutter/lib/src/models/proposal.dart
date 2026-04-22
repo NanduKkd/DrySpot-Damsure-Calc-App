@@ -1,5 +1,16 @@
 import 'package:uuid/uuid.dart';
 
+int? _parseInt(dynamic value) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value);
+  return null;
+}
+
+bool _parseBool(dynamic value) {
+  return value == true || value == 1 || value == '1';
+}
+
 class Proposal {
   final int? localId;
   final String remoteId;
@@ -35,12 +46,16 @@ class Proposal {
   }
 
   factory Proposal.fromMap(Map<String, dynamic> map) {
+    final localClientId = _parseInt(map['client_id']);
+
     return Proposal(
-      localId: map['local_id'],
-      remoteId: map['remote_id'],
-      clientId: map['client_id'],
-      pdfUrl: map['pdf_url'],
-      isDirty: map['is_dirty'] == 1,
+      localId: _parseInt(map['local_id']),
+      remoteId: map['remote_id']?.toString() ?? '',
+      clientId: localClientId ?? 0,
+      remoteClientId:
+          localClientId == null ? map['client_id']?.toString() : null,
+      pdfUrl: map['pdf_url']?.toString() ?? '',
+      isDirty: _parseBool(map['is_dirty']),
       updatedAt: DateTime.parse(map['updated_at']),
       deletedAt:
           map['deleted_at'] != null ? DateTime.parse(map['deleted_at']) : null,
