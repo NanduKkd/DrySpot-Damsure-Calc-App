@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { uploadProposal, getProposals, deleteProposal } from '../controllers/proposalController';
+import { uploadProposal, getProposals, deleteProposal, downloadProposal } from '../controllers/proposalController';
 import { authenticate } from '../middleware/authMiddleware';
 import { upload } from '../middleware/uploadMiddleware';
 
@@ -8,5 +8,6 @@ const router = Router();
 router.post('/upload', authenticate, upload.single('file'), uploadProposal as any);
 router.get('/client/:client_id', authenticate, getProposals as any);
 router.delete('/:id', authenticate, deleteProposal as any);
+router.get('/:id/download', authenticate, downloadProposal as any);
 
 export default router;

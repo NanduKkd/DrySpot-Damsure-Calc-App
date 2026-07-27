@@ -1,5 +1,8 @@
 import { sequelize } from '../src/models';
 
+// Deliberately explicit: production code rejects missing/default JWT secrets.
+process.env.JWT_SECRET = 'test-only-jwt-secret';
+
 beforeAll(async () => {
     if (process.env.NODE_ENV === 'test') {
         await sequelize.sync({ force: true });

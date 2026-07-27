@@ -3,7 +3,7 @@ import app from '../app';
 import { User, Franchisee, Client, Item, Rectangle } from '../models';
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const JWT_SECRET = process.env.JWT_SECRET!;
 
 describe('syncController', () => {
 	let franchisee1: any, franchisee2: any;

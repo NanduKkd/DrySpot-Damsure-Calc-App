@@ -147,6 +147,12 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> addWarranty(Warranty warranty) async {
+    // Keep the offline view consistent with the server's one-active-warranty rule.
+    for (final existing in List<Warranty>.from(_currentClientWarranties)) {
+      if (existing.localId != null) {
+        await _dbService.softDeleteWarranty(existing.localId!);
+      }
+    }
     await _dbService.insertWarranty(warranty);
     await loadWarranties(warranty.clientId);
   }

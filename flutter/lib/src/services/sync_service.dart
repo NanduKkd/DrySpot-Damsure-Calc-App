@@ -4,6 +4,7 @@ import 'db_service.dart';
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/rectangle.dart';
+import '../models/default_price.dart';
 import '../models/warranty.dart';
 import '../models/proposal.dart';
 
@@ -58,13 +59,17 @@ class SyncService {
     final dirtyItems = (await dbService.getDirtyItems())
         .where((item) =>
             !shouldFilterByFranchise ||
-            (item.clientId != null && activeClientLocalIds.contains(item.clientId)))
+            (item.clientId != null &&
+                activeClientLocalIds.contains(item.clientId)))
         .toList();
     final dirtyRectangles = (await dbService.getDirtyRectangles())
         .where((rect) =>
             !shouldFilterByFranchise ||
             (rect.itemId != null && activeItemLocalIds.contains(rect.itemId)))
         .toList();
+    final dirtyDefaultPrices = shouldFilterByFranchise
+        ? await dbService.getDirtyDefaultPrices(activeFranchiseeId)
+        : <DefaultPrice>[];
     final dirtyWarranties = (await dbService.getDirtyWarranties())
         .where((warranty) =>
             !shouldFilterByFranchise ||
@@ -79,7 +84,8 @@ class SyncService {
     final itemsToSync = <Item>[];
     final resolvedItems = <Map<String, dynamic>>[];
     for (final item in dirtyItems) {
-      final client = item.clientId == null ? null : clientsByLocalId[item.clientId!];
+      final client =
+          item.clientId == null ? null : clientsByLocalId[item.clientId!];
       if (client == null || client.remoteId.isEmpty) {
         continue;
       }
@@ -136,16 +142,70 @@ class SyncService {
       proposalsToSync.add(proposal);
     }
 
+    final clientsToMarkSynced = <Client>[];
+    final resolvedClients = <Map<String, dynamic>>[];
+    final pendingLocalPhotosByClientRemoteId = <String, List<String>>{};
+    for (final client in dirtyClients) {
+      final canonicalPhotos = <String>[];
+      var uploadFailed = false;
+      for (var photoIndex = 0;
+          photoIndex < client.photos.length;
+          photoIndex++) {
+        final photo = client.photos[photoIndex];
+        if (photo.startsWith('/api/photos/client/')) {
+          canonicalPhotos.add(photo);
+          continue;
+        }
+        if (photo.startsWith('http://') || photo.startsWith('https://')) {
+          final relativePath = Uri.tryParse(photo)?.path;
+          if (relativePath != null &&
+              relativePath.startsWith('/api/photos/client/')) {
+            canonicalPhotos.add(relativePath);
+          }
+          continue;
+        }
+
+        try {
+          canonicalPhotos.add(
+            await apiService.uploadClientPhoto(client.remoteId, photo),
+          );
+        } catch (_) {
+          uploadFailed = true;
+          pendingLocalPhotosByClientRemoteId[client.remoteId] = [
+            for (final pendingPhoto in client.photos.skip(photoIndex))
+              if (!pendingPhoto.startsWith('/api/photos/client/') &&
+                  !pendingPhoto.startsWith('http://') &&
+                  !pendingPhoto.startsWith('https://'))
+                pendingPhoto,
+          ];
+          break;
+        }
+      }
+
+      final clientForPayload = client.copyWith(
+        photos: canonicalPhotos,
+        isDirty: true,
+        updatedAt: DateTime.now(),
+      );
+      if (!uploadFailed && canonicalPhotos.length == client.photos.length) {
+        if (canonicalPhotos.join('|') != client.photos.join('|')) {
+          await dbService.updateClient(clientForPayload);
+        }
+        clientsToMarkSynced.add(clientForPayload);
+      }
+      final map = clientForPayload.toMap();
+      map['remote_id'] = clientForPayload.remoteId;
+      resolvedClients.add(map);
+    }
+
     final syncData = {
       'last_sync_time': lastSyncTime,
       'changes': {
-        'clients': dirtyClients.map((c) {
-          var map = c.toMap();
-          map['remote_id'] = c.remoteId;
-          return map;
-        }).toList(),
+        'clients': resolvedClients,
         'items': resolvedItems,
         'rectangles': resolvedRectangles,
+        'default_prices':
+            dirtyDefaultPrices.map((price) => price.toJson()).toList(),
         'warranties': resolvedWarranties,
         'proposals': resolvedProposals,
       }
@@ -169,11 +229,24 @@ class SyncService {
           }
         } else {
           final client = Client.fromMap(clientMap);
+          final pendingLocalPhotos =
+              pendingLocalPhotosByClientRemoteId[remoteId] ?? const <String>[];
+          final clientFromServer = pendingLocalPhotos.isEmpty
+              ? client.copyWith(isDirty: false)
+              : client.copyWith(
+                  photos: [
+                    ...client.photos,
+                    for (final localPhoto in pendingLocalPhotos)
+                      if (!client.photos.contains(localPhoto)) localPhoto,
+                  ],
+                  isDirty: true,
+                );
           if (existingClient != null) {
             await dbService.updateClient(
-                client.copyWith(localId: existingClient.localId, isDirty: false));
+              clientFromServer.copyWith(localId: existingClient.localId),
+            );
           } else {
-            await dbService.insertClient(client.copyWith(isDirty: false));
+            await dbService.insertClient(clientFromServer);
           }
         }
       }
@@ -182,7 +255,8 @@ class SyncService {
       for (var itemMap in updates['items']) {
         final remoteId = itemMap['remote_id'];
         final existingItem = await dbService.getItemByRemoteId(remoteId);
-        final client = await dbService.getClientByRemoteId(itemMap['client_id']);
+        final client =
+            await dbService.getClientByRemoteId(itemMap['client_id']);
 
         if (client != null) {
           if (itemMap['deleted_at'] != null) {
@@ -217,8 +291,8 @@ class SyncService {
             final rect = Rectangle.fromMap(rectMap)
                 .copyWith(itemId: item.localId, isDirty: false);
             if (existingRect != null) {
-              await dbService
-                  .updateRectangle(rect.copyWith(localId: existingRect.localId));
+              await dbService.updateRectangle(
+                  rect.copyWith(localId: existingRect.localId));
             } else {
               await dbService.insertRectangle(rect);
             }
@@ -227,9 +301,53 @@ class SyncService {
       }
 
       // Warranties
+      if (shouldFilterByFranchise) {
+        for (final priceMap in updates['default_prices'] ?? []) {
+          final remoteId = priceMap['remote_id']?.toString();
+          if (remoteId == null || remoteId.isEmpty) continue;
+
+          final existing = await dbService.getDefaultPriceByRemoteId(
+            remoteId,
+            activeFranchiseeId,
+          );
+          if (priceMap['deleted_at'] != null) {
+            if (existing != null && existing.localId != null) {
+              await dbService.deleteDefaultPrice(
+                existing.localId!,
+                franchiseeId: activeFranchiseeId,
+              );
+              await dbService.markAsSynced(
+                'default_prices',
+                remoteId,
+                franchiseeId: activeFranchiseeId,
+              );
+            }
+            continue;
+          }
+
+          final price = DefaultPrice.fromJson(priceMap).copyWith(
+            franchiseeId: activeFranchiseeId,
+            isDirty: false,
+          );
+          if (existing == null) {
+            await dbService.insertDefaultPrice(
+              price,
+              franchiseeId: activeFranchiseeId,
+            );
+          } else {
+            await dbService.updateDefaultPrice(
+              price.copyWith(localId: existing.localId),
+              franchiseeId: activeFranchiseeId,
+            );
+          }
+        }
+      }
+
+      // Warranties
       for (var warrantyMap in updates['warranties'] ?? []) {
         final remoteId = warrantyMap['remote_id'];
-        final existingWarranty = await dbService.getWarrantyByRemoteId(remoteId);
+        final existingWarranty =
+            await dbService.getWarrantyByRemoteId(remoteId);
         final client =
             await dbService.getClientByRemoteId(warrantyMap['client_id']);
 
@@ -254,7 +372,8 @@ class SyncService {
       // Proposals
       for (var proposalMap in updates['proposals'] ?? []) {
         final remoteId = proposalMap['remote_id'];
-        final existingProposal = await dbService.getProposalByRemoteId(remoteId);
+        final existingProposal =
+            await dbService.getProposalByRemoteId(remoteId);
         final client =
             await dbService.getClientByRemoteId(proposalMap['client_id']);
 
@@ -278,7 +397,7 @@ class SyncService {
     }
 
     // 4. Clear dirty flags for records we just sent
-    for (var c in dirtyClients) {
+    for (var c in clientsToMarkSynced) {
       await dbService.markAsSynced('clients', c.remoteId);
     }
     for (var i in itemsToSync) {
@@ -286,6 +405,13 @@ class SyncService {
     }
     for (var r in rectanglesToSync) {
       await dbService.markAsSynced('rectangles', r.remoteId);
+    }
+    for (final price in dirtyDefaultPrices) {
+      await dbService.markAsSynced(
+        'default_prices',
+        price.remoteId,
+        franchiseeId: activeFranchiseeId,
+      );
     }
     for (var w in warrantiesToSync) {
       await dbService.markAsSynced('warranties', w.remoteId);

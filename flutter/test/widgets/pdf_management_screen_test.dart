@@ -2,6 +2,7 @@ import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/proposal.dart';
 import 'package:app_client/src/models/warranty.dart';
 import 'package:app_client/src/providers/client_provider.dart';
+import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/screens/clients/pdf_management_screen.dart';
 import 'package:app_client/src/screens/clients/warranty_form_screen.dart';
 import 'package:flutter/material.dart';
@@ -49,8 +50,13 @@ void main() {
     );
 
     await tester.pumpWidget(
-      ChangeNotifierProvider<ClientProvider>.value(
-        value: provider,
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: provider),
+          Provider<ApiService>.value(
+            value: ApiService(serverUrl: 'http://localhost'),
+          ),
+        ],
         child: MaterialApp(
           home: PdfManagementScreen(client: client),
         ),
@@ -65,7 +71,17 @@ void main() {
     await tester.tap(find.widgetWithText(ElevatedButton, 'Create Warranty'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Warranty Exists'), findsNothing);
+    expect(find.text('Replace active warranty?'), findsOneWidget);
+    expect(
+      find.text(
+        'This client already has an active warranty. Creating a new one will replace it permanently.',
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Replace'));
+    await tester.pumpAndSettle();
+
     expect(find.byType(WarrantyFormScreen), findsOneWidget);
   });
 }

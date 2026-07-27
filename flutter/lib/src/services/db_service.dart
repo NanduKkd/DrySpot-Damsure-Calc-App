@@ -30,7 +30,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 7,
+      version: 8,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -55,6 +55,10 @@ class DbService {
     }
     if (oldVersion < 7) {
       await db.execute('ALTER TABLE rectangles ADD COLUMN image_data TEXT');
+    }
+    if (oldVersion < 8) {
+      await db
+          .execute('ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT');
     }
   }
 
@@ -119,6 +123,7 @@ class DbService {
       CREATE TABLE default_prices (
         local_id INTEGER PRIMARY KEY AUTOINCREMENT,
         remote_id TEXT UNIQUE,
+        franchisee_id TEXT NOT NULL,
         price REAL NOT NULL,
         enabled INTEGER DEFAULT 1,
         is_dirty INTEGER DEFAULT 1,
@@ -308,35 +313,50 @@ class DbService {
   }
 
   // DefaultPrice CRUD
-  Future<int> insertDefaultPrice(DefaultPrice defaultPrice) async {
+  Future<int> insertDefaultPrice(DefaultPrice defaultPrice,
+      {required String franchiseeId}) async {
+    if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
+      throw ArgumentError(
+          'Default prices must belong to the active franchisee');
+    }
     final db = await database;
     return await db.insert('default_prices', defaultPrice.toMap());
   }
 
-  Future<List<DefaultPrice>> getDefaultPrices() async {
+  Future<List<DefaultPrice>> getDefaultPrices(String franchiseeId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('default_prices',
-        where: 'deleted_at IS NULL', orderBy: 'updated_at ASC');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'default_prices',
+      where: 'franchisee_id = ? AND deleted_at IS NULL',
+      whereArgs: [franchiseeId],
+      orderBy: 'updated_at ASC',
+    );
     return List.generate(maps.length, (i) => DefaultPrice.fromMap(maps[i]));
   }
 
-  Future<int> updateDefaultPrice(DefaultPrice defaultPrice) async {
+  Future<int> updateDefaultPrice(DefaultPrice defaultPrice,
+      {required String franchiseeId}) async {
+    if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
+      throw ArgumentError(
+          'Default prices must belong to the active franchisee');
+    }
     final db = await database;
     return await db.update(
       'default_prices',
       defaultPrice.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [defaultPrice.localId],
+      where: 'local_id = ? AND franchisee_id = ?',
+      whereArgs: [defaultPrice.localId, franchiseeId],
     );
   }
 
-  Future<int> deleteDefaultPrice(int localId) async {
+  Future<int> deleteDefaultPrice(int localId,
+      {required String franchiseeId}) async {
     final db = await database;
     return await db.update(
       'default_prices',
       {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
+      where: 'local_id = ? AND franchisee_id = ?',
+      whereArgs: [localId, franchiseeId],
     );
   }
 
@@ -444,11 +464,26 @@ class DbService {
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
-  Future<List<DefaultPrice>> getDirtyDefaultPrices() async {
+  Future<List<DefaultPrice>> getDirtyDefaultPrices(String franchiseeId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('default_prices', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'default_prices',
+      where: 'is_dirty = 1 AND franchisee_id = ?',
+      whereArgs: [franchiseeId],
+    );
     return List.generate(maps.length, (i) => DefaultPrice.fromMap(maps[i]));
+  }
+
+  Future<DefaultPrice?> getDefaultPriceByRemoteId(
+      String remoteId, String franchiseeId) async {
+    final db = await database;
+    final maps = await db.query(
+      'default_prices',
+      where: 'remote_id = ? AND franchisee_id = ?',
+      whereArgs: [remoteId, franchiseeId],
+      limit: 1,
+    );
+    return maps.isEmpty ? null : DefaultPrice.fromMap(maps.first);
   }
 
   Future<List<Warranty>> getDirtyWarranties() async {
@@ -465,9 +500,20 @@ class DbService {
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
-  Future<void> markAsSynced(String table, String remoteId) async {
+  Future<void> markAsSynced(String table, String remoteId,
+      {String? franchiseeId}) async {
     final db = await database;
-    await db.update(table, {'is_dirty': 0},
-        where: 'remote_id = ?', whereArgs: [remoteId]);
+    final tenantScoped = table == 'default_prices';
+    if (tenantScoped && (franchiseeId == null || franchiseeId.isEmpty)) {
+      throw ArgumentError('A franchisee is required for default-price sync');
+    }
+    await db.update(
+      table,
+      {'is_dirty': 0},
+      where: tenantScoped
+          ? 'remote_id = ? AND franchisee_id = ?'
+          : 'remote_id = ?',
+      whereArgs: tenantScoped ? [remoteId, franchiseeId] : [remoteId],
+    );
   }
 }

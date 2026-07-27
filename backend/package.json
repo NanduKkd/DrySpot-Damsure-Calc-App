@@ -16,7 +16,8 @@
     "test:coverage": "jest --coverage",
     "test:unit": "jest --testPathPattern=src/",
     "test:integration": "jest --testPathPattern=tests/integration",
-    "db:migrate": "sequelize-cli db:migrate",
+    "db:migrate": "sequelize-cli db:migrate --env ${NODE_ENV:-development}",
+    "db:migrate:undo": "sequelize-cli db:migrate:undo --env ${NODE_ENV:-development}",
     "db:seed": "sequelize-cli db:seed:all"
   },
   "dependencies": {

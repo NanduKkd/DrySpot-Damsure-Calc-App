@@ -2,8 +2,10 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
+import 'package:provider/provider.dart';
 
 import '../../services/pdf_service.dart';
+import '../../services/api_service.dart';
 
 class PdfPreviewScreen extends StatefulWidget {
   const PdfPreviewScreen({
@@ -20,12 +22,13 @@ class PdfPreviewScreen extends StatefulWidget {
 }
 
 class _PdfPreviewScreenState extends State<PdfPreviewScreen> {
-  final PdfService _pdfService = PdfService();
+  late final PdfService _pdfService;
   late final Future<Uint8List> _pdfBytesFuture;
 
   @override
   void initState() {
     super.initState();
+    _pdfService = PdfService(apiService: context.read<ApiService>());
     _pdfBytesFuture = _pdfService.loadPdfBytes(widget.pdfUrl);
   }
 

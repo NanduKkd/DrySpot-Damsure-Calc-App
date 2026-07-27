@@ -7,9 +7,14 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/client.dart';
+import 'api_service.dart';
 import '../utils/warranty_date_utils.dart';
 
 class PdfService {
+  PdfService({ApiService? apiService})
+      : _apiService = apiService ?? ApiService();
+
+  final ApiService _apiService;
   Future<File> generateWarrantyPdf({
     required Client client,
     required String customerName,
@@ -608,11 +613,35 @@ class PdfService {
     );
   }
 
-  Future<Uint8List> loadPdfBytes(String pdfUrl) async {
+  Uri? resolveProtectedPdfUrl(String pdfUrl) {
     final uri = Uri.tryParse(pdfUrl);
+    final configuredServer = Uri.parse(_apiService.serverUrl);
+    final relativePath = uri != null && !uri.hasScheme ? uri.path : pdfUrl;
+    final path = relativePath.startsWith('/') ? relativePath : '';
+    final isProtectedPath =
+        path.startsWith('/api/warranty/') || path.startsWith('/api/proposal/');
+    if (isProtectedPath) return Uri.parse(_apiService.resolveUrl(path));
 
-    if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
-      final response = await http.get(uri);
+    if (uri != null &&
+        uri.hasScheme &&
+        uri.scheme == configuredServer.scheme &&
+        uri.host == configuredServer.host &&
+        uri.port == configuredServer.port &&
+        (uri.path.startsWith('/api/warranty/') ||
+            uri.path.startsWith('/api/proposal/'))) {
+      return uri;
+    }
+    return null;
+  }
+
+  Future<Uint8List> loadPdfBytes(String pdfUrl) async {
+    final protectedUri = resolveProtectedPdfUrl(pdfUrl);
+
+    if (protectedUri != null) {
+      final response = await http.get(
+        protectedUri,
+        headers: _apiService.authenticatedHeaders,
+      );
       if (response.statusCode == 200) {
         return response.bodyBytes;
       }
@@ -620,6 +649,7 @@ class PdfService {
       throw Exception('Failed to load PDF (${response.statusCode})');
     }
 
+    final uri = Uri.tryParse(pdfUrl);
     final filePath =
         uri != null && uri.scheme == 'file' ? uri.toFilePath() : pdfUrl;
     final file = File(filePath);
@@ -629,6 +659,25 @@ class PdfService {
     }
 
     return file.readAsBytes();
+  }
+
+  Future<void> deleteRemotePdf(String pdfUrl) async {
+    final uri = resolveProtectedPdfUrl(pdfUrl);
+    if (uri == null) {
+      return;
+    }
+    final segments = List<String>.from(uri.pathSegments);
+    if (segments.length < 4 || segments.last != 'download') {
+      throw Exception('This PDF cannot be deleted from the server.');
+    }
+    segments.removeLast();
+    final response = await http.delete(
+      uri.replace(pathSegments: segments),
+      headers: _apiService.authenticatedHeaders,
+    );
+    if (response.statusCode != 204) {
+      throw Exception('Failed to delete PDF (${response.statusCode})');
+    }
   }
 
   String buildPdfFileName({

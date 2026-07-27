@@ -94,6 +94,33 @@ class ApiService {
         if (_hasToken) 'Authorization': 'Bearer $_token',
       };
 
+  Map<String, String> get authenticatedHeaders => {
+        if (_hasToken) 'Authorization': 'Bearer $_token',
+      };
+
+  String resolveUrl(String pathOrUrl) {
+    final uri = Uri.tryParse(pathOrUrl);
+    if (uri != null && uri.hasScheme) return pathOrUrl;
+    return '$_serverUrl${pathOrUrl.startsWith('/') ? '' : '/'}$pathOrUrl';
+  }
+
+  String? resolveProtectedClientPhotoUrl(String photoUrl) {
+    if (photoUrl.startsWith('/api/photos/client/')) {
+      return resolveUrl(photoUrl);
+    }
+    final uri = Uri.tryParse(photoUrl);
+    final server = Uri.parse(_serverUrl);
+    if (uri == null ||
+        !uri.hasScheme ||
+        uri.scheme != server.scheme ||
+        uri.host != server.host ||
+        uri.port != server.port ||
+        !uri.path.startsWith('/api/photos/client/')) {
+      return null;
+    }
+    return photoUrl;
+  }
+
   Map<String, dynamic> _decodeObjectBody(
     String body, {
     required String fallbackMessage,
@@ -243,6 +270,46 @@ class ApiService {
       throw ApiException(
         _extractErrorMessage(response, 'Failed to delete proposal'),
       );
+    }
+  }
+
+  Future<String> uploadClientPhoto(String clientId, String filePath) async {
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$baseUrl/photos/client/$clientId'),
+    );
+    request.headers.addAll(authenticatedHeaders);
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+
+    final response = await http.Response.fromStream(await request.send());
+    if (response.statusCode != 201) {
+      throw ApiException(
+          _extractErrorMessage(response, 'Failed to upload photo'));
+    }
+    final payload = _decodeObjectBody(
+      response.body,
+      fallbackMessage:
+          'Photo upload succeeded but the server response was invalid.',
+    );
+    final url = payload['url']?.toString();
+    if (url == null || !url.startsWith('/api/photos/client/')) {
+      throw const ApiException('Photo upload returned an invalid URL.');
+    }
+    return url;
+  }
+
+  Future<void> deleteClientPhoto(String photoUrl) async {
+    final resolvedUrl = resolveProtectedClientPhotoUrl(photoUrl);
+    if (resolvedUrl == null) {
+      throw const ApiException('Photo URL is not on the configured server.');
+    }
+    final response = await http.delete(
+      Uri.parse(resolvedUrl),
+      headers: authenticatedHeaders,
+    );
+    if (response.statusCode != 204) {
+      throw ApiException(
+          _extractErrorMessage(response, 'Failed to delete photo'));
     }
   }
 }

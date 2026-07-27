@@ -5,6 +5,7 @@ import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/screens/clients/client_photo_gallery_screen.dart';
 import 'package:app_client/src/screens/clients/client_photo_preview_screen.dart';
 import 'package:app_client/src/services/client_photo_service.dart';
+import 'package:app_client/src/services/api_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image_picker/image_picker.dart';
@@ -121,8 +122,25 @@ class FakeClientPhotoService extends ClientPhotoService {
   }
 
   @override
-  ImageProvider<Object> buildImageProvider(String photoPath) {
+  ImageProvider<Object> buildImageProvider(
+    String photoPath, {
+    ApiService? apiService,
+  }) {
     return MemoryImage(_transparentImage);
+  }
+}
+
+class FakeApiService extends ApiService {
+  FakeApiService({this.failDelete = false})
+      : super(serverUrl: 'http://localhost');
+
+  final List<String> deletedPhotoUrls = [];
+  final bool failDelete;
+
+  @override
+  Future<void> deleteClientPhoto(String photoUrl) async {
+    deletedPhotoUrls.add(photoUrl);
+    if (failDelete) throw const ApiException('delete failed');
   }
 }
 
@@ -131,9 +149,15 @@ void main() {
     required Client client,
     required MockClientProvider provider,
     required FakeClientPhotoService photoService,
+    ApiService? apiService,
   }) {
-    return ChangeNotifierProvider<ClientProvider>.value(
-      value: provider,
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider<ClientProvider>.value(value: provider),
+        Provider<ApiService>.value(
+          value: apiService ?? ApiService(serverUrl: 'http://localhost'),
+        ),
+      ],
       child: MaterialApp(
         home: ClientPhotoGalleryScreen(
           client: client,
@@ -221,5 +245,58 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byType(ClientPhotoPreviewScreen), findsOneWidget);
+  });
+
+  testWidgets('remote photo metadata is removed only after server deletion',
+      (tester) async {
+    const remotePhoto = '/api/photos/client/client-remote-id/server.jpg';
+    final client = Client(
+      name: 'Acme',
+      localId: 1,
+      photos: const [remotePhoto],
+    );
+    final provider = MockClientProvider(client);
+    final photoService = FakeClientPhotoService();
+    final apiService = FakeApiService();
+
+    await tester.pumpWidget(buildTestApp(
+      client: client,
+      provider: provider,
+      photoService: photoService,
+      apiService: apiService,
+    ));
+    await tester.tap(find.byKey(const ValueKey('clientPhotoDelete_0')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Delete'));
+    await tester.pumpAndSettle();
+
+    expect(apiService.deletedPhotoUrls, [remotePhoto]);
+    expect(photoService.deletedPhotoPaths, isEmpty);
+    expect(provider.updatedClient?.photos, isEmpty);
+  });
+
+  testWidgets('failed server deletion preserves remote photo metadata',
+      (tester) async {
+    const remotePhoto = '/api/photos/client/client-remote-id/server.jpg';
+    final client =
+        Client(name: 'Acme', localId: 1, photos: const [remotePhoto]);
+    final provider = MockClientProvider(client);
+    final photoService = FakeClientPhotoService();
+    final apiService = FakeApiService(failDelete: true);
+
+    await tester.pumpWidget(buildTestApp(
+      client: client,
+      provider: provider,
+      photoService: photoService,
+      apiService: apiService,
+    ));
+    await tester.tap(find.byKey(const ValueKey('clientPhotoDelete_0')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Delete'));
+    await tester.pumpAndSettle();
+
+    expect(apiService.deletedPhotoUrls, [remotePhoto]);
+    expect(provider.updatedClient, isNull);
+    expect(find.text('Error deleting photo: delete failed'), findsOneWidget);
   });
 }

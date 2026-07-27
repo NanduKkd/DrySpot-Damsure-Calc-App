@@ -20,6 +20,8 @@ class MockClientProvider extends ChangeNotifier implements ClientProvider {
   List<Client> get clients => [_client];
   @override
   bool get isLoading => false;
+  @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
 
   @override
   Future<void> updateClient(Client client) async {
@@ -72,6 +74,8 @@ class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
   List<DefaultPrice> get defaultPrices => [];
   @override
   Future<void> loadSettings() async {}
+  @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
   @override
   double get firstDefaultPrice => 45.0;
   @override

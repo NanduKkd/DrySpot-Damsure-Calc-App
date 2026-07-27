@@ -16,13 +16,15 @@ class MockApiService extends Mock implements ApiService {}
 class FakeAuthProvider extends ChangeNotifier implements AuthProvider {
   @override
   String? get franchiseeId => 'test-franchisee';
-  
+
   @override
   String? get franchiseeName => 'Test Franchisee Name';
-  
+
   @override
   bool get isAuthenticated => true;
-  
+  @override
+  bool get isRestoringSession => false;
+
   String? get token => 'dummy-token';
 
   @override
@@ -36,7 +38,7 @@ class FakeAuthProvider extends ChangeNotifier implements AuthProvider {
 
   @override
   Future<void> logout() async {}
-  
+
   Future<void> checkAuthStatus() async {}
 
   @override
@@ -57,30 +59,33 @@ void main() {
       return MaterialApp(
         home: MultiProvider(
           providers: [
-            ChangeNotifierProvider<ClientProvider>.value(value: mockClientProvider),
-            ChangeNotifierProvider<AuthProvider>(create: (_) => FakeAuthProvider()),
+            ChangeNotifierProvider<ClientProvider>.value(
+                value: mockClientProvider),
+            ChangeNotifierProvider<AuthProvider>(
+                create: (_) => FakeAuthProvider()),
           ],
           child: const ClientFormScreen(),
         ),
       );
     }
 
-    testWidgets('displays Site Address field and saves it', (WidgetTester tester) async {
+    testWidgets('displays Site Address field and saves it',
+        (WidgetTester tester) async {
       await tester.pumpWidget(createWidgetUnderTest());
 
       expect(find.text('Site Address'), findsOneWidget);
 
       await tester.enterText(find.byType(TextFormField).at(0), 'Test Client');
-      await tester.enterText(find.byType(TextFormField).at(2), '123 Build Site');
-      
+      await tester.enterText(
+          find.byType(TextFormField).at(2), '123 Build Site');
+
       await tester.tap(find.byType(ElevatedButton).first);
       await tester.pumpAndSettle();
 
-      verify(mockClientProvider.addClient(argThat(
-        isA<Client>()
-          .having((c) => c.name, 'name', 'Test Client')
-          .having((c) => c.siteAddress, 'siteAddress', '123 Build Site')
-      ))).called(1);
+      verify(mockClientProvider.addClient(argThat(isA<Client>()
+              .having((c) => c.name, 'name', 'Test Client')
+              .having((c) => c.siteAddress, 'siteAddress', '123 Build Site'))))
+          .called(1);
     });
   });
 }

@@ -5,6 +5,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
+import 'api_service.dart';
+
 class ClientPhotoService {
   ClientPhotoService({
     ImagePicker? imagePicker,
@@ -59,12 +61,23 @@ class ClientPhotoService {
 
   bool isRemotePhotoPath(String photoPath) {
     final uri = Uri.tryParse(photoPath);
-    return uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+    return (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) ||
+        photoPath.startsWith('/api/photos/client/');
   }
 
-  ImageProvider<Object> buildImageProvider(String photoPath) {
+  ImageProvider<Object> buildImageProvider(
+    String photoPath, {
+    ApiService? apiService,
+  }) {
     if (isRemotePhotoPath(photoPath)) {
-      return NetworkImage(photoPath);
+      final resolvedUrl = apiService?.resolveProtectedClientPhotoUrl(photoPath);
+      if (resolvedUrl == null) {
+        throw ArgumentError('Photo URL is not on the configured server.');
+      }
+      return NetworkImage(
+        resolvedUrl,
+        headers: apiService?.authenticatedHeaders,
+      );
     }
 
     return FileImage(File(_normalizeLocalPath(photoPath)));

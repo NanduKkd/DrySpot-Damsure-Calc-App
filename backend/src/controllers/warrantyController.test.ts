@@ -1,19 +1,20 @@
-import path from 'path';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import app from '../app';
 import { Client, Franchisee, User, Warranty } from '../models';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
-const samplePdfPath = path.resolve(__dirname, '../../../artifacts/proposal_emulator_sample.pdf');
+const JWT_SECRET = process.env.JWT_SECRET!;
+const samplePdf = Buffer.from('%PDF-1.4\nminimal test PDF\n%%EOF');
 
 describe('warrantyController', () => {
 	let franchisee: any;
 	let otherFranchisee: any;
 	let user: any;
+	let otherUser: any;
 	let client: any;
 	let otherClient: any;
 	let token: string;
+	let otherToken: string;
 
 	beforeAll(async () => {
 		franchisee = await Franchisee.create({
@@ -43,8 +44,16 @@ describe('warrantyController', () => {
 			name: 'Client 2',
 			franchiseeId: otherFranchisee.id,
 		});
+		otherUser = await User.create({
+			id: 'u2-id',
+			name: 'User 2',
+			email: 'user2@example.com',
+			password: 'password',
+			franchiseeId: otherFranchisee.id,
+		});
 
 		token = jwt.sign({ id: user.id, franchiseeId: franchisee.id }, JWT_SECRET);
+		otherToken = jwt.sign({ id: otherUser.id, franchiseeId: otherFranchisee.id }, JWT_SECRET);
 	});
 
 	describe('POST /api/warranty/upload', () => {
@@ -52,21 +61,78 @@ describe('warrantyController', () => {
 			const response = await request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
+				.set('Host', 'attacker.invalid')
 				.field('client_id', client.id)
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-001')
-				.attach('file', samplePdfPath, {
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
 				});
 
 			expect(response.status).toBe(201);
-			expect(response.body.pdfUrl).toContain('/uploads/');
+			expect(response.body.pdfUrl).toMatch(/^\/api\/warranty\/[0-9a-f-]+\/download$/);
+			expect(response.body.pdfUrl).not.toContain('attacker.invalid');
 			expect(response.body.warrantyCardNumber).toBe('WARR-001');
 
 			const warranty = await Warranty.findOne({ where: { clientId: client.id } });
 			expect(warranty).toBeDefined();
 			expect((warranty as any).warrantyCardNumber).toBe('WARR-001');
+
+			const unauthorizedDownload = await request(app)
+				.get(`/api/warranty/${response.body.id}/download`);
+			expect(unauthorizedDownload.status).toBe(401);
+		});
+
+		it('serves the PDF only to the owning authenticated franchisee', async () => {
+			const upload = await request(app)
+				.post('/api/warranty/upload')
+				.set('Authorization', `Bearer ${token}`)
+				.field('client_id', client.id)
+				.field('start_date', new Date().toISOString())
+				.field('duration_years', '5')
+				.field('warranty_card_number', 'WARR-DOWNLOAD')
+				.field('replace_existing', 'true')
+				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+
+			expect(upload.status).toBe(201);
+			const ownedDownload = await request(app)
+				.get(upload.body.pdfUrl)
+				.set('Authorization', `Bearer ${token}`);
+			expect(ownedDownload.status).toBe(200);
+			expect(ownedDownload.headers['content-type']).toMatch(/application\/pdf/);
+			expect(ownedDownload.body).toEqual(samplePdf);
+
+			const foreignDownload = await request(app)
+				.get(upload.body.pdfUrl)
+				.set('Authorization', `Bearer ${otherToken}`);
+			expect(foreignDownload.status).toBe(404);
+		});
+
+		it('requires explicit replacement when an active warranty exists', async () => {
+			const response = await request(app)
+				.post('/api/warranty/upload')
+				.set('Authorization', `Bearer ${token}`)
+				.field('client_id', client.id)
+				.field('start_date', new Date().toISOString())
+				.field('duration_years', '5')
+				.field('warranty_card_number', 'WARR-REPLACE')
+				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+
+			expect(response.status).toBe(409);
+
+			const replacement = await request(app)
+				.post('/api/warranty/upload')
+				.set('Authorization', `Bearer ${token}`)
+				.field('client_id', client.id)
+				.field('start_date', new Date().toISOString())
+				.field('duration_years', '5')
+				.field('warranty_card_number', 'WARR-REPLACE')
+				.field('replace_existing', 'true')
+				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+			expect(replacement.status).toBe(201);
+			expect(await Warranty.count({ where: { activeClientId: client.id } })).toBe(1);
 		});
 
 		it('returns 400 when client_id is missing', async () => {
@@ -76,7 +142,8 @@ describe('warrantyController', () => {
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-002')
-				.attach('file', samplePdfPath, {
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
 				});
 
@@ -92,7 +159,8 @@ describe('warrantyController', () => {
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-003')
-				.attach('file', samplePdfPath, {
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
 				});
 
@@ -110,7 +178,8 @@ describe('warrantyController', () => {
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-004')
-				.attach('file', samplePdfPath, {
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
 				});
 

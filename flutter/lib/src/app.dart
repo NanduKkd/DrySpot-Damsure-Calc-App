@@ -35,8 +35,17 @@ class App extends StatelessWidget {
             return provider;
           },
         ),
-        ChangeNotifierProvider(
-            create: (_) => SettingsProvider()..loadSettings()),
+        ChangeNotifierProxyProvider<AuthProvider, SettingsProvider>(
+          create: (_) => SettingsProvider(),
+          update: (_, auth, settingsProvider) {
+            final provider = settingsProvider ?? SettingsProvider();
+            provider.updateSession(
+              isAuthenticated: auth.isAuthenticated,
+              franchiseeId: auth.franchiseeId,
+            );
+            return provider;
+          },
+        ),
         ChangeNotifierProvider(
             create: (_) => SyncProvider(syncService: syncService)),
         Provider.value(value: apiService),

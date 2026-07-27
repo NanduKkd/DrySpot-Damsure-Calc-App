@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../../services/client_photo_service.dart';
+import '../../services/api_service.dart';
+import 'package:provider/provider.dart';
 
 class ClientPhotoPreviewScreen extends StatelessWidget {
   const ClientPhotoPreviewScreen({
@@ -40,7 +42,10 @@ class ClientPhotoPreviewScreen extends StatelessWidget {
         maxScale: 4,
         child: Center(
           child: Image(
-            image: photoService.buildImageProvider(photoPath),
+            image: photoService.buildImageProvider(
+              photoPath,
+              apiService: context.read<ApiService?>(),
+            ),
             fit: BoxFit.contain,
             errorBuilder: (context, error, stackTrace) {
               return const Padding(

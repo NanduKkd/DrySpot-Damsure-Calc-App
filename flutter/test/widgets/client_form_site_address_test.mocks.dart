@@ -3,12 +3,14 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i4;
-import 'dart:ui' as _i7;
+import 'dart:async' as _i6;
+import 'dart:ui' as _i9;
 
 import 'package:app_client/src/models/client.dart' as _i3;
-import 'package:app_client/src/models/item.dart' as _i5;
-import 'package:app_client/src/models/rectangle.dart' as _i6;
+import 'package:app_client/src/models/item.dart' as _i7;
+import 'package:app_client/src/models/proposal.dart' as _i5;
+import 'package:app_client/src/models/rectangle.dart' as _i8;
+import 'package:app_client/src/models/warranty.dart' as _i4;
 import 'package:app_client/src/providers/client_provider.dart' as _i2;
 import 'package:mockito/mockito.dart' as _i1;
 
@@ -48,123 +50,152 @@ class MockClientProvider extends _i1.Mock implements _i2.ClientProvider {
       ) as bool);
 
   @override
+  List<_i4.Warranty> get currentClientWarranties => (super.noSuchMethod(
+        Invocation.getter(#currentClientWarranties),
+        returnValue: <_i4.Warranty>[],
+      ) as List<_i4.Warranty>);
+
+  @override
+  List<_i5.Proposal> get currentClientProposals => (super.noSuchMethod(
+        Invocation.getter(#currentClientProposals),
+        returnValue: <_i5.Proposal>[],
+      ) as List<_i5.Proposal>);
+
+  @override
   bool get hasListeners => (super.noSuchMethod(
         Invocation.getter(#hasListeners),
         returnValue: false,
       ) as bool);
 
   @override
-  _i4.Future<void> loadClients() => (super.noSuchMethod(
+  void updateSession({
+    required bool? isAuthenticated,
+    String? franchiseeId,
+  }) =>
+      super.noSuchMethod(
+        Invocation.method(
+          #updateSession,
+          [],
+          {
+            #isAuthenticated: isAuthenticated,
+            #franchiseeId: franchiseeId,
+          },
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  _i6.Future<void> loadClients() => (super.noSuchMethod(
         Invocation.method(
           #loadClients,
           [],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> addClient(_i3.Client? client) => (super.noSuchMethod(
+  _i6.Future<void> addClient(_i3.Client? client) => (super.noSuchMethod(
         Invocation.method(
           #addClient,
           [client],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> updateClient(_i3.Client? client) => (super.noSuchMethod(
+  _i6.Future<void> updateClient(_i3.Client? client) => (super.noSuchMethod(
         Invocation.method(
           #updateClient,
           [client],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> deleteClient(int? localId) => (super.noSuchMethod(
+  _i6.Future<void> deleteClient(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #deleteClient,
           [localId],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<int> addItem(_i5.Item? item) => (super.noSuchMethod(
+  _i6.Future<int> addItem(_i7.Item? item) => (super.noSuchMethod(
         Invocation.method(
           #addItem,
           [item],
         ),
-        returnValue: _i4.Future<int>.value(0),
-      ) as _i4.Future<int>);
+        returnValue: _i6.Future<int>.value(0),
+      ) as _i6.Future<int>);
 
   @override
-  _i4.Future<_i5.Item?> getItemByLocalId(int? localId) => (super.noSuchMethod(
+  _i6.Future<_i7.Item?> getItemByLocalId(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #getItemByLocalId,
           [localId],
         ),
-        returnValue: _i4.Future<_i5.Item?>.value(),
-      ) as _i4.Future<_i5.Item?>);
+        returnValue: _i6.Future<_i7.Item?>.value(),
+      ) as _i6.Future<_i7.Item?>);
 
   @override
-  _i4.Future<void> updateItem(_i5.Item? item) => (super.noSuchMethod(
+  _i6.Future<void> updateItem(_i7.Item? item) => (super.noSuchMethod(
         Invocation.method(
           #updateItem,
           [item],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> deleteItem(int? localId) => (super.noSuchMethod(
+  _i6.Future<void> deleteItem(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #deleteItem,
           [localId],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> addRectangle(_i6.Rectangle? rectangle) =>
+  _i6.Future<void> addRectangle(_i8.Rectangle? rectangle) =>
       (super.noSuchMethod(
         Invocation.method(
           #addRectangle,
           [rectangle],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> updateRectangle(_i6.Rectangle? rectangle) =>
+  _i6.Future<void> updateRectangle(_i8.Rectangle? rectangle) =>
       (super.noSuchMethod(
         Invocation.method(
           #updateRectangle,
           [rectangle],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> deleteRectangle(int? localId) => (super.noSuchMethod(
+  _i6.Future<void> deleteRectangle(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #deleteRectangle,
           [localId],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  _i4.Future<void> applyBulkPrice(
+  _i6.Future<void> applyBulkPrice(
     int? clientLocalId,
     double? price,
   ) =>
@@ -176,12 +207,86 @@ class MockClientProvider extends _i1.Mock implements _i2.ClientProvider {
             price,
           ],
         ),
-        returnValue: _i4.Future<void>.value(),
-        returnValueForMissingStub: _i4.Future<void>.value(),
-      ) as _i4.Future<void>);
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
 
   @override
-  void addListener(_i7.VoidCallback? listener) => super.noSuchMethod(
+  _i6.Future<void> loadWarranties(int? clientLocalId) => (super.noSuchMethod(
+        Invocation.method(
+          #loadWarranties,
+          [clientLocalId],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  _i6.Future<void> loadProposals(int? clientLocalId) => (super.noSuchMethod(
+        Invocation.method(
+          #loadProposals,
+          [clientLocalId],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  _i6.Future<void> addWarranty(_i4.Warranty? warranty) => (super.noSuchMethod(
+        Invocation.method(
+          #addWarranty,
+          [warranty],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  _i6.Future<void> addProposal(_i5.Proposal? proposal) => (super.noSuchMethod(
+        Invocation.method(
+          #addProposal,
+          [proposal],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  _i6.Future<void> deleteWarranty(
+    int? localId,
+    int? clientLocalId,
+  ) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #deleteWarranty,
+          [
+            localId,
+            clientLocalId,
+          ],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  _i6.Future<void> deleteProposal(
+    int? localId,
+    int? clientLocalId,
+  ) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #deleteProposal,
+          [
+            localId,
+            clientLocalId,
+          ],
+        ),
+        returnValue: _i6.Future<void>.value(),
+        returnValueForMissingStub: _i6.Future<void>.value(),
+      ) as _i6.Future<void>);
+
+  @override
+  void addListener(_i9.VoidCallback? listener) => super.noSuchMethod(
         Invocation.method(
           #addListener,
           [listener],
@@ -190,7 +295,7 @@ class MockClientProvider extends _i1.Mock implements _i2.ClientProvider {
       );
 
   @override
-  void removeListener(_i7.VoidCallback? listener) => super.noSuchMethod(
+  void removeListener(_i9.VoidCallback? listener) => super.noSuchMethod(
         Invocation.method(
           #removeListener,
           [listener],

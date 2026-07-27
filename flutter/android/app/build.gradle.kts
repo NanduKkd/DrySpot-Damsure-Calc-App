@@ -10,11 +10,25 @@ plugins {
 
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
-val hasReleaseSigning = keystorePropertiesFile.exists()
+val requiredSigningProperties = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
 
-if (hasReleaseSigning) {
+if (keystorePropertiesFile.exists()) {
     FileInputStream(keystorePropertiesFile).use { keystoreProperties.load(it) }
 }
+
+val releaseSigningProblems = buildList {
+    if (!keystorePropertiesFile.isFile) {
+        add("android/key.properties is missing")
+    } else {
+        requiredSigningProperties.filter { keystoreProperties.getProperty(it).isNullOrBlank() }
+            .forEach { add("android/key.properties is missing $it") }
+        val storeFilePath = keystoreProperties.getProperty("storeFile")
+        if (!storeFilePath.isNullOrBlank() && !rootProject.file(storeFilePath).isFile) {
+            add("the configured release keystore file is missing or unreadable")
+        }
+    }
+}
+val hasCompleteReleaseSigning = releaseSigningProblems.isEmpty()
 
 android {
     namespace = "com.dryspotuppala"
@@ -39,7 +53,7 @@ android {
     }
 
     signingConfigs {
-        if (hasReleaseSigning) {
+        if (hasCompleteReleaseSigning) {
             create("release") {
                 keyAlias = keystoreProperties.getProperty("keyAlias")
                 keyPassword = keystoreProperties.getProperty("keyPassword")
@@ -52,8 +66,21 @@ android {
 
     buildTypes {
         release {
-            if (hasReleaseSigning) {
+            if (hasCompleteReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
+            }
+        }
+    }
+}
+
+// Do not silently produce an unsigned/debug-signed release artifact.  Values
+// are intentionally never included in this diagnostic.
+tasks.configureEach {
+    if (name in setOf("assembleRelease", "bundleRelease", "packageRelease", "signReleaseBundle")) {
+        doFirst {
+            check(hasCompleteReleaseSigning) {
+                "Release signing is not configured: ${releaseSigningProblems.joinToString("; ")}. " +
+                    "See docs/current/android-release-runbook.md."
             }
         }
     }
