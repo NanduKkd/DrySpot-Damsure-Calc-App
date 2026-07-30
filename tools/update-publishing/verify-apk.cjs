@@ -12,13 +12,16 @@ async function main() {
   const artifactPath = arg('artifact');
   const expectedPackageId = arg('package-id');
   const expectedVersionCode = Number(arg('version-code'));
+  const expectedVersionName = arg('version-name');
   const expectedCertificateSha256 = arg('certificate-sha256');
-  if (!artifactPath || !expectedPackageId || !Number.isInteger(expectedVersionCode) || !expectedCertificateSha256) {
-    throw new Error('usage: verify-apk.cjs --artifact APK --package-id ID --version-code N --certificate-sha256 SHA256 [--sha256 SHA256] [--size-bytes N]');
+  const aapt = arg('aapt');
+  const apksigner = arg('apksigner');
+  if (!artifactPath || !expectedPackageId || !Number.isInteger(expectedVersionCode) || !expectedVersionName || !expectedCertificateSha256 || !aapt || !apksigner) {
+    throw new Error('usage: verify-apk.cjs --artifact APK --package-id ID --version-code N --version-name X.Y.Z --certificate-sha256 SHA256 --aapt ABSOLUTE_PATH --apksigner ABSOLUTE_PATH --sha256 SHA256 --size-bytes N');
   }
   const result = await verifyApkArtifact({ artifactPath, expectedPackageId, expectedVersionCode, expectedCertificateSha256,
-    expectedSha256: arg('sha256'), expectedSizeBytes: arg('size-bytes') ? Number(arg('size-bytes')) : undefined,
-    aapt: process.env.AAPT || 'aapt', apksigner: process.env.APKSIGNER || 'apksigner' });
+    expectedVersionName, expectedSha256: arg('sha256'), expectedSizeBytes: arg('size-bytes') ? Number(arg('size-bytes')) : undefined,
+    trustedTools: { aapt, apksigner } });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 

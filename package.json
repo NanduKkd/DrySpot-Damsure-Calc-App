@@ -25,6 +25,7 @@
     "test:backend:integration": "./scripts/test-summary.sh backend integration",
     "test:update-publishing": "node --test tools/update-publishing/test/*.test.cjs",
     "check:update-nginx": "./tools/update-publishing/check-nginx-release-template.sh",
+    "check:gradle-release-guard": "./tools/update-publishing/check-gradle-release-guard.sh",
     "check:production-isolation": "./tools/update-publishing/check-production-isolation.sh",
     "setup": "./setup.sh",
     "lint": "npm run lint:flutter && npm run lint:backend",

@@ -2,10 +2,23 @@ import 'dart:convert';
 
 /// The release endpoint is deliberately independent from the configurable API
 /// base URL. It is a release-policy trust boundary, not an API route.
-const String releaseManifestEndpoint =
-    'https://damsure.nandakrishnan.in/releases/manifest.json';
+const String _productionReleaseOrigin = 'https://damsure.nandakrishnan.in';
+const String _releaseFlavor = String.fromEnvironment(
+  'FLUTTER_APP_FLAVOR',
+  defaultValue: 'production',
+);
+const String _stagingReleaseOrigin = String.fromEnvironment(
+  'DAMSURE_STAGING_ORIGIN',
+);
 
-const String _releaseHost = 'damsure.nandakrishnan.in';
+/// Flavor-bound trust endpoint. Production is fixed; staging is compiled only
+/// with the validated origin enforced by the Android Gradle configuration.
+String get releaseManifestEndpoint =>
+    '${_releaseOriginForFlavor()}/releases/manifest.json';
+
+String _releaseOriginForFlavor() => _releaseFlavor == 'staging'
+    ? _stagingReleaseOrigin
+    : _productionReleaseOrigin;
 const int _schemaVersion = 1;
 const int _maxSignedInt32 = 2147483647;
 const int _maxReasonLength = 500;
@@ -156,6 +169,7 @@ class ReleaseManifestParser {
   static ReleaseManifestParseResult parse(
     Object? document, {
     required DateTime trustedNowUtc,
+    Uri? trustedReleaseOrigin,
   }) {
     if (document is! Map<Object?, Object?> ||
         document.keys.any((key) => key is! String)) {
@@ -166,7 +180,11 @@ class ReleaseManifestParser {
 
     final json = Map<String, Object?>.from(document);
     if (_hasExactKeys(json, _availableFields)) {
-      return _parseAvailable(json, trustedNowUtc.toUtc());
+      return _parseAvailable(
+        json,
+        trustedNowUtc.toUtc(),
+        trustedReleaseOrigin ?? Uri.parse(_releaseOriginForFlavor()),
+      );
     }
     if (_hasExactKeys(json, _disabledFields)) {
       return _parseDisabled(json, trustedNowUtc.toUtc());
@@ -182,6 +200,7 @@ class ReleaseManifestParser {
   static ReleaseManifestParseResult _parseAvailable(
     Map<String, Object?> json,
     DateTime trustedNowUtc,
+    Uri trustedReleaseOrigin,
   ) {
     if (!_isExactInt(json['schemaVersion'], _schemaVersion) ||
         json['updatesEnabled'] != true ||
@@ -220,7 +239,11 @@ class ReleaseManifestParser {
       );
     }
 
-    final artifactUrl = _parseArtifactUrl(json['artifactUrl'], latestCode);
+    final artifactUrl = _parseArtifactUrl(
+      json['artifactUrl'],
+      latestCode,
+      trustedReleaseOrigin,
+    );
     if (artifactUrl == null) {
       return const MalformedReleaseManifest(
         ReleaseManifestParseFailure.invalidAvailableManifest,
@@ -366,18 +389,33 @@ String _formatCanonicalUtc(DateTime value) {
       'T${two(utc.hour)}:${two(utc.minute)}:${two(utc.second)}Z';
 }
 
-Uri? _parseArtifactUrl(Object? value, int versionCode) {
+Uri? _parseArtifactUrl(
+  Object? value,
+  int versionCode,
+  Uri trustedReleaseOrigin,
+) {
   if (value is! String) {
     return null;
   }
-  final expected = 'https://$_releaseHost/releases/damsure-$versionCode.apk';
+  if (trustedReleaseOrigin.scheme != 'https' ||
+      trustedReleaseOrigin.host.isEmpty ||
+      trustedReleaseOrigin.hasPort ||
+      trustedReleaseOrigin.userInfo.isNotEmpty ||
+      trustedReleaseOrigin.hasQuery ||
+      trustedReleaseOrigin.hasFragment ||
+      (trustedReleaseOrigin.path.isNotEmpty &&
+          trustedReleaseOrigin.path != '/')) {
+    return null;
+  }
+  final expected =
+      '${trustedReleaseOrigin.origin}/releases/damsure-$versionCode.apk';
   if (value != expected) {
     return null;
   }
   final parsed = Uri.tryParse(value);
   if (parsed == null ||
       parsed.scheme != 'https' ||
-      parsed.host != _releaseHost ||
+      parsed.host != trustedReleaseOrigin.host ||
       parsed.hasPort ||
       parsed.userInfo.isNotEmpty ||
       parsed.hasQuery ||

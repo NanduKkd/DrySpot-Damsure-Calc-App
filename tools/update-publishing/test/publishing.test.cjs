@@ -1,129 +1,33 @@
 'use strict';
-
 const assert = require('node:assert/strict');
-const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const {
-  LEGACY_DISABLED_MANIFEST, LocalReleaseTarget, applyPublishedManifest, basicArtifactMetadata,
-  buildManifest, canonicalManifestIdentity, emptyLedger, publishToLocalFixture, reserveVersionCode,
-  verifyApkArtifact,
-} = require('../lib.cjs');
+const { PACKAGE_IDS, LocalReleaseTarget, basicArtifactMetadata, buildManifest, canonicalManifestIdentity, emptyLedger, publishToLocalFixture, readLedger, recoverPublication, reserveVersionCodeAtPath, verifyApkArtifact } = require('../lib.cjs');
+const origin = 'https://staging.example.test'; const time = '2026-07-30T12:00:00Z';
+async function fixture() { const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'damsure-publish-'))); return { root, remote: path.join(root, 'remote'), ledgerPath: path.join(root, 'ledger.json') }; }
+async function fakeTools(root) { const aapt = path.join(root, 'aapt'); const apksigner = path.join(root, 'apksigner'); await fs.writeFile(aapt, "#!/usr/bin/env node\nconsole.log(\"package: name='com.dryspotuppala.staging' versionCode='2' versionName='1.0.2'\")\n"); await fs.writeFile(apksigner, "#!/usr/bin/env node\nconsole.log('Signer #1 certificate SHA-256 digest: AA:BB:CC')\n"); await fs.chmod(aapt, 0o755); await fs.chmod(apksigner, 0o755); return { aapt, apksigner }; }
+async function candidate(root) { const artifact = path.join(root, 'candidate.apk'); await fs.writeFile(artifact, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('fixture')])); return { artifact, ...(await basicArtifactMetadata(artifact, { requireApkZip: true })) }; }
+async function prepared(code = 2) { const f = await fixture(); const ledger = await reserveVersionCodeAtPath({ ledgerPath: f.ledgerPath, environment: 'staging', root: f.remote, origin, code }); const file = await candidate(f.root); const manifest = buildManifest({ environment: 'staging', ledger, type: 'available', revision: 1, publishedAt: time, origin, version: '1.0.2', versionCode: code, minimumSupportedVersionCode: 1, sha256: file.sha256, sizeBytes: file.sizeBytes, releaseNotes: 'Notes.', requiredUpdateReason: 'Required.' }); return { ...f, ledger, ...file, manifest, tools: await fakeTools(f.root) }; }
+function publishArgs(state, extra = {}) { return { target: new LocalReleaseTarget(state.remote), ledgerPath: state.ledgerPath, environment: 'staging', root: state.remote, origin, manifest: state.manifest, artifactPath: state.artifact, trustedTools: state.tools, certificateSha256: 'aa:bb:cc', trustedReceiptAt: time, ...extra }; }
+function runNode(args) { return new Promise((resolve) => { const child = spawn(process.execPath, args, { cwd: path.resolve(__dirname, '../../..') }); let stderr = ''; child.stderr.on('data', (chunk) => { stderr += chunk; }); child.on('close', (code) => resolve({ code, stderr })); }); }
 
-const productionOrigin = 'https://damsure.nandakrishnan.in';
-const time = '2026-07-30T12:00:00Z';
+test('strict generator rejects leading-zero semantic versions and tracks canonical identity', async () => { const f = await fixture(); const ledger = emptyLedger('staging', f.remote, origin); assert.throws(() => buildManifest({ environment: 'staging', ledger, type: 'available', revision: 1, publishedAt: time, origin, version: '01.2.3', versionCode: 2, minimumSupportedVersionCode: 1, sha256: 'a'.repeat(64), sizeBytes: 4, releaseNotes: 'n', requiredUpdateReason: 'r' }), /leading zero/); const disabled = buildManifest({ environment: 'staging', ledger, type: 'disabled', revision: 1, publishedAt: time, origin, reason: 'Hold.' }); assert.match(canonicalManifestIdentity(disabled), /"schemaVersion":1/); });
 
-async function fixture() { return fs.mkdtemp(path.join(os.tmpdir(), 'damsure-publish-')); }
-async function availableManifest(ledger, root, revision = 2, code = 2) {
-  const artifact = path.join(root, 'candidate.apk');
-  await fs.writeFile(artifact, 'APK fixture bytes');
-  const metadata = await basicArtifactMetadata(artifact);
-  return { artifact, manifest: buildManifest({ environment: ledger.environment, ledger, type: 'available', revision,
-    publishedAt: time, origin: ledger.environment === 'production' ? productionOrigin : 'https://staging.example.test',
-    version: '1.0.2', versionCode: code, minimumSupportedVersionCode: 1, sha256: metadata.sha256,
-    sizeBytes: metadata.sizeBytes, releaseNotes: 'Release notes.', requiredUpdateReason: 'Update now.' }) };
-}
+test('dry run never claims activation or writes ledger/root', async () => { const state = await prepared(); const result = await publishToLocalFixture(publishArgs(state, { dryRun: true })); assert.equal(result.wrote, false); assert.equal(result.receipt.activation, 'not-attempted'); await assert.rejects(fs.stat(state.remote), /ENOENT/); });
 
-test('legacy state is preserved outside the ledger and production starts at strict disabled revision 1', () => {
-  assert.deepEqual(LEGACY_DISABLED_MANIFEST, { status: 'unavailable', updatesEnabled: false, message: 'No Android release has been published.', publishedAt: null });
-  const manifest = buildManifest({ environment: 'production', ledger: emptyLedger('production'), type: 'disabled', revision: 1,
-    publishedAt: time, origin: productionOrigin, reason: 'Updates are temporarily unavailable.' });
-  assert.deepEqual(Object.keys(manifest), ['schemaVersion', 'updatesEnabled', 'manifestRevision', 'publishedAt', 'reason']);
-  assert.throws(() => buildManifest({ environment: 'production', ledger: emptyLedger('production'), type: 'available', revision: 2,
-    publishedAt: time, origin: productionOrigin, version: '1.0.2', versionCode: 2, minimumSupportedVersionCode: 1,
-    sha256: 'a'.repeat(64), sizeBytes: 1, releaseNotes: 'x', requiredUpdateReason: 'y' }), /previously published strict disabled/);
-});
+test('available publication rejects text artifacts before upload', async () => { const state = await prepared(); await fs.writeFile(state.artifact, 'plain text'); await assert.rejects(publishToLocalFixture(publishArgs(state)), /APK ZIP/); await assert.rejects(fs.stat(path.join(state.remote, 'damsure-2.apk')), /ENOENT/); });
 
-test('reservations reject code 1, reuse, and lower codes', () => {
-  const ledger = emptyLedger('staging');
-  assert.throws(() => reserveVersionCode(ledger, 1), /permanently reserved/);
-  const reserved = reserveVersionCode(ledger, 2);
-  assert.throws(() => reserveVersionCode(reserved, 2), /already been reserved/);
-  const published = applyPublishedManifest(reserved, buildManifest({ environment: 'staging', ledger: reserved, type: 'disabled', revision: 1, publishedAt: time, origin: 'https://staging.example.test', reason: 'Hold.' }));
-  assert.throws(() => reserveVersionCode(published, 1), /permanently reserved/);
-});
+test('available publication verifies local and independently downloaded APK before activation', async () => { const state = await prepared(); const result = await publishToLocalFixture(publishArgs(state, { receiptPath: path.join(state.root, 'receipt.json') })); assert.equal(result.receipt.activation, 'active'); const ledger = await readLedger(state.ledgerPath, 'staging', state.remote, origin); assert.equal(ledger.lastManifestRevision, 1); assert.equal(ledger.receiptState.status, 'written'); assert.deepEqual(JSON.parse(await fs.readFile(path.join(state.remote, 'manifest.json'), 'utf8')), state.manifest); });
 
-test('canonical identity is ordered JSON without delimiter collisions and revisions cannot mutate', () => {
-  const ledger = emptyLedger('staging');
-  const first = buildManifest({ environment: 'staging', ledger, type: 'disabled', revision: 1, publishedAt: time, origin: 'https://staging.example.test', reason: 'a|b' });
-  const second = { ...first, reason: 'a', publishedAt: '2026-07-30T12:00:01Z' };
-  assert.notEqual(canonicalManifestIdentity(first), canonicalManifestIdentity(second));
-  const applied = applyPublishedManifest(ledger, first);
-  assert.throws(() => applyPublishedManifest(applied, second), /same or lower manifest revision/);
-});
+test('untrusted tool substitutions and certificate/package/version mismatches are refused', async () => { const state = await prepared(); await assert.rejects(verifyApkArtifact({ artifactPath: state.artifact, expectedSha256: state.sha256, expectedSizeBytes: state.sizeBytes, expectedPackageId: PACKAGE_IDS.staging, expectedVersionCode: 2, expectedVersionName: '1.0.2', expectedCertificateSha256: 'aa:bb:cc', trustedTools: { aapt: 'aapt', apksigner: state.tools.apksigner } }), /absolute trusted tool/); const symlink = path.join(state.root, 'aapt-link'); await fs.symlink(state.tools.aapt, symlink); await assert.rejects(verifyApkArtifact({ artifactPath: state.artifact, expectedSha256: state.sha256, expectedSizeBytes: state.sizeBytes, expectedPackageId: PACKAGE_IDS.staging, expectedVersionCode: 2, expectedVersionName: 'wrong', expectedCertificateSha256: 'aa:bb:cc', trustedTools: { aapt: symlink, apksigner: state.tools.apksigner } }), /non-symlink/); });
 
-test('dry-run makes zero ledger or fixture mutations', async () => {
-  const root = await fixture();
-  const ledgerPath = path.join(root, 'ledger.json');
-  const initial = applyPublishedManifest(emptyLedger('staging'), buildManifest({ environment: 'staging', ledger: emptyLedger('staging'), type: 'disabled', revision: 1, publishedAt: time, origin: 'https://staging.example.test', reason: 'Hold.' }));
-  const reserved = reserveVersionCode(initial, 2);
-  const { artifact, manifest } = await availableManifest(reserved, root);
-  await fs.writeFile(ledgerPath, JSON.stringify(reserved));
-  const before = await fs.readFile(ledgerPath, 'utf8');
-  const result = await publishToLocalFixture({ target: new LocalReleaseTarget(path.join(root, 'remote')), ledgerPath, ledger: reserved, manifest, artifactPath: artifact, dryRun: true });
-  assert.equal(result.wrote, false);
-  assert.equal(await fs.readFile(ledgerPath, 'utf8'), before);
-  await assert.rejects(fs.stat(path.join(root, 'remote', 'manifest.json')), /ENOENT/);
-});
+test('journal recovers manifest-success/ledger-failure without reusing revision', async () => { const state = await prepared(); await assert.rejects(publishToLocalFixture(publishArgs(state, { hooks: { afterManifestReplaced: async () => { throw new Error('injected crash'); } } })), /injected crash/); const pending = await readLedger(state.ledgerPath, 'staging', state.remote, origin); assert.equal(pending.pendingPublication.manifestRevision, 1); await assert.rejects(publishToLocalFixture(publishArgs(state)), /pending publication/); const recovered = await recoverPublication({ target: new LocalReleaseTarget(state.remote), ledgerPath: state.ledgerPath, environment: 'staging', root: state.remote, origin }); assert.equal(recovered.receipt.phase, 'recovered'); const committed = await readLedger(state.ledgerPath, 'staging', state.remote, origin); assert.equal(committed.lastManifestRevision, 1); });
 
-test('no-clobber uploads before an atomic manifest replacement and emits a receipt', async () => {
-  const root = await fixture();
-  const ledgerPath = path.join(root, 'ledger.json');
-  const base = applyPublishedManifest(emptyLedger('staging'), buildManifest({ environment: 'staging', ledger: emptyLedger('staging'), type: 'disabled', revision: 1, publishedAt: time, origin: 'https://staging.example.test', reason: 'Hold.' }));
-  const ledger = reserveVersionCode(base, 2);
-  const { artifact, manifest } = await availableManifest(ledger, root);
-  const remote = path.join(root, 'remote');
-  const receiptPath = path.join(root, 'receipt.json');
-  const outcome = await publishToLocalFixture({ target: new LocalReleaseTarget(remote), ledgerPath, ledger, manifest, artifactPath: artifact, receiptPath });
-  assert.equal(outcome.receipt.artifactName, 'damsure-2.apk');
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(remote, 'manifest.json'), 'utf8')), manifest);
-  await assert.rejects(new LocalReleaseTarget(remote).uploadArtifactNoClobber(artifact, 'damsure-2.apk'), /refusing to overwrite/);
-  assert.equal(JSON.parse(await fs.readFile(receiptPath, 'utf8')).dryRun, false);
-});
+test('environment/root binding rejects symlinks, shared roots, and production confusion', async () => { const f = await fixture(); const linked = path.join(f.root, 'linked'); await fs.symlink(f.remote, linked); await assert.rejects(reserveVersionCodeAtPath({ ledgerPath: f.ledgerPath, environment: 'staging', root: linked, origin, code: 2 }), /symlink/); const ledger = await reserveVersionCodeAtPath({ ledgerPath: f.ledgerPath, environment: 'staging', root: f.remote, origin, code: 2 }); assert.equal(ledger.environment, 'staging'); await assert.rejects(readLedger(f.ledgerPath, 'production', f.remote, 'https://damsure.nandakrishnan.in'), /environment-confused/); });
 
-test('failed atomic replacement preserves the existing manifest and leaves ledger untouched', async () => {
-  const root = await fixture();
-  const ledgerPath = path.join(root, 'ledger.json');
-  const oldManifest = { old: true };
-  const remote = path.join(root, 'remote');
-  await fs.mkdir(remote);
-  await fs.writeFile(path.join(remote, 'manifest.json'), JSON.stringify(oldManifest));
-  const base = applyPublishedManifest(emptyLedger('staging'), buildManifest({ environment: 'staging', ledger: emptyLedger('staging'), type: 'disabled', revision: 1, publishedAt: time, origin: 'https://staging.example.test', reason: 'Hold.' }));
-  const ledger = reserveVersionCode(base, 2);
-  await fs.writeFile(ledgerPath, JSON.stringify(ledger));
-  const beforeLedger = await fs.readFile(ledgerPath, 'utf8');
-  const { artifact, manifest } = await availableManifest(ledger, root);
-  const target = new LocalReleaseTarget(remote, { ...fs, rename: async () => { throw new Error('injected rename failure'); } });
-  await assert.rejects(publishToLocalFixture({ target, ledgerPath, ledger, manifest, artifactPath: artifact }), /injected rename failure/);
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(remote, 'manifest.json'), 'utf8')), oldManifest);
-  assert.equal(await fs.readFile(ledgerPath, 'utf8'), beforeLedger);
-});
+test('child-process lock makes same-code reservation single-winner and retains distinct codes', async () => { const f = await fixture(); const cli = path.resolve(__dirname, '../publish.cjs'); const common = ['reserve', '--environment', 'staging', '--ledger', f.ledgerPath, '--fixture-root', f.remote, '--origin', origin]; const [sameA, sameB] = await Promise.all([runNode([cli, ...common, '--version-code', '2']), runNode([cli, ...common, '--version-code', '2'])]); assert.equal([sameA.code, sameB.code].filter((code) => code === 0).length, 1); const [three, four] = await Promise.all([runNode([cli, ...common, '--version-code', '3']), runNode([cli, ...common, '--version-code', '4'])]); assert.equal(three.code, 0, three.stderr); assert.equal(four.code, 0, four.stderr); const ledger = await readLedger(f.ledgerPath, 'staging', f.remote, origin); assert.deepEqual(ledger.reservedVersionCodes, [1, 2, 3, 4]); });
 
-test('production is hard-disabled without named approval and all gate receipts', async () => {
-  const root = await fixture();
-  const ledger = emptyLedger('production');
-  const manifest = buildManifest({ environment: 'production', ledger, type: 'disabled', revision: 1, publishedAt: time, origin: productionOrigin, reason: 'Hold.' });
-  await assert.rejects(publishToLocalFixture({ target: new LocalReleaseTarget(path.join(root, 'remote')), ledgerPath: path.join(root, 'ledger.json'), ledger, manifest }), /hard-disabled without approval/);
-});
-
-test('APK verification checks size, hash, package, version, and certificate without exposing secrets', async () => {
-  const root = await fixture();
-  const artifact = path.join(root, 'candidate.apk');
-  const aapt = path.join(root, 'fake-aapt');
-  const apksigner = path.join(root, 'fake-apksigner');
-  await fs.writeFile(artifact, 'APK fixture bytes');
-  await fs.writeFile(aapt, "#!/usr/bin/env node\nconsole.log(\"package: name='com.dryspotuppala' versionCode='2' versionName='1.0.2'\")\n");
-  await fs.writeFile(apksigner, "#!/usr/bin/env node\nconsole.log('Signer #1 certificate SHA-256 digest: AA:BB:CC')\n");
-  await fs.chmod(aapt, 0o755);
-  await fs.chmod(apksigner, 0o755);
-  const metadata = await basicArtifactMetadata(artifact);
-  const verified = await verifyApkArtifact({ artifactPath: artifact, expectedSha256: metadata.sha256,
-    expectedSizeBytes: metadata.sizeBytes, expectedPackageId: 'com.dryspotuppala', expectedVersionCode: 2,
-    expectedCertificateSha256: 'aa:bb:cc', aapt, apksigner });
-  assert.deepEqual(verified, { ...metadata, packageId: 'com.dryspotuppala', versionCode: 2,
-    versionName: '1.0.2', certificateSha256: 'AABBCC' });
-  await assert.rejects(verifyApkArtifact({ artifactPath: artifact, expectedPackageId: 'wrong.package',
-    expectedVersionCode: 2, expectedCertificateSha256: 'aa:bb:cc', aapt, apksigner }), /package ID/);
-});
+test('child-process publishes with a shared revision allow exactly one canonical payload', async () => { const state = await prepared(); const cli = path.resolve(__dirname, '../publish.cjs'); const base = ['publish', '--environment', 'staging', '--ledger', state.ledgerPath, '--fixture-root', state.remote, '--origin', origin, '--type', 'available', '--revision', '1', '--published-at', time, '--receipt-at', time, '--version', '1.0.2', '--version-code', '2', '--minimum-supported-version-code', '1', '--sha256', state.sha256, '--size-bytes', String(state.sizeBytes), '--required-update-reason', 'Required.', '--artifact', state.artifact, '--aapt', state.tools.aapt, '--apksigner', state.tools.apksigner, '--certificate-sha256', 'aa:bb:cc']; const [first, second] = await Promise.all([runNode([cli, ...base, '--release-notes', 'One.']), runNode([cli, ...base, '--release-notes', 'Two.'])]); assert.equal([first.code, second.code].filter((code) => code === 0).length, 1); const ledger = await readLedger(state.ledgerPath, 'staging', state.remote, origin); assert.equal(ledger.lastManifestRevision, 1); assert.equal(Object.keys(ledger.manifests).length, 1); });

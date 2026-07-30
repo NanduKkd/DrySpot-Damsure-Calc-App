@@ -13,25 +13,36 @@ plugins {
 
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
+val stagingKeystoreProperties = Properties()
+val stagingKeystorePropertiesFile = rootProject.file("staging-key.properties")
 val requiredSigningProperties = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
 
 if (keystorePropertiesFile.exists()) {
     FileInputStream(keystorePropertiesFile).use { keystoreProperties.load(it) }
 }
+if (stagingKeystorePropertiesFile.exists()) {
+    FileInputStream(stagingKeystorePropertiesFile).use { stagingKeystoreProperties.load(it) }
+}
 
-val releaseSigningProblems = buildList {
-    if (!keystorePropertiesFile.isFile) {
-        add("android/key.properties is missing")
+fun signingProblems(propertiesFile: java.io.File, properties: Properties, label: String): List<String> = buildList {
+    if (!propertiesFile.isFile) {
+        add("$label signing properties are missing")
     } else {
-        requiredSigningProperties.filter { keystoreProperties.getProperty(it).isNullOrBlank() }
-            .forEach { add("android/key.properties is missing $it") }
-        val storeFilePath = keystoreProperties.getProperty("storeFile")
+        requiredSigningProperties.filter { properties.getProperty(it).isNullOrBlank() }
+            .forEach { add("$label signing properties are missing $it") }
+        val storeFilePath = properties.getProperty("storeFile")
         if (!storeFilePath.isNullOrBlank() && !rootProject.file(storeFilePath).isFile) {
-            add("the configured release keystore file is missing or unreadable")
+            add("the configured $label keystore file is missing or unreadable")
         }
     }
 }
-val hasCompleteReleaseSigning = releaseSigningProblems.isEmpty()
+val productionSigningProblems = signingProblems(keystorePropertiesFile, keystoreProperties, "production")
+val stagingSigningProblems = signingProblems(stagingKeystorePropertiesFile, stagingKeystoreProperties, "staging")
+val hasCompleteProductionSigning = productionSigningProblems.isEmpty()
+val hasCompleteStagingSigning = stagingSigningProblems.isEmpty()
+val signingIdentitiesDistinct = !hasCompleteProductionSigning && !hasCompleteStagingSigning ||
+    keystoreProperties.getProperty("keyAlias") != stagingKeystoreProperties.getProperty("keyAlias") ||
+    keystoreProperties.getProperty("storeFile") != stagingKeystoreProperties.getProperty("storeFile")
 
 fun stagingOriginFromDartDefines(): String? {
     val encoded = project.findProperty("dart-defines")?.toString() ?: return null
@@ -84,37 +95,44 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        if (hasCompleteProductionSigning) {
+            create("productionRelease") {
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+            }
+        }
+        if (hasCompleteStagingSigning) {
+            create("stagingRelease") {
+                keyAlias = stagingKeystoreProperties.getProperty("keyAlias")
+                keyPassword = stagingKeystoreProperties.getProperty("keyPassword")
+                storeFile = rootProject.file(stagingKeystoreProperties.getProperty("storeFile"))
+                storePassword = stagingKeystoreProperties.getProperty("storePassword")
+            }
+        }
+    }
+
     flavorDimensions += "environment"
     productFlavors {
         create("production") {
             dimension = "environment"
             applicationId = "com.dryspotuppala"
             resValue("string", "app_name", "DrySpot Uppala")
+            if (hasCompleteProductionSigning) signingConfig = signingConfigs.getByName("productionRelease")
         }
         create("staging") {
             dimension = "environment"
             applicationId = "com.dryspotuppala.staging"
             resValue("string", "app_name", "DrySpot Uppala Staging")
-        }
-    }
-
-    signingConfigs {
-        if (hasCompleteReleaseSigning) {
-            create("release") {
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-                storeFile =
-                    rootProject.file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-            }
+            if (hasCompleteStagingSigning) signingConfig = signingConfigs.getByName("stagingRelease")
         }
     }
 
     buildTypes {
         release {
-            if (hasCompleteReleaseSigning) {
-                signingConfig = signingConfigs.getByName("release")
-            }
+            // Flavor-specific signing configs above prevent staging/production key reuse.
         }
     }
 }
@@ -129,10 +147,15 @@ tasks.configureEach {
             }
         }
     }
-    if (name in setOf("assembleRelease", "bundleRelease", "packageRelease", "signReleaseBundle")) {
+    if (Regex("(?i)^(assemble|bundle|package|sign).*release").containsMatchIn(name)) {
         doFirst {
-            check(hasCompleteReleaseSigning) {
-                "Release signing is not configured: ${releaseSigningProblems.joinToString("; ")}. " +
+            val problems = when {
+                name.contains("staging", ignoreCase = true) -> stagingSigningProblems
+                name.contains("production", ignoreCase = true) -> productionSigningProblems
+                else -> productionSigningProblems + stagingSigningProblems
+            }
+            check(problems.isEmpty() && signingIdentitiesDistinct) {
+                "Release signing is not configured or identities are not distinct: ${problems.joinToString("; ")}. " +
                     "See docs/current/android-release-runbook.md."
             }
         }

@@ -94,7 +94,9 @@ Before an available policy, verify the final APK locally:
 ```bash
 node tools/update-publishing/verify-apk.cjs \
   --artifact app-production-release.apk --package-id com.dryspotuppala \
-  --version-code 2 --certificate-sha256 <pinned-certificate-sha256> \
+  --version-code 2 --version-name 1.0.2 \
+  --certificate-sha256 <pinned-certificate-sha256> \
+  --aapt /absolute/path/to/aapt --apksigner /absolute/path/to/apksigner \
   --sha256 <lowercase-sha256> --size-bytes <bytes>
 ```
 
@@ -125,3 +127,27 @@ If upload verification fails, do not replace the manifest and retain the
 consumed reservation. If manifest replacement fails, prove the old manifest is
 still present before retrying. To stop guided updates, publish a new strict
 disabled v1 policy; never delete an APK first or restore legacy/older metadata.
+
+## T2 durability and verification hardening
+
+Schema-v2 ledgers bind the canonical non-symlink release root, origin, and
+environment. Every mutation takes an auditable sibling `.lock` directory with
+PID, UTC acquisition time, and nonce. A live lock waits only briefly before a
+clear error; a stale lock needs explicit `--break-stale-lock` and is retained
+under a unique stale name. This serializes separate processes and prevents
+same-code or same-revision split-brain.
+
+Before a non-dry-run publish, a durable pending-publication journal stores the
+exact canonical identity. The journal progresses through prepared,
+artifact-uploaded, manifest-replaced, and committed states. Normal retry never
+reuses a pending revision. `recover` commits only when the fixture manifest has
+the identical canonical identity. Receipt failure records pending evidence in
+the ledger and returns an explicit recoverable active status. Receipts use an
+operator-supplied canonical `--receipt-at` value; dry-run is always
+`activation: not-attempted`.
+
+Available publication performs required APK verification before upload and
+again after independent download: ZIP/APK shape, exact size/SHA-256, flavor
+package ID, version code/name, and pinned certificate. `--aapt` and
+`--apksigner` are required explicit absolute paths to regular executable
+non-symlink files; environment-variable tool substitution is refused.
