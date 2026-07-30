@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:app_client/src/services/db_service.dart';
@@ -218,6 +220,151 @@ void main() {
         ),
         isNotEmpty,
       );
+    });
+
+    test(
+        'v12 durably backfills only unacknowledged client photo paths and reapplies',
+        () async {
+      final database = await openDatabase(
+        inMemoryDatabasePath,
+        version: 1,
+        onCreate: (db, _) async {
+          await db.execute('''
+            CREATE TABLE clients (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              name TEXT NOT NULL,
+              photos TEXT,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.insert('clients', {
+            'remote_id': '40000000-0000-4000-8000-000000000001',
+            'franchisee_id': '40000000-0000-4000-8000-000000000002',
+            'name': 'Photo client',
+            'photos':
+                '["/api/photos/client/canonical.jpg","/offline/one.jpg","/offline/two.jpg"]',
+            'is_dirty': 0,
+            'updated_at': '2026-07-30T00:00:00.000Z',
+          });
+          await db.insert('clients', {
+            'remote_id': '40000000-0000-4000-8000-000000000003',
+            'franchisee_id': '40000000-0000-4000-8000-000000000002',
+            'name': 'Deleted client',
+            'photos': '["/offline/deleted.jpg"]',
+            'is_dirty': 0,
+            'updated_at': '2026-07-30T00:00:00.000Z',
+            'deleted_at': '2026-07-30T01:00:00.000Z',
+          });
+        },
+      );
+      addTearDown(database.close);
+
+      await DbService.migrateSchema(database, 11, 12);
+      await DbService.migrateSchema(database, 11, 12);
+
+      expect(
+        await database.query(
+          'pending_client_photos',
+          columns: ['client_remote_id', 'local_path'],
+          orderBy: 'local_path',
+        ),
+        [
+          {
+            'client_remote_id': '40000000-0000-4000-8000-000000000001',
+            'local_path': '/offline/one.jpg',
+          },
+          {
+            'client_remote_id': '40000000-0000-4000-8000-000000000001',
+            'local_path': '/offline/two.jpg',
+          },
+        ],
+      );
+    });
+
+    test(
+        'v12 rolls back malformed legacy photo state and reapplies after repair',
+        () async {
+      final path =
+          '${Directory.systemTemp.path}/damsure-v12-${DateTime.now().microsecondsSinceEpoch}.db';
+      addTearDown(() => deleteDatabase(path));
+      final legacy = await openDatabase(
+        path,
+        version: 11,
+        singleInstance: false,
+        onCreate: (db, _) async {
+          await db.execute('''
+            CREATE TABLE clients (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              name TEXT NOT NULL,
+              photos TEXT,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.insert('clients', {
+            'remote_id': '40000000-0000-4000-8000-000000000011',
+            'franchisee_id': '40000000-0000-4000-8000-000000000012',
+            'name': 'Malformed photos',
+            'photos': '{"not":"a list"}',
+            'is_dirty': 0,
+            'updated_at': '2026-07-30T00:00:00.000Z',
+          });
+        },
+      );
+      await legacy.close();
+
+      await expectLater(
+        openDatabase(
+          path,
+          version: 12,
+          singleInstance: false,
+          onUpgrade: DbService.migrateSchema,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+
+      final repaired = await openDatabase(
+        path,
+        version: 11,
+        singleInstance: false,
+      );
+      expect(
+        await repaired.rawQuery(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'table' AND name = 'pending_client_photos'",
+        ),
+        isEmpty,
+        reason: 'the failed schema and backfill must roll back together',
+      );
+      await repaired.update(
+        'clients',
+        {'photos': '["/offline/repaired.jpg"]'},
+      );
+      await repaired.close();
+
+      final upgraded = await openDatabase(
+        path,
+        version: 12,
+        singleInstance: false,
+        onUpgrade: DbService.migrateSchema,
+      );
+      expect(
+        await upgraded.query(
+          'pending_client_photos',
+          columns: ['local_path'],
+        ),
+        [
+          {'local_path': '/offline/repaired.jpg'},
+        ],
+      );
+      await upgraded.close();
     });
   });
 }

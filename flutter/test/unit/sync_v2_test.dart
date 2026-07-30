@@ -15,6 +15,7 @@ class V2ApiService extends ApiService {
 
   Map<String, dynamic>? lastV1;
   Map<String, dynamic>? lastV2;
+  final List<Map<String, dynamic>> v2Requests = [];
   final List<List<String>> photoUploads = [];
   final List<String> proposalDeletes = [];
   Future<Map<String, dynamic>> Function(Map<String, dynamic>)? v1Handler;
@@ -31,6 +32,7 @@ class V2ApiService extends ApiService {
   @override
   Future<Map<String, dynamic>> syncV2(Map<String, dynamic> data) async {
     lastV2 = data;
+    v2Requests.add(data);
     return v2Handler!(data);
   }
 
@@ -178,6 +180,14 @@ void main() {
         value TEXT NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE pending_client_photos (
+        franchisee_id TEXT NOT NULL,
+        client_remote_id TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        PRIMARY KEY (franchisee_id, client_remote_id, local_path)
+      )
+    ''');
   }
 
   setUp(() async {
@@ -266,6 +276,8 @@ void main() {
     Map<String, dynamic> request, {
     required String cursor,
     List<Map<String, dynamic>> clientOutcomes = const [],
+    List<Map<String, dynamic>> itemOutcomes = const [],
+    List<Map<String, dynamic>> rectangleOutcomes = const [],
     List<Map<String, dynamic>> defaultPriceOutcomes = const [],
     List<Map<String, dynamic>> clients = const [],
     List<Map<String, dynamic>> items = const [],
@@ -284,8 +296,8 @@ void main() {
             warrantyTombstoneCursor ?? request['warranty_tombstone_cursor'],
         'outcomes': {
           'clients': clientOutcomes,
-          'items': [],
-          'rectangles': [],
+          'items': itemOutcomes,
+          'rectangles': rectangleOutcomes,
           'default_prices': defaultPriceOutcomes,
         },
         'warnings': [],
@@ -316,6 +328,35 @@ void main() {
 
   String payloadHash(Map<String, dynamic> payload) =>
       sha256.convert(utf8.encode(jsonEncode(stableValue(payload)))).toString();
+
+  Map<String, dynamic> lwwUpsertRecord({
+    required String id,
+    required String generation,
+    required int branch,
+    required String writer,
+    required String change,
+    required String cursor,
+    required Map<String, dynamic> payload,
+    String? parentId,
+    bool tenantOwned = false,
+    Map<String, dynamic>? media,
+  }) =>
+      {
+        'remote_id': id,
+        'generation': generation,
+        'branch_seq': branch,
+        'operation': 'upsert',
+        'writer_id': writer,
+        'change_id': change,
+        'payload_hash': payloadHash(payload),
+        'row_cursor': cursor,
+        'server_timestamp': now,
+        'deleted_at': null,
+        if (parentId != null) 'parent_id': parentId,
+        if (tenantOwned) 'franchisee_id': tenant,
+        'payload': payload,
+        if (media != null) 'media': media,
+      };
 
   test('applies exact outcome and cursor atomically above 2^53', () async {
     await activate(cursor: '9007199254740993');
@@ -597,6 +638,350 @@ void main() {
     apiService.v2Handler = (request) async => responseFor(request, cursor: '2');
     await SyncService(apiService: apiService, dbService: dbService).sync();
     expect(apiService.photoUploads, hasLength(1));
+  });
+
+  for (final failureCase in <String, Object>{
+    'network': StateError('photo network failed'),
+    'HTTP 500': const ApiException('photo failed', statusCode: 500),
+  }.entries) {
+    test(
+        'partial two-photo ${failureCase.key} failure preserves the second path and retries',
+        () async {
+      await activate();
+      const localOne = '/offline/one.jpg';
+      const localTwo = '/offline/two.jpg';
+      const canonicalOne =
+          '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000041.jpg';
+      const canonicalTwo =
+          '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000042.jpg';
+      await dbService.insertClient(Client(
+        remoteId: remoteId,
+        franchiseeId: tenant,
+        name: 'Two photos',
+        photos: const [localOne, localTwo],
+        updatedAt: DateTime.parse(now),
+      ));
+
+      Map<String, dynamic>? authoritative;
+      var v2Round = 0;
+      apiService.v2Handler = (request) async {
+        v2Round += 1;
+        switch (v2Round) {
+          case 1:
+            final submitted = request['changes']['clients'].single;
+            authoritative = serverClient(
+              changeId: submitted['change_id'],
+              cursor: '1',
+              name: 'Two photos',
+              generation: submitted['generation'],
+              branch: submitted['branch_seq'],
+              writerId: submitted['writer_id'],
+            );
+            return responseFor(
+              request,
+              cursor: '1',
+              clientOutcomes: [
+                {
+                  'change_id': submitted['change_id'],
+                  'remote_id': remoteId,
+                  'status': 'applied',
+                  'reason_code': 'upsert_applied',
+                  'authoritative': authoritative!,
+                },
+              ],
+              clients: [authoritative!],
+            );
+          case 2:
+            expect(request['request_cursor'], '1');
+            expect(request['changes']['clients'], isEmpty);
+            final reconciled = {
+              ...authoritative!,
+              'row_cursor': '2',
+              'media': {
+                'photos': [canonicalOne],
+              },
+            };
+            authoritative = reconciled;
+            return responseFor(
+              request,
+              cursor: '2',
+              clients: [reconciled],
+            );
+          case 3:
+            expect(request['request_cursor'], '2');
+            expect(request['changes']['clients'], isEmpty);
+            return responseFor(request, cursor: '2');
+          case 4:
+            final reconciled = {
+              ...authoritative!,
+              'row_cursor': '3',
+              'media': {
+                'photos': [canonicalOne, canonicalTwo],
+              },
+            };
+            authoritative = reconciled;
+            return responseFor(
+              request,
+              cursor: '3',
+              clients: [reconciled],
+            );
+          default:
+            return responseFor(request, cursor: '3');
+        }
+      };
+      var uploadAttempt = 0;
+      apiService.photoHandler = (_, path) async {
+        uploadAttempt += 1;
+        if (uploadAttempt == 1) {
+          expect(path, localOne);
+          return canonicalOne;
+        }
+        if (uploadAttempt == 2) {
+          expect(path, localTwo);
+          throw failureCase.value;
+        }
+        expect(path, localTwo);
+        return canonicalTwo;
+      };
+
+      await expectLater(
+        SyncService(apiService: apiService, dbService: dbService).sync(),
+        throwsA(same(failureCase.value)),
+      );
+
+      var row = (await database.query('clients')).single;
+      expect(jsonDecode(row['photos'] as String), [canonicalOne, localTwo]);
+      expect(row['is_dirty'], 0);
+      expect(await dbService.getSyncV2Cursor(tenant), '2');
+      expect(await dbService.getPendingClientPhotos(tenant), [
+        {
+          'client_remote_id': remoteId,
+          'local_path': localTwo,
+        },
+      ]);
+
+      await SyncService(apiService: apiService, dbService: dbService).sync();
+
+      row = (await database.query('clients')).single;
+      expect(
+        jsonDecode(row['photos'] as String),
+        [canonicalOne, canonicalTwo],
+      );
+      expect(await dbService.getPendingClientPhotos(tenant), isEmpty);
+      expect(await dbService.getSyncV2Cursor(tenant), '3');
+      expect(apiService.photoUploads, [
+        [remoteId, localOne],
+        [remoteId, localTwo],
+        [remoteId, localTwo],
+      ]);
+
+      await SyncService(apiService: apiService, dbService: dbService).sync();
+      expect(apiService.photoUploads, hasLength(3));
+    });
+  }
+
+  test(
+      'ambiguous committed photo response preserves local intent through pull and converges on retry',
+      () async {
+    await activate();
+    const localPhoto = '/offline/ambiguous.jpg';
+    const canonicalPhoto =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000043.jpg';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'Ambiguous photo',
+      photos: const [localPhoto],
+      updatedAt: DateTime.parse(now),
+    ));
+    Map<String, dynamic>? authoritative;
+    var v2Round = 0;
+    apiService.v2Handler = (request) async {
+      v2Round += 1;
+      if (v2Round == 1) {
+        final submitted = request['changes']['clients'].single;
+        authoritative = serverClient(
+          changeId: submitted['change_id'],
+          cursor: '1',
+          name: 'Ambiguous photo',
+          generation: submitted['generation'],
+          branch: submitted['branch_seq'],
+          writerId: submitted['writer_id'],
+        );
+        return responseFor(
+          request,
+          cursor: '1',
+          clientOutcomes: [
+            {
+              'change_id': submitted['change_id'],
+              'remote_id': remoteId,
+              'status': 'applied',
+              'reason_code': 'upsert_applied',
+              'authoritative': authoritative!,
+            },
+          ],
+          clients: [authoritative!],
+        );
+      }
+      if (v2Round == 2) {
+        final committed = {
+          ...authoritative!,
+          'row_cursor': '2',
+          'media': {
+            'photos': [canonicalPhoto],
+          },
+        };
+        authoritative = committed;
+        return responseFor(request, cursor: '2', clients: [committed]);
+      }
+      final converged = {
+        ...authoritative!,
+        'row_cursor': '3',
+        'media': {
+          'photos': [canonicalPhoto],
+        },
+      };
+      authoritative = converged;
+      return responseFor(request, cursor: '3', clients: [converged]);
+    };
+    var attempts = 0;
+    apiService.photoHandler = (_, path) async {
+      attempts += 1;
+      expect(path, localPhoto);
+      if (attempts == 1) {
+        throw StateError('response lost after server commit');
+      }
+      final row = (await database.query('clients')).single;
+      expect(
+        jsonDecode(row['photos'] as String),
+        [canonicalPhoto, localPhoto],
+        reason: 'the pull must not erase the unacknowledged local path',
+      );
+      return canonicalPhoto;
+    };
+
+    await expectLater(
+      SyncService(apiService: apiService, dbService: dbService).sync(),
+      throwsA(isA<StateError>()),
+    );
+    expect(await dbService.getPendingClientPhotos(tenant), hasLength(1));
+    expect(
+      jsonDecode((await database.query('clients')).single['photos'] as String),
+      [localPhoto],
+    );
+
+    await SyncService(apiService: apiService, dbService: dbService).sync();
+
+    expect(
+      jsonDecode((await database.query('clients')).single['photos'] as String),
+      [canonicalPhoto],
+    );
+    expect(await dbService.getPendingClientPhotos(tenant), isEmpty);
+    expect(apiService.photoUploads, hasLength(2));
+  });
+
+  test('photo acknowledgement CAS preserves an in-flight local edit', () async {
+    await activate();
+    const localOne = '/offline/in-flight-one.jpg';
+    const localTwo = '/offline/in-flight-two.jpg';
+    const localThree = '/offline/in-flight-three.jpg';
+    const canonicalOne =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000044.jpg';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'Before upload',
+      photos: const [localOne, localTwo],
+      updatedAt: DateTime.parse(now),
+    ));
+    Map<String, dynamic>? authoritative;
+    var v2Round = 0;
+    apiService.v2Handler = (request) async {
+      v2Round += 1;
+      if (v2Round == 1) {
+        final submitted = request['changes']['clients'].single;
+        authoritative = serverClient(
+          changeId: submitted['change_id'],
+          cursor: '1',
+          name: 'Before upload',
+          generation: submitted['generation'],
+          branch: submitted['branch_seq'],
+          writerId: submitted['writer_id'],
+        );
+        return responseFor(
+          request,
+          cursor: '1',
+          clientOutcomes: [
+            {
+              'change_id': submitted['change_id'],
+              'remote_id': remoteId,
+              'status': 'applied',
+              'reason_code': 'upsert_applied',
+              'authoritative': authoritative!,
+            },
+          ],
+          clients: [authoritative!],
+        );
+      }
+      final inFlight = request['changes']['clients'].single;
+      final reconciled = {
+        ...authoritative!,
+        'row_cursor': '2',
+        'media': {
+          'photos': [canonicalOne],
+        },
+      };
+      authoritative = reconciled;
+      return responseFor(
+        request,
+        cursor: '2',
+        clientOutcomes: [
+          {
+            'change_id': inFlight['change_id'],
+            'remote_id': remoteId,
+            'status': 'rejected',
+            'reason_code': 'invalid_payload',
+          },
+        ],
+        clients: [reconciled],
+      );
+    };
+    var uploadAttempt = 0;
+    apiService.photoHandler = (_, path) async {
+      uploadAttempt += 1;
+      if (uploadAttempt == 1) {
+        final local = await dbService.getClientByRemoteId(remoteId);
+        await dbService.updateClient(
+          local!.copyWith(
+            name: 'Edited while uploading',
+            photos: const [localOne, localTwo, localThree],
+            isDirty: true,
+            updatedAt: DateTime.utc(2026, 7, 30, 0, 1),
+          ),
+        );
+        return canonicalOne;
+      }
+      expect(path, localTwo);
+      throw StateError('second upload failed');
+    };
+
+    await expectLater(
+      SyncService(apiService: apiService, dbService: dbService).sync(),
+      throwsA(isA<StateError>()),
+    );
+
+    final row = (await database.query('clients')).single;
+    expect(row['name'], 'Edited while uploading');
+    expect(row['is_dirty'], 1);
+    expect(row['pending_change_id'], isNotNull);
+    expect(
+      jsonDecode(row['photos'] as String),
+      [canonicalOne, localTwo, localThree],
+    );
+    expect(await dbService.getPendingClientPhotos(tenant), [
+      {'client_remote_id': remoteId, 'local_path': localTwo},
+      {'client_remote_id': remoteId, 'local_path': localThree},
+    ]);
   });
 
   test('applies rectangle media and live/replaced/deleted PDF resources',
@@ -1211,15 +1596,358 @@ void main() {
     }
   });
 
-  test('HTTP 426 claims and drains every migrated legacy LWW row through v2',
+  for (final writerCase in <String, String>{
+    'lexically lower': '10000000-0000-4000-8000-000000000001',
+    'lexically higher': 'f0000000-0000-4000-8000-000000000001',
+  }.entries) {
+    test(
+        'HTTP 426 baselines and rebases all four legacy entities with ${writerCase.key} writer',
+        () async {
+      const itemId = '40000000-0000-4000-8000-000000000021';
+      const rectangleId = '40000000-0000-4000-8000-000000000022';
+      const priceId = '40000000-0000-4000-8000-000000000023';
+      const baselineChanges = {
+        'clients': '40000000-0000-4000-8000-000000000051',
+        'items': '40000000-0000-4000-8000-000000000052',
+        'rectangles': '40000000-0000-4000-8000-000000000053',
+        'default_prices': '40000000-0000-4000-8000-000000000054',
+      };
+      const preBaselineChanges = {
+        'clients': '40000000-0000-4000-8000-000000000071',
+        'items': '40000000-0000-4000-8000-000000000072',
+        'rectangles': '40000000-0000-4000-8000-000000000073',
+        'default_prices': '40000000-0000-4000-8000-000000000074',
+      };
+      const localClientPayload = <String, dynamic>{
+        'address': 'Local address',
+        'discounted_price': 99,
+        'email': 'local@example.com',
+        'latitude': 10,
+        'longitude': 20,
+        'name': 'Legacy client edit',
+        'phone': '1234567890',
+        'site_address': 'Local site',
+      };
+      const localItemPayload = <String, dynamic>{
+        'enabled': true,
+        'name': 'Legacy item edit',
+        'price': 10,
+      };
+      const localRectanglePayload = <String, dynamic>{
+        'length': 2,
+        'width': 3,
+      };
+      const localPricePayload = <String, dynamic>{
+        'enabled': true,
+        'price': 12,
+      };
+      const serverClientPayload = <String, dynamic>{
+        'address': null,
+        'discounted_price': null,
+        'email': null,
+        'latitude': null,
+        'longitude': null,
+        'name': 'Server client baseline',
+        'phone': null,
+        'site_address': null,
+      };
+      const serverItemPayload = <String, dynamic>{
+        'enabled': false,
+        'name': 'Server item baseline',
+        'price': 20,
+      };
+      const serverRectanglePayload = <String, dynamic>{
+        'length': 8,
+        'width': 9,
+      };
+      const serverPricePayload = <String, dynamic>{
+        'enabled': false,
+        'price': 30,
+      };
+
+      await database.insert('sync_state', {
+        'key': 'lww_installation_writer_id',
+        'value': writerCase.value,
+      });
+      final clientLocalId = await database.insert('clients', {
+        'remote_id': remoteId,
+        'franchisee_id': tenant,
+        'name': localClientPayload['name'],
+        'address': localClientPayload['address'],
+        'site_address': localClientPayload['site_address'],
+        'email': localClientPayload['email'],
+        'phone': localClientPayload['phone'],
+        'latitude': localClientPayload['latitude'],
+        'longitude': localClientPayload['longitude'],
+        'discounted_price': localClientPayload['discounted_price'],
+        'photos': '[]',
+        'is_dirty': 1,
+        'updated_at': now,
+        'pending_base_generation': '0',
+        'pending_generation': '1',
+        'pending_branch_seq': 1,
+        'pending_writer_id': writerCase.value,
+        'pending_change_id': preBaselineChanges['clients'],
+      });
+      final itemLocalId = await database.insert('items', {
+        'remote_id': itemId,
+        'client_id': clientLocalId,
+        'name': localItemPayload['name'],
+        'price': localItemPayload['price'],
+        'enabled': 1,
+        'is_dirty': 1,
+        'updated_at': now,
+        'pending_base_generation': '0',
+        'pending_generation': '1',
+        'pending_branch_seq': 1,
+        'pending_writer_id': writerCase.value,
+        'pending_change_id': preBaselineChanges['items'],
+      });
+      await database.insert('rectangles', {
+        'remote_id': rectangleId,
+        'item_id': itemLocalId,
+        'length': localRectanglePayload['length'],
+        'width': localRectanglePayload['width'],
+        'image_data': 'data:image/png;base64,bG9jYWw=',
+        'is_dirty': 1,
+        'updated_at': now,
+        'pending_base_generation': '0',
+        'pending_generation': '1',
+        'pending_branch_seq': 1,
+        'pending_writer_id': writerCase.value,
+        'pending_change_id': preBaselineChanges['rectangles'],
+      });
+      await database.insert('default_prices', {
+        'remote_id': priceId,
+        'franchisee_id': tenant,
+        'price': localPricePayload['price'],
+        'enabled': 1,
+        'is_dirty': 1,
+        'updated_at': now,
+        'pending_base_generation': '0',
+        'pending_generation': '1',
+        'pending_branch_seq': 1,
+        'pending_writer_id': writerCase.value,
+        'pending_change_id': preBaselineChanges['default_prices'],
+      });
+
+      final baseline = <String, Map<String, dynamic>>{
+        'clients': lwwUpsertRecord(
+          id: remoteId,
+          generation: '1',
+          branch: 1,
+          writer: serverWriter,
+          change: baselineChanges['clients']!,
+          cursor: '1',
+          payload: serverClientPayload,
+          tenantOwned: true,
+          media: {'photos': <String>[]},
+        ),
+        'items': lwwUpsertRecord(
+          id: itemId,
+          generation: '1',
+          branch: 1,
+          writer: serverWriter,
+          change: baselineChanges['items']!,
+          cursor: '1',
+          payload: serverItemPayload,
+          parentId: remoteId,
+        ),
+        'rectangles': lwwUpsertRecord(
+          id: rectangleId,
+          generation: '1',
+          branch: 1,
+          writer: serverWriter,
+          change: baselineChanges['rectangles']!,
+          cursor: '1',
+          payload: serverRectanglePayload,
+          parentId: itemId,
+          media: {'image_data': null},
+        ),
+        'default_prices': lwwUpsertRecord(
+          id: priceId,
+          generation: '1',
+          branch: 1,
+          writer: serverWriter,
+          change: baselineChanges['default_prices']!,
+          cursor: '1',
+          payload: serverPricePayload,
+          tenantOwned: true,
+        ),
+      };
+      apiService.v1Handler = (_) async => throw const ApiException(
+            'Upgrade required',
+            statusCode: 426,
+            code: 'sync_protocol_upgrade_required',
+          );
+      var round = 0;
+      apiService.v2Handler = (request) async {
+        round += 1;
+        if (round == 1) {
+          expect(request['request_cursor'], '0');
+          for (final collection in baseline.keys) {
+            expect(request['changes'][collection], isEmpty);
+          }
+          return responseFor(
+            request,
+            cursor: '1',
+            clients: [baseline['clients']!],
+            items: [baseline['items']!],
+            rectangles: [baseline['rectangles']!],
+            defaultPrices: [baseline['default_prices']!],
+          );
+        }
+        expect(request['request_cursor'], '1');
+        final submitted = <String, Map<String, dynamic>>{
+          for (final collection in baseline.keys)
+            collection: Map<String, dynamic>.from(
+              request['changes'][collection].single as Map,
+            ),
+        };
+        for (final change in submitted.values) {
+          expect(change['base_generation'], '1');
+          expect(change['generation'], '2');
+          expect(change['branch_seq'], 1);
+          expect(change['writer_id'], writerCase.value);
+        }
+        for (final entry in submitted.entries) {
+          expect(
+            entry.value['change_id'],
+            isNot(preBaselineChanges[entry.key]),
+          );
+        }
+        expect(submitted['clients']!['payload'], localClientPayload);
+        expect(submitted['items']!['payload'], localItemPayload);
+        expect(
+          submitted['rectangles']!['payload'],
+          localRectanglePayload,
+        );
+        expect(submitted['default_prices']!['payload'], localPricePayload);
+        final accepted = <String, Map<String, dynamic>>{
+          'clients': lwwUpsertRecord(
+            id: remoteId,
+            generation: '2',
+            branch: 1,
+            writer: writerCase.value,
+            change: submitted['clients']!['change_id'],
+            cursor: '2',
+            payload: localClientPayload,
+            tenantOwned: true,
+            media: {'photos': <String>[]},
+          ),
+          'items': lwwUpsertRecord(
+            id: itemId,
+            generation: '2',
+            branch: 1,
+            writer: writerCase.value,
+            change: submitted['items']!['change_id'],
+            cursor: '2',
+            payload: localItemPayload,
+            parentId: remoteId,
+          ),
+          'rectangles': lwwUpsertRecord(
+            id: rectangleId,
+            generation: '2',
+            branch: 1,
+            writer: writerCase.value,
+            change: submitted['rectangles']!['change_id'],
+            cursor: '2',
+            payload: localRectanglePayload,
+            parentId: itemId,
+            media: Map<String, dynamic>.from(
+              submitted['rectangles']!['media'] as Map,
+            ),
+          ),
+          'default_prices': lwwUpsertRecord(
+            id: priceId,
+            generation: '2',
+            branch: 1,
+            writer: writerCase.value,
+            change: submitted['default_prices']!['change_id'],
+            cursor: '2',
+            payload: localPricePayload,
+            tenantOwned: true,
+          ),
+        };
+        List<Map<String, dynamic>> outcomes(String collection) => [
+              {
+                'change_id': submitted[collection]!['change_id'],
+                'remote_id': submitted[collection]!['remote_id'],
+                'status': 'applied',
+                'reason_code': 'upsert_applied',
+                'authoritative': accepted[collection],
+              },
+            ];
+        return responseFor(
+          request,
+          cursor: '2',
+          clientOutcomes: outcomes('clients'),
+          itemOutcomes: outcomes('items'),
+          rectangleOutcomes: outcomes('rectangles'),
+          defaultPriceOutcomes: outcomes('default_prices'),
+          clients: [accepted['clients']!],
+          items: [accepted['items']!],
+          rectangles: [accepted['rectangles']!],
+          defaultPrices: [accepted['default_prices']!],
+        );
+      };
+
+      await SyncService(apiService: apiService, dbService: dbService).sync();
+
+      expect((await database.query('clients')).single['name'],
+          localClientPayload['name']);
+      expect((await database.query('items')).single['name'],
+          localItemPayload['name']);
+      expect((await database.query('rectangles')).single['length'],
+          localRectanglePayload['length']);
+      expect((await database.query('default_prices')).single['price'],
+          localPricePayload['price']);
+      for (final table in baseline.keys) {
+        final row = (await database.query(table)).single;
+        expect(row['server_generation'], '2');
+        expect(row['is_dirty'], 0);
+        expect(row['pending_change_id'], isNull);
+      }
+      expect(apiService.v2Requests, hasLength(2));
+      expect(await dbService.isSyncV2Enabled(tenant), isTrue);
+      expect(await dbService.getSyncV2Cursor(tenant), '2');
+    });
+  }
+
+  test(
+      '426 bootstrap rejection preserves all four dirty values and exact rebased identities for retry',
       () async {
-    const itemId = '40000000-0000-4000-8000-000000000021';
-    const rectangleId = '40000000-0000-4000-8000-000000000022';
-    const priceId = '40000000-0000-4000-8000-000000000023';
+    const itemId = '40000000-0000-4000-8000-000000000061';
+    const rectangleId = '40000000-0000-4000-8000-000000000062';
+    const priceId = '40000000-0000-4000-8000-000000000063';
+    const localWriter = '10000000-0000-4000-8000-000000000002';
+    const localPayloads = <String, Map<String, dynamic>>{
+      'clients': {
+        'address': null,
+        'discounted_price': null,
+        'email': null,
+        'latitude': null,
+        'longitude': null,
+        'name': 'Preserved client',
+        'phone': null,
+        'site_address': null,
+      },
+      'items': {
+        'enabled': true,
+        'name': 'Preserved item',
+        'price': 11,
+      },
+      'rectangles': {'length': 4, 'width': 5},
+      'default_prices': {'enabled': true, 'price': 13},
+    };
+    await database.insert('sync_state', {
+      'key': 'lww_installation_writer_id',
+      'value': localWriter,
+    });
     final clientLocalId = await database.insert('clients', {
       'remote_id': remoteId,
       'franchisee_id': tenant,
-      'name': 'Legacy client',
+      'name': localPayloads['clients']!['name'],
       'photos': '[]',
       'is_dirty': 1,
       'updated_at': now,
@@ -1227,8 +1955,8 @@ void main() {
     final itemLocalId = await database.insert('items', {
       'remote_id': itemId,
       'client_id': clientLocalId,
-      'name': 'Legacy item',
-      'price': 10,
+      'name': localPayloads['items']!['name'],
+      'price': localPayloads['items']!['price'],
       'enabled': 1,
       'is_dirty': 1,
       'updated_at': now,
@@ -1236,8 +1964,8 @@ void main() {
     await database.insert('rectangles', {
       'remote_id': rectangleId,
       'item_id': itemLocalId,
-      'length': 2,
-      'width': 3,
+      'length': localPayloads['rectangles']!['length'],
+      'width': localPayloads['rectangles']!['width'],
       'image_data': null,
       'is_dirty': 1,
       'updated_at': now,
@@ -1245,119 +1973,209 @@ void main() {
     await database.insert('default_prices', {
       'remote_id': priceId,
       'franchisee_id': tenant,
-      'price': 12,
+      'price': localPayloads['default_prices']!['price'],
       'enabled': 1,
       'is_dirty': 1,
       'updated_at': now,
     });
+    const ids = {
+      'clients': remoteId,
+      'items': itemId,
+      'rectangles': rectangleId,
+      'default_prices': priceId,
+    };
+    const baselinePayloads = <String, Map<String, dynamic>>{
+      'clients': {
+        'address': null,
+        'discounted_price': null,
+        'email': null,
+        'latitude': null,
+        'longitude': null,
+        'name': 'Server client',
+        'phone': null,
+        'site_address': null,
+      },
+      'items': {'enabled': false, 'name': 'Server item', 'price': 21},
+      'rectangles': {'length': 8, 'width': 9},
+      'default_prices': {'enabled': false, 'price': 31},
+    };
+    String? parent(String collection) => switch (collection) {
+          'items' => remoteId,
+          'rectangles' => itemId,
+          _ => null,
+        };
+    Map<String, dynamic> recordFor(
+      String collection, {
+      required String generation,
+      required String change,
+      required String cursor,
+      required Map<String, dynamic> payload,
+      String writer = serverWriter,
+    }) =>
+        lwwUpsertRecord(
+          id: ids[collection]!,
+          generation: generation,
+          branch: 1,
+          writer: writer,
+          change: change,
+          cursor: cursor,
+          payload: payload,
+          parentId: parent(collection),
+          tenantOwned:
+              collection == 'clients' || collection == 'default_prices',
+          media: collection == 'clients'
+              ? {'photos': <String>[]}
+              : collection == 'rectangles'
+                  ? {'image_data': null}
+                  : null,
+        );
+    final baseline = {
+      for (final collection in ids.keys)
+        collection: recordFor(
+          collection,
+          generation: '1',
+          change:
+              '40000000-0000-4000-8000-00000000006${ids.keys.toList().indexOf(collection) + 4}',
+          cursor: '1',
+          payload: baselinePayloads[collection]!,
+        ),
+    };
     apiService.v1Handler = (_) async => throw const ApiException(
           'Upgrade required',
           statusCode: 426,
           code: 'sync_protocol_upgrade_required',
         );
+    var round = 0;
+    Map<String, String>? failedIds;
     apiService.v2Handler = (request) async {
-      expect(request['request_cursor'], '0');
-      for (final collection in [
-        'clients',
-        'items',
-        'rectangles',
-        'default_prices',
-      ]) {
-        expect(request['changes'][collection], hasLength(1));
+      round += 1;
+      if (round == 1) {
+        for (final collection in ids.keys) {
+          expect(request['changes'][collection], isEmpty);
+        }
+        return responseFor(
+          request,
+          cursor: '1',
+          clients: [baseline['clients']!],
+          items: [baseline['items']!],
+          rectangles: [baseline['rectangles']!],
+          defaultPrices: [baseline['default_prices']!],
+        );
       }
-      final clientChange = request['changes']['clients'].single;
-      final itemChange = request['changes']['items'].single;
-      final rectangleChange = request['changes']['rectangles'].single;
-      final priceChange = request['changes']['default_prices'].single;
-      Map<String, dynamic> record(
-        Map<String, dynamic> change,
-        Map<String, dynamic> payload, {
-        String? parentId,
-        bool client = false,
-        bool price = false,
-        Map<String, dynamic>? media,
-      }) =>
-          {
-            'remote_id': change['remote_id'],
-            'generation': change['generation'],
-            'branch_seq': change['branch_seq'],
-            'operation': change['operation'],
-            'writer_id': change['writer_id'],
-            'change_id': change['change_id'],
-            'payload_hash': payloadHash(payload),
-            'row_cursor': '1',
-            'server_timestamp': now,
-            'deleted_at': null,
-            if (parentId != null) 'parent_id': parentId,
-            if (client || price) 'franchisee_id': tenant,
-            'payload': payload,
-            if (media != null) 'media': media,
-          };
-      final records = <String, Map<String, dynamic>>{
-        'clients': record(
-          clientChange,
-          Map<String, dynamic>.from(clientChange['payload'] as Map),
-          client: true,
-          media: {'photos': <String>[]},
-        ),
-        'items': record(
-          itemChange,
-          Map<String, dynamic>.from(itemChange['payload'] as Map),
-          parentId: remoteId,
-        ),
-        'rectangles': record(
-          rectangleChange,
-          Map<String, dynamic>.from(rectangleChange['payload'] as Map),
-          parentId: itemId,
-          media: {'image_data': null},
-        ),
-        'default_prices': record(
-          priceChange,
-          Map<String, dynamic>.from(priceChange['payload'] as Map),
-          price: true,
-        ),
-      };
-      return {
-        'protocol_version': 2,
-        'request_id': request['request_id'],
-        'response_cursor': '1',
-        'warranty_tombstone_cursor': '0',
-        'outcomes': {
-          for (final collection in records.keys)
-            collection: [
+      if (round == 2) {
+        failedIds = {
+          for (final collection in ids.keys)
+            collection:
+                request['changes'][collection].single['change_id'] as String,
+        };
+        List<Map<String, dynamic>> rejected(String collection) => [
               {
-                'change_id': records[collection]!['change_id'],
-                'remote_id': records[collection]!['remote_id'],
-                'status': 'applied',
-                'reason_code': 'upsert_applied',
-                'authoritative': records[collection],
-              }
-            ],
-        },
-        'warnings': [],
-        'updates': {
-          for (final collection in records.keys)
-            collection: [records[collection]],
-          'warranties': [],
-          'proposals': [],
-          'warranty_tombstones': [],
-        },
+                'change_id': failedIds![collection],
+                'remote_id': ids[collection],
+                'status': 'rejected',
+                'reason_code': 'invalid_payload',
+              },
+            ];
+        return responseFor(
+          request,
+          cursor: '1',
+          clientOutcomes: rejected('clients'),
+          itemOutcomes: rejected('items'),
+          rectangleOutcomes: rejected('rectangles'),
+          defaultPriceOutcomes: rejected('default_prices'),
+        );
+      }
+      if (round == 3) {
+        expect(request['request_cursor'], '1');
+        for (final collection in ids.keys) {
+          expect(request['changes'][collection], isEmpty);
+        }
+        return responseFor(request, cursor: '1');
+      }
+      final submitted = {
+        for (final collection in ids.keys)
+          collection: Map<String, dynamic>.from(
+            request['changes'][collection].single as Map,
+          ),
       };
+      for (final collection in ids.keys) {
+        expect(submitted[collection]!['change_id'], failedIds![collection]);
+        expect(submitted[collection]!['base_generation'], '1');
+        expect(submitted[collection]!['generation'], '2');
+        expect(submitted[collection]!['payload'], localPayloads[collection]);
+      }
+      final accepted = {
+        for (final collection in ids.keys)
+          collection: recordFor(
+            collection,
+            generation: '2',
+            change: submitted[collection]!['change_id'],
+            cursor: '2',
+            payload: localPayloads[collection]!,
+            writer: localWriter,
+          ),
+      };
+      List<Map<String, dynamic>> applied(String collection) => [
+            {
+              'change_id': submitted[collection]!['change_id'],
+              'remote_id': ids[collection],
+              'status': 'applied',
+              'reason_code': 'upsert_applied',
+              'authoritative': accepted[collection],
+            },
+          ];
+      return responseFor(
+        request,
+        cursor: '2',
+        clientOutcomes: applied('clients'),
+        itemOutcomes: applied('items'),
+        rectangleOutcomes: applied('rectangles'),
+        defaultPriceOutcomes: applied('default_prices'),
+        clients: [accepted['clients']!],
+        items: [accepted['items']!],
+        rectangles: [accepted['rectangles']!],
+        defaultPrices: [accepted['default_prices']!],
+      );
     };
+
+    await expectLater(
+      SyncService(apiService: apiService, dbService: dbService).sync(),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.code,
+          'code',
+          'sync_v2_bootstrap_not_accepted',
+        ),
+      ),
+    );
+
+    expect(await dbService.isSyncV2Enabled(tenant), isFalse);
+    expect(await dbService.getSyncV2Cursor(tenant), '1');
+    expect((await database.query('clients')).single['name'],
+        localPayloads['clients']!['name']);
+    expect((await database.query('items')).single['name'],
+        localPayloads['items']!['name']);
+    expect((await database.query('rectangles')).single['length'],
+        localPayloads['rectangles']!['length']);
+    expect((await database.query('default_prices')).single['price'],
+        localPayloads['default_prices']!['price']);
+    for (final table in ids.keys) {
+      final row = (await database.query(table)).single;
+      expect(row['is_dirty'], 1);
+      expect(row['pending_change_id'], failedIds![table]);
+      expect(row['pending_base_generation'], '1');
+      expect(row['pending_generation'], '2');
+    }
 
     await SyncService(apiService: apiService, dbService: dbService).sync();
 
-    for (final table in [
-      'clients',
-      'items',
-      'rectangles',
-      'default_prices',
-    ]) {
-      expect((await database.query(table)).single['is_dirty'], 0);
-      expect((await database.query(table)).single['pending_change_id'], isNull);
-    }
     expect(await dbService.isSyncV2Enabled(tenant), isTrue);
-    expect(await dbService.getSyncV2Cursor(tenant), '1');
+    expect(await dbService.getSyncV2Cursor(tenant), '2');
+    for (final table in ids.keys) {
+      final row = (await database.query(table)).single;
+      expect(row['is_dirty'], 0);
+      expect(row['pending_change_id'], isNull);
+    }
   });
 
   test('active v2 rejects an old or malformed response without cursor advance',

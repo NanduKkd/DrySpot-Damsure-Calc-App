@@ -34,7 +34,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 11,
+      version: 12,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
@@ -92,6 +92,10 @@ class DbService {
     if (oldVersion < 11 && newVersion >= 11) {
       await _addLwwSyncColumns(db);
       await _createSyncStateTable(db);
+    }
+    if (oldVersion < 12 && newVersion >= 12) {
+      await _createPendingClientPhotosTable(db);
+      await _backfillPendingClientPhotos(db);
     }
   }
 
@@ -186,6 +190,7 @@ class DbService {
     await _createWarrantiesTable(db);
     await _createWarrantyDeletionTombstonesTable(db);
     await _createSyncStateTable(db);
+    await _createPendingClientPhotosTable(db);
     await _createProposalsTable(db);
   }
 
@@ -312,6 +317,68 @@ class DbService {
     ''');
   }
 
+  static Future<void> _createPendingClientPhotosTable(
+    DatabaseExecutor db,
+  ) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS pending_client_photos (
+        franchisee_id TEXT NOT NULL,
+        client_remote_id TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        PRIMARY KEY (franchisee_id, client_remote_id, local_path)
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS pending_client_photos_client
+      ON pending_client_photos (franchisee_id, client_remote_id)
+    ''');
+  }
+
+  static bool _isCanonicalClientPhotoPath(String path) =>
+      path.startsWith('/api/photos/client/');
+
+  static List<String> _decodeClientPhotos(Object? value) {
+    final decoded = jsonDecode(value?.toString() ?? '[]');
+    if (decoded is! List || decoded.any((photo) => photo is! String)) {
+      throw const FormatException('Local client photo metadata is invalid.');
+    }
+    return decoded.cast<String>();
+  }
+
+  static Future<void> _backfillPendingClientPhotos(
+    DatabaseExecutor db,
+  ) async {
+    final rows = await db.query(
+      'clients',
+      columns: ['remote_id', 'franchisee_id', 'photos', 'deleted_at'],
+    );
+    for (final row in rows) {
+      final remoteId = row['remote_id']?.toString();
+      final franchiseeId = row['franchisee_id']?.toString();
+      final photos = _decodeClientPhotos(row['photos']);
+      if (row['deleted_at'] != null ||
+          remoteId == null ||
+          remoteId.isEmpty ||
+          franchiseeId == null ||
+          franchiseeId.isEmpty) {
+        continue;
+      }
+      for (final path in photos.where(
+        (photo) => !_isCanonicalClientPhotoPath(photo),
+      )) {
+        await db.insert(
+          'pending_client_photos',
+          {
+            'franchisee_id': franchiseeId,
+            'client_remote_id': remoteId,
+            'local_path': path,
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+      }
+    }
+  }
+
   static Future<void> _createProposalsTable(Database db) async {
     await db.execute('''
       CREATE TABLE proposals (
@@ -421,11 +488,84 @@ class DbService {
     'pending_change_id': null,
   };
 
+  Future<bool> _supportsPendingClientPhotos(
+    DatabaseExecutor executor,
+  ) async {
+    final rows = await executor.rawQuery(
+      "SELECT name FROM sqlite_master "
+      "WHERE type = 'table' AND name = 'pending_client_photos'",
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<void> _syncPendingClientPhotos(
+    DatabaseExecutor executor,
+    int localId,
+  ) async {
+    if (!await _supportsPendingClientPhotos(executor)) return;
+    final rows = await executor.query(
+      'clients',
+      columns: [
+        'remote_id',
+        'franchisee_id',
+        'photos',
+        'deleted_at',
+      ],
+      where: 'local_id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return;
+    final row = rows.single;
+    final remoteId = row['remote_id']?.toString();
+    final franchiseeId = row['franchisee_id']?.toString();
+    if (remoteId == null ||
+        remoteId.isEmpty ||
+        franchiseeId == null ||
+        franchiseeId.isEmpty) {
+      return;
+    }
+    final pendingRows = await executor.query(
+      'pending_client_photos',
+      columns: ['local_path'],
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [franchiseeId, remoteId],
+    );
+    final desired = row['deleted_at'] == null
+        ? _decodeClientPhotos(row['photos'])
+            .where((photo) => !_isCanonicalClientPhotoPath(photo))
+            .toSet()
+        : const <String>{};
+    for (final pending in pendingRows) {
+      final path = pending['local_path'] as String;
+      if (!desired.contains(path)) {
+        await executor.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, path],
+        );
+      }
+    }
+    for (final path in desired) {
+      await executor.insert(
+        'pending_client_photos',
+        {
+          'franchisee_id': franchiseeId,
+          'client_remote_id': remoteId,
+          'local_path': path,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
+  }
+
   // Client CRUD
   Future<int> insertClient(Client client) async {
     final db = await database;
     return db.transaction((transaction) async {
       final id = await transaction.insert('clients', client.toMap());
+      await _syncPendingClientPhotos(transaction, id);
       if (client.isDirty) {
         await _markLocalLwwMutation(transaction, 'clients', id);
       }
@@ -469,6 +609,9 @@ class DbService {
         where: 'local_id = ?',
         whereArgs: [client.localId],
       );
+      if (changed == 1 && client.localId != null) {
+        await _syncPendingClientPhotos(transaction, client.localId!);
+      }
       if (changed == 1 && client.isDirty && client.localId != null) {
         await _markLocalLwwMutation(transaction, 'clients', client.localId!);
       }
@@ -476,49 +619,107 @@ class DbService {
     });
   }
 
-  Future<void> replaceClientPhotoPath({
+  Future<List<Map<String, String>>> getPendingClientPhotos(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsPendingClientPhotos(db)) return const [];
+    final rows = await db.rawQuery(
+      '''
+      SELECT p.client_remote_id, p.local_path
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND c.deleted_at IS NULL
+      ORDER BY c.local_id, p.rowid
+      ''',
+      [franchiseeId],
+    );
+    return [
+      for (final row in rows)
+        {
+          'client_remote_id': row['client_remote_id'] as String,
+          'local_path': row['local_path'] as String,
+        },
+    ];
+  }
+
+  Future<bool> acknowledgeClientPhotoUpload({
     required String franchiseeId,
     required String remoteId,
     required String localPath,
     required String canonicalPath,
   }) async {
     final db = await database;
-    await db.transaction((transaction) async {
+    return db.transaction((transaction) async {
+      if (!await _supportsPendingClientPhotos(transaction)) return false;
+      final pending = await transaction.query(
+        'pending_client_photos',
+        columns: ['local_path'],
+        where: 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+        whereArgs: [franchiseeId, remoteId, localPath],
+        limit: 1,
+      );
+      if (pending.isEmpty) return false;
       final rows = await transaction.query(
         'clients',
-        columns: ['local_id', 'photos'],
+        columns: ['local_id', 'photos', 'deleted_at'],
         where: 'remote_id = ? AND franchisee_id = ?',
         whereArgs: [remoteId, franchiseeId],
         limit: 1,
       );
       if (rows.isEmpty) {
-        throw StateError('The uploaded photo client is no longer local.');
+        await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        return false;
       }
-      final rawPhotos = jsonDecode(rows.first['photos']?.toString() ?? '[]');
-      if (rawPhotos is! List || rawPhotos.any((photo) => photo is! String)) {
-        throw const FormatException('Local client photo metadata is invalid.');
+      final currentPhotos = _decodeClientPhotos(rows.first['photos']);
+      if (rows.first['deleted_at'] != null ||
+          !currentPhotos.contains(localPath)) {
+        await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        return false;
       }
-      final nextPhotos = rawPhotos
-          .cast<String>()
+      final nextPhotos = currentPhotos
           .map((photo) => photo == localPath ? canonicalPath : photo)
           .toSet()
           .toList();
-      if (!nextPhotos.contains(canonicalPath)) {
-        throw StateError(
-            'The uploaded local photo changed before acknowledgement.');
-      }
+      final removed = await transaction.delete(
+        'pending_client_photos',
+        where: 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+        whereArgs: [franchiseeId, remoteId, localPath],
+      );
+      if (removed != 1) return false;
       await transaction.update(
         'clients',
         {'photos': jsonEncode(nextPhotos)},
         where: 'local_id = ?',
         whereArgs: [rows.first['local_id']],
       );
+      return true;
     });
   }
 
   Future<int> softDeleteClient(int localId) async {
     final db = await database;
     return db.transaction((transaction) async {
+      final rows = await transaction.query(
+        'clients',
+        columns: ['remote_id', 'franchisee_id'],
+        where: 'local_id = ?',
+        whereArgs: [localId],
+        limit: 1,
+      );
       final changed = await transaction.update(
         'clients',
         {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
@@ -526,6 +727,17 @@ class DbService {
         whereArgs: [localId],
       );
       if (changed == 1) {
+        if (rows.isNotEmpty &&
+            await _supportsPendingClientPhotos(transaction)) {
+          await transaction.delete(
+            'pending_client_photos',
+            where: 'franchisee_id = ? AND client_remote_id = ?',
+            whereArgs: [
+              rows.single['franchisee_id'],
+              rows.single['remote_id'],
+            ],
+          );
+        }
         await _markLocalLwwMutation(transaction, 'clients', localId);
       }
       return changed;
@@ -699,49 +911,91 @@ class DbService {
         where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''");
   }
 
-  Future<void> claimLegacyLwwChanges(String franchiseeId) async {
+  Future<void> rebasePendingLwwChangesForBootstrap(
+    String franchiseeId,
+  ) async {
     final db = await database;
     await db.transaction((transaction) async {
       final tableQueries = <String, String>{
         'clients': '''
-          SELECT c.local_id
+          SELECT c.local_id, c.server_generation, c.pending_base_generation,
+                 c.pending_generation, c.pending_branch_seq,
+                 c.pending_writer_id, c.pending_change_id
           FROM clients c
           WHERE c.franchisee_id = ?
             AND c.is_dirty = 1
-            AND c.pending_change_id IS NULL
         ''',
         'items': '''
-          SELECT i.local_id
+          SELECT i.local_id, i.server_generation, i.pending_base_generation,
+                 i.pending_generation, i.pending_branch_seq,
+                 i.pending_writer_id, i.pending_change_id
           FROM items i
           JOIN clients c ON c.local_id = i.client_id
           WHERE c.franchisee_id = ?
             AND i.is_dirty = 1
-            AND i.pending_change_id IS NULL
         ''',
         'rectangles': '''
-          SELECT r.local_id
+          SELECT r.local_id, r.server_generation, r.pending_base_generation,
+                 r.pending_generation, r.pending_branch_seq,
+                 r.pending_writer_id, r.pending_change_id
           FROM rectangles r
           JOIN items i ON i.local_id = r.item_id
           JOIN clients c ON c.local_id = i.client_id
           WHERE c.franchisee_id = ?
             AND r.is_dirty = 1
-            AND r.pending_change_id IS NULL
         ''',
         'default_prices': '''
-          SELECT d.local_id
+          SELECT d.local_id, d.server_generation, d.pending_base_generation,
+                 d.pending_generation, d.pending_branch_seq,
+                 d.pending_writer_id, d.pending_change_id
           FROM default_prices d
           WHERE d.franchisee_id = ?
             AND d.is_dirty = 1
-            AND d.pending_change_id IS NULL
         ''',
       };
+      final writerId = await _installationWriterId(transaction);
+      const maxGeneration = '9223372036854775807';
       for (final entry in tableQueries.entries) {
         final rows = await transaction.rawQuery(entry.value, [franchiseeId]);
         for (final row in rows) {
-          await _markLocalLwwMutation(
-            transaction,
+          final serverGeneration = BigInt.tryParse(
+            row['server_generation']?.toString() ?? '',
+          );
+          if (serverGeneration == null ||
+              serverGeneration.isNegative ||
+              serverGeneration >= BigInt.parse(maxGeneration)) {
+            throw StateError(
+              'The authoritative logical generation cannot be rebased.',
+            );
+          }
+          final rebasedGeneration = serverGeneration + BigInt.one;
+          final pendingBase = BigInt.tryParse(
+            row['pending_base_generation']?.toString() ?? '',
+          );
+          final pendingGeneration = BigInt.tryParse(
+            row['pending_generation']?.toString() ?? '',
+          );
+          final pendingBranch = row['pending_branch_seq'] as int?;
+          final alreadyRebased = pendingBase == serverGeneration &&
+              pendingGeneration == rebasedGeneration &&
+              pendingBranch != null &&
+              pendingBranch >= 1 &&
+              pendingBranch <= 1000000 &&
+              row['pending_writer_id'] != null &&
+              row['pending_change_id'] != null;
+          if (alreadyRebased) continue;
+          await transaction.update(
             entry.key,
-            row['local_id'] as int,
+            {
+              'is_dirty': 1,
+              'pending_base_generation': serverGeneration.toString(),
+              'pending_generation': rebasedGeneration.toString(),
+              'pending_branch_seq': 1,
+              'pending_writer_id': writerId,
+              'pending_change_id': const Uuid().v4(),
+            },
+            where: 'local_id = ?',
+            whereArgs: [row['local_id']],
           );
         }
       }
@@ -1307,6 +1561,52 @@ class DbService {
     return List<String>.from(media['photos'] as List);
   }
 
+  Future<List<String>> _mergePendingClientPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> serverPhotos,
+    required List<String> legacyFallback,
+  }) async {
+    final pendingPaths = <String>[];
+    if (await _supportsPendingClientPhotos(executor)) {
+      final rows = await executor.query(
+        'pending_client_photos',
+        columns: ['local_path'],
+        where: 'franchisee_id = ? AND client_remote_id = ?',
+        whereArgs: [franchiseeId, remoteId],
+        orderBy: 'rowid',
+      );
+      pendingPaths.addAll(
+        rows.map((row) => row['local_path'] as String),
+      );
+    } else {
+      pendingPaths.addAll(
+        legacyFallback.where(
+          (photo) => !_isCanonicalClientPhotoPath(photo),
+        ),
+      );
+    }
+    return [
+      ...serverPhotos,
+      for (final photo in pendingPaths)
+        if (!serverPhotos.contains(photo)) photo,
+    ];
+  }
+
+  Future<void> _deletePendingClientPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+  }) async {
+    if (!await _supportsPendingClientPhotos(executor)) return;
+    await executor.delete(
+      'pending_client_photos',
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [franchiseeId, remoteId],
+    );
+  }
+
   Future<void> _applyV2Record(
     DatabaseExecutor executor,
     String collection,
@@ -1360,18 +1660,24 @@ class DbService {
       };
       if (collection == 'clients') {
         final serverPhotos = _serverPhotos(record);
-        if (localDirty) {
-          final localPhotos = List<String>.from(
-              jsonDecode(existing['photos']?.toString() ?? '[]'));
-          values['photos'] = jsonEncode([
-            ...serverPhotos,
-            for (final photo in localPhotos)
-              if (!serverPhotos.contains(photo) &&
-                  !photo.startsWith('/api/photos/client/'))
-                photo,
-          ]);
+        final localPhotos = _decodeClientPhotos(existing['photos']);
+        if (record['operation'] == 'delete' && !localDirty) {
+          await _deletePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+          );
+          values['photos'] = '[]';
         } else {
-          values['photos'] = jsonEncode(serverPhotos);
+          values['photos'] = jsonEncode(
+            await _mergePendingClientPhotos(
+              executor,
+              franchiseeId: franchiseeId,
+              remoteId: remoteId,
+              serverPhotos: serverPhotos,
+              legacyFallback: localPhotos,
+            ),
+          );
         }
       } else if (collection == 'rectangles' && !localDirty) {
         final media = Map<String, dynamic>.from(record['media'] as Map);
@@ -1410,16 +1716,16 @@ class DbService {
       final dirtyMetadata = <String, Object?>{...metadata};
       if (collection == 'clients') {
         final serverPhotos = _serverPhotos(record);
-        final localPhotos = List<String>.from(
-          jsonDecode(existing['photos']?.toString() ?? '[]'),
+        final localPhotos = _decodeClientPhotos(existing['photos']);
+        dirtyMetadata['photos'] = jsonEncode(
+          await _mergePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+            serverPhotos: serverPhotos,
+            legacyFallback: localPhotos,
+          ),
         );
-        dirtyMetadata['photos'] = jsonEncode([
-          ...serverPhotos,
-          for (final photo in localPhotos)
-            if (!serverPhotos.contains(photo) &&
-                !photo.startsWith('/api/photos/client/'))
-              photo,
-        ]);
       }
       await executor.update(
         table,
@@ -1446,9 +1752,15 @@ class DbService {
         final serverPhotos = _serverPhotos(record);
         final localPhotos = existing == null
             ? const <String>[]
-            : List<String>.from(
-                jsonDecode(existing['photos']?.toString() ?? '[]'),
-              );
+            : _decodeClientPhotos(existing['photos']);
+        final deleting = record['operation'] == 'delete';
+        if (deleting) {
+          await _deletePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+          );
+        }
         values.addAll({
           'franchisee_id': franchiseeId,
           'name': payload['name'] ?? '',
@@ -1459,15 +1771,17 @@ class DbService {
           'latitude': payload['latitude'],
           'longitude': payload['longitude'],
           'discounted_price': payload['discounted_price'],
-          'photos': jsonEncode(record['operation'] == 'delete'
-              ? const <String>[]
-              : [
-                  ...serverPhotos,
-                  for (final photo in localPhotos)
-                    if (!serverPhotos.contains(photo) &&
-                        !photo.startsWith('/api/photos/client/'))
-                      photo,
-                ]),
+          'photos': jsonEncode(
+            deleting
+                ? const <String>[]
+                : await _mergePendingClientPhotos(
+                    executor,
+                    franchiseeId: franchiseeId,
+                    remoteId: remoteId,
+                    serverPhotos: serverPhotos,
+                    legacyFallback: localPhotos,
+                  ),
+          ),
         });
       case 'items':
         values.addAll({

@@ -13,6 +13,18 @@ import '../models/warranty.dart';
 import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
 
+class _PhotoUploadResult {
+  const _PhotoUploadResult({
+    required this.authoritativeChanged,
+    this.error,
+    this.stackTrace,
+  });
+
+  final bool authoritativeChanged;
+  final Object? error;
+  final StackTrace? stackTrace;
+}
+
 class SyncService {
   final ApiService apiService;
   final DbService dbService;
@@ -59,8 +71,20 @@ class SyncService {
       if (supportsV2 &&
           error.statusCode == 426 &&
           error.code == 'sync_protocol_upgrade_required') {
-        await dbService.claimLegacyLwwChanges(franchiseeId);
-        await _syncV2(franchiseeId, activateProtocol: true);
+        // The cutoff server may already own generation 1. Pull its cursor-zero
+        // baseline without submitting local candidates, preserve dirty values,
+        // then move every dirty candidate strictly above that baseline.
+        await _syncV2Round(
+          franchiseeId,
+          activateProtocol: false,
+          includePending: false,
+        );
+        await dbService.rebasePendingLwwChangesForBootstrap(franchiseeId);
+        await _syncV2(
+          franchiseeId,
+          activateProtocol: true,
+          requireSubmittedAccepted: true,
+        );
         return;
       }
       rethrow;
@@ -990,40 +1014,50 @@ class SyncService {
     return record;
   }
 
-  Future<bool> _uploadPendingV2ClientPhotos(String franchiseeId) async {
-    var uploaded = false;
-    final clients = (await dbService.getClients())
-        .where((client) => client.franchiseeId == franchiseeId)
-        .toList();
-    for (final client in clients) {
-      for (final photo in [...client.photos]) {
+  Future<_PhotoUploadResult> _uploadPendingV2ClientPhotos(
+    String franchiseeId,
+  ) async {
+    var authoritativeChanged = false;
+    for (final pending
+        in await dbService.getPendingClientPhotos(franchiseeId)) {
+      final remoteId = pending['client_remote_id']!;
+      final photo = pending['local_path']!;
+      try {
         if (photo.startsWith('/api/photos/client/')) continue;
         final uri = Uri.tryParse(photo);
         if (uri != null &&
             (uri.scheme == 'http' || uri.scheme == 'https') &&
             uri.path.startsWith('/api/photos/client/')) {
-          await dbService.replaceClientPhotoPath(
+          await dbService.acknowledgeClientPhotoUpload(
             franchiseeId: franchiseeId,
-            remoteId: client.remoteId,
+            remoteId: remoteId,
             localPath: photo,
             canonicalPath: uri.path,
           );
           continue;
         }
         final canonical = await apiService.uploadClientPhoto(
-          client.remoteId,
+          remoteId,
           photo,
         );
-        await dbService.replaceClientPhotoPath(
+        authoritativeChanged = true;
+        await dbService.acknowledgeClientPhotoUpload(
           franchiseeId: franchiseeId,
-          remoteId: client.remoteId,
+          remoteId: remoteId,
           localPath: photo,
           canonicalPath: canonical,
         );
-        uploaded = true;
+      } on Object catch (error, stackTrace) {
+        return _PhotoUploadResult(
+          authoritativeChanged: authoritativeChanged,
+          error: error,
+          stackTrace: stackTrace,
+        );
       }
     }
-    return uploaded;
+    return _PhotoUploadResult(
+      authoritativeChanged: authoritativeChanged,
+    );
   }
 
   Future<bool> _deletePendingV2Proposals(String franchiseeId) async {
@@ -1047,25 +1081,44 @@ class SyncService {
   Future<void> _syncV2(
     String franchiseeId, {
     required bool activateProtocol,
+    bool requireSubmittedAccepted = false,
   }) async {
     await _syncV2Round(
       franchiseeId,
       activateProtocol: activateProtocol,
+      requireSubmittedAccepted: requireSubmittedAccepted,
     );
-    final changedResources = await Future.wait([
-      _uploadPendingV2ClientPhotos(franchiseeId),
-      _deletePendingV2Proposals(franchiseeId),
-    ]);
-    if (changedResources.any((changed) => changed)) {
+    final photoResult = await _uploadPendingV2ClientPhotos(franchiseeId);
+    Object? proposalError;
+    StackTrace? proposalStackTrace;
+    var proposalChanged = false;
+    try {
+      proposalChanged = await _deletePendingV2Proposals(franchiseeId);
+    } on Object catch (error, stackTrace) {
+      proposalError = error;
+      proposalStackTrace = stackTrace;
+    }
+    if (photoResult.authoritativeChanged || proposalChanged) {
       // The dedicated endpoints advance/stamp the tenant cursor. Pull once
       // more so exact authoritative media/PDF state and cursor land atomically.
       await _syncV2Round(franchiseeId, activateProtocol: false);
+    }
+    if (photoResult.error != null) {
+      Error.throwWithStackTrace(
+        photoResult.error!,
+        photoResult.stackTrace!,
+      );
+    }
+    if (proposalError != null) {
+      Error.throwWithStackTrace(proposalError, proposalStackTrace!);
     }
   }
 
   Future<void> _syncV2Round(
     String franchiseeId, {
     required bool activateProtocol,
+    bool includePending = true,
+    bool requireSubmittedAccepted = false,
   }) async {
     final requestCursor = await dbService.getSyncV2Cursor(franchiseeId);
     final parsedRequestCursor = _v2Decimal(requestCursor, 'request_cursor');
@@ -1073,7 +1126,12 @@ class SyncService {
       franchiseeId,
     );
     _v2Decimal(warrantyCursor, 'warranty_tombstone_cursor');
-    final changes = await dbService.getPendingLwwChanges(franchiseeId);
+    final changes = includePending
+        ? await dbService.getPendingLwwChanges(franchiseeId)
+        : {
+            for (final collection in _v2Collections)
+              collection: <Map<String, dynamic>>[],
+          };
     final requestId = const Uuid().v4();
     final submittedChangeIds = <String, Map<String, String>>{
       for (final collection in _v2Collections)
@@ -1404,6 +1462,15 @@ class SyncService {
     }
     if (lastWarrantySequence != parsedWarrantyCursor) {
       throw _protocolError('warranty tombstone cursor is inconsistent.');
+    }
+    if (requireSubmittedAccepted &&
+        outcomeStatuses.values.any(
+          (status) => status != 'applied' && status != 'already_applied',
+        )) {
+      throw const ApiException(
+        'The v2 bootstrap did not accept every rebased legacy change.',
+        code: 'sync_v2_bootstrap_not_accepted',
+      );
     }
 
     await dbService.applySyncV2Response(

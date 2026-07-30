@@ -326,7 +326,19 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<int>);
 
   @override
-  _i5.Future<void> replaceClientPhotoPath({
+  _i5.Future<List<Map<String, String>>> getPendingClientPhotos(
+          String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getPendingClientPhotos,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<List<Map<String, String>>>.value(
+            <Map<String, String>>[]),
+      ) as _i5.Future<List<Map<String, String>>>);
+
+  @override
+  _i5.Future<bool> acknowledgeClientPhotoUpload({
     required String? franchiseeId,
     required String? remoteId,
     required String? localPath,
@@ -334,7 +346,7 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
   }) =>
       (super.noSuchMethod(
         Invocation.method(
-          #replaceClientPhotoPath,
+          #acknowledgeClientPhotoUpload,
           [],
           {
             #franchiseeId: franchiseeId,
@@ -343,9 +355,8 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
             #canonicalPath: canonicalPath,
           },
         ),
-        returnValue: _i5.Future<void>.value(),
-        returnValueForMissingStub: _i5.Future<void>.value(),
-      ) as _i5.Future<void>);
+        returnValue: _i5.Future<bool>.value(false),
+      ) as _i5.Future<bool>);
 
   @override
   _i5.Future<int> softDeleteClient(int? localId) => (super.noSuchMethod(
@@ -472,10 +483,10 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<int>);
 
   @override
-  _i5.Future<void> claimLegacyLwwChanges(String? franchiseeId) =>
+  _i5.Future<void> rebasePendingLwwChangesForBootstrap(String? franchiseeId) =>
       (super.noSuchMethod(
         Invocation.method(
-          #claimLegacyLwwChanges,
+          #rebasePendingLwwChangesForBootstrap,
           [franchiseeId],
         ),
         returnValue: _i5.Future<void>.value(),
