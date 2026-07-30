@@ -1,11 +1,12 @@
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import os from 'os';
-import { Op, Transaction, UniqueConstraintError, fn, col, where } from 'sequelize';
+import { Op, Transaction, UniqueConstraintError } from 'sequelize';
 import sequelize from '../config/database';
 import { Franchisee } from '../models/Franchisee';
 import { User } from '../models/User';
 import { UserAdminAuditEvent } from '../models/UserAdminAuditEvent';
+import { normalizeUserEmail, normalizedEmailWhere } from '../utils/userEmail';
 
 export const USER_ADMIN_BCRYPT_COST = 12;
 const MAX_TOKEN_VERSION = 2147483647;
@@ -22,12 +23,12 @@ export interface LifecycleRequest {
   name?: string; password?: string;
 }
 export interface LifecycleResult { outcome: 'succeeded' | 'noop'; reasonCode: string; user: { id: string; email: string; franchiseeId: string; isActive: boolean; tokenVersion: number }; generatedPassword?: string; }
+export interface AuditPage { events: UserAdminAuditEvent[]; nextCursor?: string; }
 
 export class UserAdminError extends Error {
   constructor(public readonly code: string, message = code) { super(message); }
 }
 
-export const normalizeUserEmail = (email: string): string => email.trim().toLowerCase();
 const isUuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 const requestHash = (request: LifecycleRequest) => crypto.createHash('sha256').update(JSON.stringify({
   action: request.action, franchiseeId: request.franchiseeId, email: normalizeUserEmail(request.email), reason: request.reason, name: request.name || '',
@@ -36,13 +37,33 @@ const requestHash = (request: LifecycleRequest) => crypto.createHash('sha256').u
 })).digest('hex');
 const snapshot = (user: User | null) => user ? { isActive: user.isActive, tokenVersion: user.tokenVersion } : null;
 const publicUser = (user: User) => ({ id: user.id, email: normalizeUserEmail(user.email), franchiseeId: user.franchiseeId, isActive: user.isActive, tokenVersion: user.tokenVersion });
-const emailWhere = (email: string) => where(fn('lower', fn('trim', col('email'))), email);
 const isEmail = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && Buffer.byteLength(email, 'utf8') <= 320;
+const isAuditId = (value: string) => isUuid(value);
+type AuditCursor = { occurredAt: string; id: string };
+
+const encodeAuditCursor = (event: UserAdminAuditEvent): string => Buffer.from(JSON.stringify({
+  occurredAt: event.createdAt.toISOString(), id: event.id,
+})).toString('base64url');
+
+const decodeAuditCursor = (value: string): AuditCursor => {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as AuditCursor;
+    const occurredAt = new Date(parsed.occurredAt);
+    if (!isAuditId(parsed.id) || Number.isNaN(occurredAt.getTime()) || occurredAt.toISOString() !== parsed.occurredAt) throw new Error('invalid');
+    return parsed;
+  } catch (_) { throw new UserAdminError('INVALID_AUDIT_CURSOR'); }
+};
 
 const ensurePassword = (password: string, email: string, name: string) => {
   const length = Buffer.byteLength(password, 'utf8');
   const lowered = password.toLowerCase();
-  if (length < 16 || length > 64 || lowered.includes(email) || (name && lowered.includes(name.trim().toLowerCase())) || COMMON_PASSWORDS.has(lowered)) {
+  const symbols = new Set(Array.from(password));
+  const repeatedPattern = /^(.{1,4})\1+$/u.test(password);
+  if (
+    length < 16 || length > 64 || password.trim() !== password || /[\p{Cc}\p{Cf}]/u.test(password)
+    || symbols.size < 4 || repeatedPattern || lowered.includes(email)
+    || (name && lowered.includes(name.trim().toLowerCase())) || COMMON_PASSWORDS.has(lowered)
+  ) {
     throw new UserAdminError('WEAK_CREDENTIAL', 'Credential does not meet the administration policy');
   }
 };
@@ -62,20 +83,29 @@ const generatePolicyCompliantPassword = (email: string, name: string): string =>
 };
 
 export class UserAdministrationService {
-  constructor(private readonly appVersion = process.env.APP_VERSION || 'unknown') {}
+  private readonly appVersion: string;
+
+  constructor(appVersion = process.env.APP_VERSION) {
+    if (process.env.NODE_ENV === 'production' && (!appVersion || !/^[0-9a-f]{7,64}$/i.test(appVersion))) {
+      throw new UserAdminError('APP_VERSION_REQUIRED');
+    }
+    this.appVersion = appVersion || 'unknown';
+  }
 
   private async audit(transaction: Transaction, actor: AdminActor, request: LifecycleRequest, outcome: 'succeeded' | 'noop' | 'rejected', reasonCode: string, target: User | null, before: object | null, after: object | null) {
     await UserAdminAuditEvent.create({
       id: crypto.randomUUID(), idempotencyKey: request.idempotencyKey, canonicalRequestSha256: requestHash(request),
       actor: actor.actor, actorUid: actor.uid, authMode: actor.authMode, scopeSnapshot: { franchiseeIds: actor.franchiseeIds },
       action: request.action, targetUserId: target?.id || null, normalizedEmail: normalizeUserEmail(request.email), franchiseeId: request.franchiseeId,
-      reason: request.reason, outcome, reasonCode, beforeState: before, afterState: after, hostname: os.hostname(), appVersion: this.appVersion,
+      reason: Buffer.byteLength(request.reason, 'utf8') > 255 ? '[redacted:reason-too-long]' : request.reason,
+      outcome, reasonCode, beforeState: before, afterState: after, hostname: os.hostname(), appVersion: this.appVersion,
     }, { transaction });
   }
 
   private validate(actor: AdminActor, request: LifecycleRequest) {
     const normalizedEmail = normalizeUserEmail(request.email);
-    if (!isUuid(request.franchiseeId) || !isUuid(request.idempotencyKey) || !request.reason.trim() || Buffer.byteLength(request.reason, 'utf8') > 512) throw new UserAdminError('INVALID_REQUEST');
+    if (!isUuid(request.franchiseeId) || !isUuid(request.idempotencyKey) || !request.reason.trim()) throw new UserAdminError('INVALID_REQUEST');
+    if (Buffer.byteLength(request.reason, 'utf8') > 255) throw new UserAdminError('REASON_TOO_LONG');
     if (!isEmail(normalizedEmail)) throw new UserAdminError('INVALID_EMAIL');
     if (actor.franchiseeIds !== '*' && !actor.franchiseeIds.includes(request.franchiseeId)) throw new UserAdminError('OUT_OF_SCOPE');
     if (request.action === 'create' && !request.name?.trim()) throw new UserAdminError('NAME_REQUIRED');
@@ -112,7 +142,7 @@ export class UserAdministrationService {
         }
         const franchisee = await Franchisee.findByPk(request.franchiseeId, { transaction, lock: transaction.LOCK.UPDATE });
         if (!franchisee) throw new UserAdminError('FRANCHISEE_NOT_FOUND');
-        let target = await User.findOne({ where: emailWhere(normalizedEmail), transaction, lock: transaction.LOCK.UPDATE });
+        let target = await User.findOne({ where: normalizedEmailWhere(normalizedEmail), transaction, lock: transaction.LOCK.UPDATE });
         if (target && target.franchiseeId !== request.franchiseeId) throw new UserAdminError('TARGET_NOT_FOUND_IN_FRANCHISEE');
         const before = snapshot(target);
         let outcome: 'succeeded' | 'noop' = 'succeeded';
@@ -162,15 +192,24 @@ export class UserAdministrationService {
 
   async show(actor: AdminActor, franchiseeId: string, email: string) {
     if (!isUuid(franchiseeId) || (actor.franchiseeIds !== '*' && !actor.franchiseeIds.includes(franchiseeId))) throw new UserAdminError('OUT_OF_SCOPE');
-    const user = await User.findOne({ where: { franchiseeId, [Op.and]: [emailWhere(normalizeUserEmail(email))] } });
+    const user = await User.findOne({ where: { franchiseeId, [Op.and]: [normalizedEmailWhere(email)] } });
     if (!user) throw new UserAdminError('TARGET_NOT_FOUND_IN_FRANCHISEE');
     return publicUser(user);
   }
 
-  async auditEvents(actor: AdminActor, franchiseeId: string, limit = 50, cursor?: string) {
+  async auditEvents(actor: AdminActor, franchiseeId: string, limit = 50, cursor?: string): Promise<AuditPage> {
     if (!isUuid(franchiseeId) || (actor.franchiseeIds !== '*' && !actor.franchiseeIds.includes(franchiseeId))) throw new UserAdminError('OUT_OF_SCOPE');
-    const whereClause: Record<string, unknown> = { franchiseeId };
-    if (cursor) whereClause.id = { [Op.lt]: cursor };
-    return UserAdminAuditEvent.findAll({ where: whereClause, order: [['createdAt', 'DESC'], ['id', 'DESC']], limit: Math.min(Math.max(limit, 1), 100) });
+    const whereClause: Record<string | symbol, unknown> = { franchiseeId };
+    if (cursor) {
+      const point = decodeAuditCursor(cursor);
+      whereClause[Op.or] = [
+        { createdAt: { [Op.lt]: new Date(point.occurredAt) } },
+        { [Op.and]: [{ createdAt: new Date(point.occurredAt) }, { id: { [Op.lt]: point.id } }] },
+      ];
+    }
+    const cappedLimit = Math.min(Math.max(limit, 1), 100);
+    const rows = await UserAdminAuditEvent.findAll({ where: whereClause, order: [['createdAt', 'DESC'], ['id', 'DESC']], limit: cappedLimit + 1 });
+    const events = rows.slice(0, cappedLimit);
+    return { events, nextCursor: rows.length > cappedLimit ? encodeAuditCursor(events[events.length - 1]) : undefined };
   }
 }

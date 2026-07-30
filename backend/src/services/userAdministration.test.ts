@@ -68,6 +68,24 @@ describe('APP-108 user administration', () => {
     await expect(service.execute(actor, request('revoke-all-tokens', '12'))).rejects.toMatchObject({ code: 'TOKEN_VERSION_EXHAUSTED' });
   });
 
+  it('rejects whitespace, control, repeated, and low-entropy supplied credentials', async () => {
+    for (const [suffix, password] of [
+      ['21', ' leading-secret-123'], ['22', '                '], ['23', 'a'.repeat(16)],
+      ['24', 'strong-secret\u0000value'], ['25', 'abababababababab'],
+    ]) {
+      await expect(service.execute(actor, request('create', suffix, { email: `${suffix}@example.com`, password }))).rejects.toMatchObject({ code: 'WEAK_CREDENTIAL' });
+    }
+  });
+
+  it('fails fast on overlong UTF-8 reasons while preserving a redacted rejected audit event', async () => {
+    for (const [suffix, reason] of [['26', 'x'.repeat(256)], ['27', 'é'.repeat(150)]]) {
+      await expect(service.execute(actor, request('create', suffix, { email: `${suffix}@example.com`, reason }))).rejects.toMatchObject({ code: 'REASON_TOO_LONG' });
+      const audit = await UserAdminAuditEvent.findOne({ where: { idempotencyKey: key(suffix) } });
+      expect(audit!.get('reason')).toBe('[redacted:reason-too-long]');
+      expect(audit!.get('reasonCode')).toBe('REASON_TOO_LONG');
+    }
+  });
+
   it('retries the same key without another token mutation and rejects duplicate normalized creates', async () => {
     const both = [await service.execute(actor, request('create', '13')), await service.execute(actor, request('create', '13'))];
     expect(both[0].user.id).toBe(both[1].user.id);
@@ -79,10 +97,39 @@ describe('APP-108 user administration', () => {
   it('scopes audit queries to the authorized tenant and clamps pagination', async () => {
     await service.execute(actor, request('create', '18'));
     await service.execute(actor, request('deactivate', '19'));
-    const events = await service.auditEvents(actor, tenantA, 999);
-    expect(events).toHaveLength(Math.min(await UserAdminAuditEvent.count({ where: { franchiseeId: tenantA } }), 100));
-    expect(events.map((event) => event.get('idempotencyKey'))).toEqual(expect.arrayContaining([key('18'), key('19')]));
-    expect(events.every((event) => event.get('franchiseeId') === tenantA)).toBe(true);
+    const page = await service.auditEvents(actor, tenantA, 999);
+    expect(page.events).toHaveLength(Math.min(await UserAdminAuditEvent.count({ where: { franchiseeId: tenantA } }), 100));
+    expect(page.events.map((event) => event.get('idempotencyKey'))).toEqual(expect.arrayContaining([key('18'), key('19')]));
+    expect(page.events.every((event) => event.get('franchiseeId') === tenantA)).toBe(true);
     await expect(service.auditEvents(actor, tenantB)).rejects.toMatchObject({ code: 'OUT_OF_SCOPE' });
+  });
+
+  it('uses an opaque occurred-at/id cursor without tenant leakage, duplicates, or equal-time skips', async () => {
+    const createAudit = (id: string, idempotencyKey: string, franchiseeId: string, createdAt: Date) => UserAdminAuditEvent.create({
+      id, idempotencyKey, canonicalRequestSha256: 'a'.repeat(64), actor: 'cursor-test', actorUid: 1001, authMode: 'test', scopeSnapshot: { franchiseeIds: [franchiseeId] }, action: 'create', targetUserId: null, normalizedEmail: `${id}@example.com`, franchiseeId, reason: 'cursor test', outcome: 'succeeded', reasonCode: 'APPLIED', beforeState: null, afterState: { isActive: true, tokenVersion: 0 }, hostname: 'test', appVersion: 'test', createdAt,
+    });
+    const latest = '90000000-0000-4000-8000-000000000003';
+    const sameLow = '90000000-0000-4000-8000-000000000001';
+    const sameHigh = '90000000-0000-4000-8000-000000000002';
+    await createAudit(latest, key('30'), tenantA, new Date('2035-01-02T00:00:00.000Z'));
+    await createAudit(sameLow, key('31'), tenantA, new Date('2035-01-01T00:00:00.000Z'));
+    await createAudit(sameHigh, key('32'), tenantA, new Date('2035-01-01T00:00:00.000Z'));
+    await createAudit('90000000-0000-4000-8000-000000000004', key('33'), tenantB, new Date('2036-01-01T00:00:00.000Z'));
+    const first = await service.auditEvents(actor, tenantA, 1);
+    const second = await service.auditEvents(actor, tenantA, 1, first.nextCursor);
+    const third = await service.auditEvents(actor, tenantA, 1, second.nextCursor);
+    expect([first.events[0].id, second.events[0].id, third.events[0].id]).toEqual([latest, sameHigh, sameLow]);
+    expect(new Set([first.events[0].id, second.events[0].id, third.events[0].id]).size).toBe(3);
+    await expect(service.auditEvents(actor, tenantA, 1, 'not-a-cursor')).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
+  });
+
+  it('requires an explicit deployed version for production audit operations', () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousVersion = process.env.APP_VERSION;
+    process.env.NODE_ENV = 'production'; delete process.env.APP_VERSION;
+    expect(() => new UserAdministrationService()).toThrow(expect.objectContaining({ code: 'APP_VERSION_REQUIRED' }));
+    expect(() => new UserAdministrationService('abcdef1')).not.toThrow();
+    process.env.NODE_ENV = previousNodeEnv;
+    if (previousVersion === undefined) delete process.env.APP_VERSION; else process.env.APP_VERSION = previousVersion;
   });
 });

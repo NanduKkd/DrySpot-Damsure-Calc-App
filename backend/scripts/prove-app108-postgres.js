@@ -44,7 +44,12 @@ const main = async () => {
   await reset(); queryInterface = await createBaseSchema();
   await migration.up(queryInterface, Sequelize); await migration.up(queryInterface, Sequelize);
   const { UserAdministrationService } = require('../dist/services/userAdministration.js');
-  const service = new UserAdministrationService('postgres-proof');
+  const { User } = require('../dist/models');
+  const { normalizedEmailWhere } = require('../dist/utils/userEmail.js');
+  await database.query(`INSERT INTO users (id, name, email, password, franchisee_id, is_active, token_version)
+    VALUES ('30000000-0000-4000-8000-000000000003', 'Legacy', 'Legacy@Example.COM', 'x', :tenant, true, 0)`, { replacements: { tenant: tenantA } });
+  assert.equal((await User.findOne({ where: normalizedEmailWhere(' legacy@example.com ') })).id, '30000000-0000-4000-8000-000000000003', 'legacy mixed-case login lookup must use normalized expression');
+  const service = new UserAdministrationService('abcdef1');
   const createKey = '40000000-0000-4000-8000-000000000001';
   const created = await service.execute(actor, request('create', createKey));
   assert.equal(created.user.email, 'proof@example.com');
@@ -64,7 +69,7 @@ const main = async () => {
   await migration.down(queryInterface);
   assert((await queryInterface.showAllTables()).includes('user_admin_audit_events'), 'down must retain audit data');
   await migration.up(queryInterface, Sequelize);
-  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
+  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', normalized_legacy_login: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
 };
 
 main().finally(() => database.close()).catch((error) => { console.error(error); process.exitCode = 1; });

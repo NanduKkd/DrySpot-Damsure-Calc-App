@@ -36,7 +36,7 @@ module.exports = {
           auth_mode: { type: Sequelize.STRING, allowNull: false }, scope_snapshot: { type: Sequelize.JSON, allowNull: false },
           action: { type: Sequelize.STRING, allowNull: false }, target_user_id: { type: Sequelize.UUID, allowNull: true },
           normalized_email: { type: Sequelize.STRING, allowNull: false }, franchisee_id: { type: Sequelize.UUID, allowNull: false },
-          reason: { type: Sequelize.STRING, allowNull: false }, outcome: { type: Sequelize.STRING, allowNull: false },
+          reason: { type: Sequelize.STRING(255), allowNull: false }, outcome: { type: Sequelize.STRING, allowNull: false },
           reason_code: { type: Sequelize.STRING, allowNull: false }, before_state: { type: Sequelize.JSON, allowNull: true },
           after_state: { type: Sequelize.JSON, allowNull: true }, hostname: { type: Sequelize.STRING, allowNull: false },
           app_version: { type: Sequelize.STRING, allowNull: false },

@@ -2,6 +2,7 @@
 import fs from 'fs';
 import type { LifecycleRequest } from '../services/userAdministration';
 import { OperatorAuthorizationError, resolveOperator } from './operatorAuthorization';
+import { displayNewGeneratedCredential } from './credentialDisplay';
 
 const fail = (code: string): never => { process.stderr.write(`user-admin: ${code}\n`); process.exit(2); };
 const args = process.argv.slice(2);
@@ -43,10 +44,9 @@ const run = async () => {
     };
     const result = await service.execute(actor, request);
     output({ outcome: result.outcome, reasonCode: result.reasonCode, user: result.user });
-    if (result.generatedPassword || request.password) {
-      // This occurs after the transaction: a failed TTY write must be recovered by reset with a new key.
-      try { writeCredentialToTty(result.generatedPassword || request.password!); } catch (_) { process.stderr.write('user-admin: CREDENTIAL_DISPLAY_FAILED_AFTER_COMMIT; reset with a new idempotency key\n'); process.exitCode = 3; }
-    }
+    // This occurs after the transaction: a failed TTY write must be recovered by reset with a new key.
+    try { displayNewGeneratedCredential(result, writeCredentialToTty); }
+    catch (_) { process.stderr.write('user-admin: CREDENTIAL_DISPLAY_FAILED_AFTER_COMMIT; reset with a new idempotency key\n'); process.exitCode = 3; }
   } finally { await database.close(); }
 };
 

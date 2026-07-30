@@ -6,6 +6,7 @@ export class UserAdminAuditEvent extends Model {
   declare idempotencyKey: string;
   declare canonicalRequestSha256: string;
   declare outcome: 'succeeded' | 'noop' | 'rejected';
+  declare createdAt: Date;
 }
 
 UserAdminAuditEvent.init(
@@ -21,7 +22,7 @@ UserAdminAuditEvent.init(
     targetUserId: { type: DataTypes.UUID, allowNull: true },
     normalizedEmail: { type: DataTypes.STRING, allowNull: false },
     franchiseeId: { type: DataTypes.UUID, allowNull: false },
-    reason: { type: DataTypes.STRING, allowNull: false },
+    reason: { type: DataTypes.STRING(255), allowNull: false },
     outcome: { type: DataTypes.STRING, allowNull: false },
     reasonCode: { type: DataTypes.STRING, allowNull: false },
     beforeState: { type: DataTypes.JSON, allowNull: true },
