@@ -145,12 +145,23 @@ describe('warrantyController', () => {
 			expect(await Warranty.count({ where: { activeClientId: client.id } })).toBe(1);
 		});
 
-		it('replaces a rollout-window warranty with no active_client_id', async () => {
+		it('replaces after an old process leaves a historical active marker', async () => {
 			const rolloutClient = await Client.create({
 				id: 'c-rollout-id',
 				name: 'Rolling deploy client',
 				franchiseeId: franchisee.id,
 			});
+			const migratedWarranty = await Warranty.create({
+				id: 'w-rollout-migrated-id',
+				clientId: rolloutClient.id,
+				activeClientId: rolloutClient.id,
+				warrantyCardNumber: 'MIGRATED-ACTIVE-WARRANTY',
+				startDate: new Date(),
+				durationYears: 5,
+				pdfUrl: '/api/warranty/w-rollout-migrated-id/download',
+			});
+			// Reproduce the old process's post-migration replacement sequence.
+			await migratedWarranty.destroy();
 			const rolloutWarranty = await Warranty.create({
 				id: 'w-rollout-id',
 				clientId: rolloutClient.id,
@@ -176,6 +187,13 @@ describe('warrantyController', () => {
 
 			expect(replacement.status).toBe(201);
 			expect(await Warranty.findByPk(rolloutWarranty.id)).toBeNull();
+			expect(
+				(
+					await Warranty.findByPk(migratedWarranty.id, {
+						paranoid: false,
+					})
+				)?.activeClientId,
+			).toBeNull();
 			expect(
 				await Warranty.count({
 					where: { clientId: rolloutClient.id, activeClientId: rolloutClient.id },

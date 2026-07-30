@@ -19,6 +19,7 @@ describe('syncController warranty and PDF server invariants', () => {
 	const fileWarrantyId = '00000000-0000-0000-0000-000000000308';
 	const fileProposalId = '00000000-0000-0000-0000-000000000309';
 	const rolloutClientId = '00000000-0000-0000-0000-000000000320';
+	const rolloutHistoricalWarrantyId = '00000000-0000-0000-0000-000000000323';
 	const rolloutWarrantyId = '00000000-0000-0000-0000-000000000321';
 	const rolloutReplacementId = '00000000-0000-0000-0000-000000000322';
 	let token: string;
@@ -90,12 +91,24 @@ describe('syncController warranty and PDF server invariants', () => {
 		expect((await Warranty.findByPk(replacementWarrantyId))?.activeClientId).toBe(clientId);
 	});
 
-	it('replaces a rollout-window warranty with no active_client_id', async () => {
+	it('replaces after an old process leaves a historical active marker', async () => {
 		await Client.create({
 			id: rolloutClientId,
 			franchiseeId,
 			name: 'Rolling deploy client',
 		});
+		const migratedWarranty = await Warranty.create({
+			id: rolloutHistoricalWarrantyId,
+			clientId: rolloutClientId,
+			activeClientId: rolloutClientId,
+			warrantyCardNumber: 'migrated-active-warranty',
+			startDate: new Date('2025-01-01T00:00:00.000Z'),
+			durationYears: 1,
+			pdfUrl: `/api/warranty/${rolloutHistoricalWarrantyId}/download`,
+		});
+		// Reproduce the old process's replacement after migration: the soft
+		// delete retains active_client_id, while its new current row leaves it null.
+		await migratedWarranty.destroy();
 		await Warranty.create({
 			id: rolloutWarrantyId,
 			clientId: rolloutClientId,
@@ -117,6 +130,10 @@ describe('syncController warranty and PDF server invariants', () => {
 
 		expect(response.status).toBe(200);
 		expect(await Warranty.findByPk(rolloutWarrantyId)).toBeNull();
+		expect(
+			(await Warranty.findByPk(rolloutHistoricalWarrantyId, { paranoid: false }))
+				?.activeClientId,
+		).toBeNull();
 		expect((await Warranty.findByPk(rolloutReplacementId))?.activeClientId).toBe(
 			rolloutClientId,
 		);

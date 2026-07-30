@@ -58,9 +58,19 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 				const error = new Error('ACTIVE_WARRANTY_EXISTS');
 				throw error;
 			}
+			// The old process soft-deletes a migrated warranty without clearing
+			// active_client_id. Clear the marker across history before creating
+			// the replacement so either a full or partial unique index is safe.
+			await Warranty.update(
+				{ activeClientId: null },
+				{
+					where: { clientId: client.id },
+					paranoid: false,
+					transaction,
+				},
+			);
 			for (const existing of active) {
 				replacedPdfs.push({ pdfUrl: existing.pdfUrl, pdfFileName: existing.pdfFileName });
-				await existing.update({ activeClientId: null }, { transaction });
 				await existing.destroy({ transaction });
 			}
 			return Warranty.create(
@@ -84,18 +94,14 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 	} catch (error: any) {
 		await removeUploadedFile(file);
 		if (error?.message === 'ACTIVE_WARRANTY_EXISTS') {
-			return res
-				.status(409)
-				.json({
-					error: 'An active warranty already exists. Set replace_existing to true to replace it.',
-				});
+			return res.status(409).json({
+				error: 'An active warranty already exists. Set replace_existing to true to replace it.',
+			});
 		}
 		if (error?.name === 'SequelizeUniqueConstraintError') {
-			return res
-				.status(409)
-				.json({
-					error: 'An active warranty already exists. Please confirm replacement and try again.',
-				});
+			return res.status(409).json({
+				error: 'An active warranty already exists. Please confirm replacement and try again.',
+			});
 		}
 		console.error('Warranty upload error:', error);
 		return res.status(500).json({ error: 'An error occurred during warranty upload' });

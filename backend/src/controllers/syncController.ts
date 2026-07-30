@@ -46,8 +46,18 @@ const enforceActiveWarranty = async (
 		lock: transaction.LOCK.UPDATE,
 	});
 	if (active.length && !replaceExisting) throw new ActiveWarrantyConflictError();
+	// The old process soft-deletes a migrated warranty without clearing the
+	// newly added active_client_id column. Clear the marker across history so a
+	// full unique index cannot be held by that rollout-window tombstone.
+	await Warranty.update(
+		{ activeClientId: null },
+		{
+			where: { clientId },
+			paranoid: false,
+			transaction,
+		},
+	);
 	for (const current of active) {
-		await current.update({ activeClientId: null }, { transaction });
 		await current.destroy({ transaction });
 	}
 	return active;
