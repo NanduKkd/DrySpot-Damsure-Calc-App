@@ -110,20 +110,33 @@ async function lockRecord(lockPath) {
   if (!stat || !stat.isDirectory() || !body) return null;
   try { return { stat, owner: JSON.parse(body) }; } catch { return null; }
 }
-async function restoreClaim(claim, lock) {
-  // A claim is never removed.  If another writer already recreated the active
-  // pathname, leaving this uniquely named evidence is safer than touching it.
-  await fs.rename(claim, lock).catch(() => {});
-}
 async function claimExistingLock(lock, purpose, expected) {
+  const before = await lockRecord(lock);
+  if (!before || before.stat.ino !== expected.inode || before.owner.nonce !== expected.nonce) return null;
   const claim = `${lock}.${purpose}.${crypto.randomUUID()}`;
   try { await fs.rename(lock, claim); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   const actual = await lockRecord(claim);
   if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) {
-    await restoreClaim(claim, lock);
     return null;
   }
   return claim;
+}
+async function removeVerifiedClaim(claim, expected, hooks = {}) {
+  await hooks.beforeClaimCleanup?.(claim);
+  const actual = await lockRecord(claim);
+  if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) fail(`claimed lock changed; manual recovery required: ${claim}`);
+  // The pathname is a freshly generated result of our atomic rename, never the
+  // shared active lock. Recheck immediately before removing only that claim.
+  await fs.rm(claim, { recursive: true, force: false });
+}
+function recoveryGuardPath(ledgerPath) { return `${ledgerPath}.recovery-guard.json`; }
+async function assertNoRecoveryGuard(ledgerPath) {
+  if (await fs.lstat(recoveryGuardPath(ledgerPath)).catch(() => null)) fail(`ledger recovery guard is present; manual recovery required: ${recoveryGuardPath(ledgerPath)}`);
+}
+async function createRecoveryGuard(ledgerPath) {
+  const guard = recoveryGuardPath(ledgerPath); const value = { schemaVersion: 1, nonce: crypto.randomUUID(), createdAt: new Date().toISOString() };
+  try { await fs.writeFile(guard, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' }); } catch (error) { if (error.code === 'EEXIST') fail(`ledger recovery guard is already present; manual recovery required: ${guard}`); throw error; }
+  return guard;
 }
 async function assertLockOwnership(lock, owner, inode) {
   const current = await lockRecord(lock);
@@ -133,9 +146,8 @@ async function releaseLedgerLock(lock, owner, inode, hooks = {}) {
   await hooks.beforeReleaseClaim?.();
   const claim = await claimExistingLock(lock, 'released', { inode, nonce: owner.nonce });
   if (!claim) return false;
-  // Do not recursively delete a lock directory. Keeping a uniquely named,
-  // verified audit record makes a same-user pathname substitution harmless.
   await hooks.afterReleaseClaim?.(claim);
+  await removeVerifiedClaim(claim, { inode, nonce: owner.nonce }, hooks);
   return true;
 }
 async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} } = {}) {
@@ -143,31 +155,36 @@ async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} }
   await assertNoSymlinkPath(recoveryReceiptPath);
   const receipt = await fs.lstat(recoveryReceiptPath);
   if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size === 0) fail('lock recovery receipt is invalid');
+  const guard = await createRecoveryGuard(ledgerPath);
   const lock = `${ledgerPath}.lock`;
-  const recorded = await lockRecord(lock); if (!recorded) fail('lock recovery cannot read owner record');
+  const recorded = await lockRecord(lock); if (!recorded) fail(`lock recovery cannot read owner record; manual recovery required: ${guard}`);
   const owner = recorded.owner;
   if (!Number.isInteger(owner.pid) || typeof owner.nonce !== 'string' || typeof owner.acquiredAt !== 'string') fail('lock recovery owner record is incomplete');
   await hooks.beforeRecoveryClaim?.();
   const claimed = await claimExistingLock(lock, 'recovery-claim', { inode: recorded.stat.ino, nonce: owner.nonce });
-  if (!claimed) fail('lock changed during recovery; refusing to touch successor');
-  // PID liveness is checked after the atomic claim. A live (including reused)
-  // PID is restored unchanged and recovery fails closed.
-  try { process.kill(owner.pid, 0); await restoreClaim(claimed, lock); fail('lock recovery refused: recorded PID is currently live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  if (!claimed) fail(`lock changed during recovery; manual recovery required: ${guard}`);
+  // PID liveness is checked only after the atomic claim. A live (including
+  // reused) PID leaves the claim and guard for an operator; it is never put
+  // back over the active pathname.
+  try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
   await hooks.afterRecoveryClaim?.(claimed);
+  await removeVerifiedClaim(claimed, { inode: recorded.stat.ino, nonce: owner.nonce }, hooks);
+  await fs.rm(guard, { force: false });
   return claimed;
 }
 async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000, lockHooks = {} } = {}, deadline = Date.now() + waitLockMs) {
   const lock = `${ledgerPath}.lock`;
+  await assertNoRecoveryGuard(ledgerPath);
   try { await fs.mkdir(lock, { mode: 0o700 }); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
     if (Date.now() >= deadline) fail(`ledger lock is held; use explicit recover-lock after owner-liveness review: ${lock}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
-    return withLedgerLock(ledgerPath, callback, { waitLockMs }, deadline);
+    return withLedgerLock(ledgerPath, callback, { waitLockMs, lockHooks }, deadline);
   }
   const owner = { pid: process.pid, acquiredAt: new Date().toISOString(), nonce: crypto.randomUUID() };
   const inode = (await fs.stat(lock)).ino;
-  try { await fs.writeFile(path.join(lock, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' }); const assertOwnership = () => assertLockOwnership(lock, owner, inode); await assertOwnership(); return await callback({ owner, assertOwnership }); }
+  try { await lockHooks.beforeOwnerWrite?.(); await assertNoRecoveryGuard(ledgerPath); const active = await fs.lstat(lock); if (active.ino !== inode) fail('ledger lock changed before owner record; manual recovery required'); await fs.writeFile(path.join(lock, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' }); const assertOwnership = async () => { await assertNoRecoveryGuard(ledgerPath); return assertLockOwnership(lock, owner, inode); }; await assertOwnership(); return await callback({ owner, assertOwnership }); }
   finally { await releaseLedgerLock(lock, owner, inode, lockHooks); }
 }
 
@@ -179,12 +196,15 @@ function reserveVersionCode(ledger, code) {
 }
 async function reserveVersionCodeAtPath({ ledgerPath, environment, root, origin, code, dryRun = false, lockOptions }) {
   const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment);
+  // A dry-run is a pure calculation: it deliberately does not create a lock,
+  // parent directory, marker, or any other observable filesystem entry.
+  if (dryRun) return reserveVersionCode(await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin), code);
   return withLedgerLock(secure.ledgerPath, async ({ assertOwnership }) => {
     await assertOwnership();
-    if (!dryRun) await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
+    await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
     const ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin);
     const next = reserveVersionCode(ledger, code);
-    if (!dryRun) { await assertOwnership(); await atomicWriteJson(secure.ledgerPath, next); }
+    await assertOwnership(); await atomicWriteJson(secure.ledgerPath, next);
     return next;
   }, lockOptions);
 }

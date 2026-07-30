@@ -165,11 +165,20 @@ before upload, so a source replacement after initial verification fails closed.
 Locks are never stolen merely because of age. Each acquired lock contains a
 random owner nonce; release and recovery atomically rename the active lock to
 a unique claim, then recheck both nonce and inode. Claims are retained as local
-audit evidence rather than recursively deleted, so an old owner cannot delete
-or quarantine a replacement lock. `recover-lock` is an explicit
+audit evidence only on a mismatch; a verified normal or dead-owner claim is
+removed by its unique claimed path, never by the shared active lock pathname.
+Recovery creates an exclusive sibling recovery guard before claiming. Normal
+acquisition checks that guard before and after lock creation and fails closed.
+If a claim mismatches, a successor appears, or the recorded PID is live, the
+guard and uniquely named claim remain for manual operator review; neither is
+renamed back over the active pathname. `recover-lock` is an explicit
 operator action requiring a local recovery receipt and a non-live recorded PID;
 PID reuse remains fail-closed because liveness is not treated as proof of a
 crash.
+
+Dry-run is externally immutable: it performs only read-only validation and
+leaves no lock, claim, ledger, root marker, journal, artifact, manifest, receipt,
+or parent-directory entry. It is not a reservation or concurrency claim.
 
 All journal phases are recoverable. If the exact manifest is present, recovery
 commits that identity only. If it is absent before activation, recovery burns
