@@ -163,15 +163,15 @@ before upload, so a source replacement after initial verification fails closed.
 ## Second independent-verification hardening
 
 Locks are never stolen merely because of age. Each acquired lock contains a
-random owner nonce; release and recovery atomically rename the active lock to
-a unique claim, then recheck both nonce and inode. Claims are retained as local
-audit evidence only on a mismatch; a verified normal or dead-owner claim is
-removed by its unique claimed path, never by the shared active lock pathname.
-Recovery creates an exclusive sibling recovery guard before claiming. Normal
-acquisition checks that guard before and after lock creation and fails closed.
-If a claim mismatches, a successor appears, or the recorded PID is live, the
-guard and uniquely named claim remain for manual operator review; neither is
-renamed back over the active pathname. `recover-lock` is an explicit
+random owner nonce. Lock state is allowed only in an operator-owned,
+non-symlink `0700` ledger directory; the tool refuses a wider or foreign-owned
+directory before creating or cleaning up state. Within that explicit local
+operator boundary, acquisition uses one bounded `.lock` directory and cleanup
+removes only its single owner record followed by non-recursive `rmdir`; there
+are no claim renames or recursive removals. Same-UID arbitrary filesystem/code
+modification is outside this local operator boundary. Recovery creates an
+exclusive sibling recovery guard. A live owner or malformed state leaves the
+guard for manual review; no active successor pathname is moved. `recover-lock` is an explicit
 operator action requiring a local recovery receipt and a non-live recorded PID;
 PID reuse remains fail-closed because liveness is not treated as proof of a
 crash.

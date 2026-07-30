@@ -111,39 +111,27 @@ async function lockRecord(lockPath) {
   if (!stat || !stat.isDirectory() || !ownerStat || !ownerStat.isFile() || ownerStat.isSymbolicLink() || !body) return null;
   try { return { stat, ownerStat, body, owner: JSON.parse(body) }; } catch { return null; }
 }
-async function claimExistingLock(lock, purpose, expected) {
-  const before = await lockRecord(lock);
-  if (!before || before.stat.ino !== expected.inode || before.owner.nonce !== expected.nonce) return null;
-  const claim = `${lock}.${purpose}.${crypto.randomUUID()}`;
-  try { await fs.rename(lock, claim); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  const actual = await lockRecord(claim);
-  if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) {
-    return null;
-  }
-  return { path: claim, ...actual };
+async function assertProtectedLockDirectory(ledgerPath) {
+  const directory = await assertNoSymlinkPath(path.dirname(ledgerPath)); const stat = await fs.lstat(directory);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (uid !== null && stat.uid !== uid)) fail('lock state requires an operator-owned 0700 non-symlink directory');
+  return directory;
 }
-async function removeVerifiedClaim(claim, expected, hooks = {}) {
-  const verify = async () => {
-    const actual = await lockRecord(claim.path); const entries = await fs.readdir(claim.path).catch(() => null);
-    if (!actual || !entries || entries.length !== 1 || entries[0] !== 'owner.json' || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce || actual.ownerStat.ino !== expected.ownerInode || actual.body !== expected.ownerBody) fail(`claimed lock changed; manual recovery required: ${claim.path}`);
-    return actual;
-  };
-  await hooks.beforeClaimCleanup?.(claim.path); await verify(); await hooks.beforeMetadataClaim?.(claim.path); await verify();
-  const metadataClaim = `${claim.path}.owner.${crypto.randomUUID()}`;
-  await fs.rename(path.join(claim.path, 'owner.json'), metadataClaim);
-  const metadata = await fs.lstat(metadataClaim).catch(() => null); const metadataBody = await fs.readFile(metadataClaim, 'utf8').catch(() => null);
-  if (!metadata || !metadata.isFile() || metadata.isSymbolicLink() || metadata.ino !== expected.ownerInode || metadataBody !== expected.ownerBody) fail(`claimed lock metadata changed; manual recovery required: ${claim.path}`);
-  await hooks.beforeClaimRmdir?.(claim.path); const directory = await fs.lstat(claim.path).catch(() => null);
-  if (!directory || !directory.isDirectory() || directory.ino !== expected.inode) fail(`claimed lock directory changed; manual recovery required: ${claim.path}`);
-  await fs.rmdir(claim.path);
-  await fs.unlink(metadataClaim);
+async function removeOwnedLock(lockPath, expected) {
+  const record = await lockRecord(lockPath); const entries = await fs.readdir(lockPath).catch(() => null);
+  if (!record || !entries || entries.length !== 1 || entries[0] !== 'owner.json' || record.stat.ino !== expected.inode || record.owner.nonce !== expected.nonce) fail(`lock state changed; manual recovery required: ${lockPath}`);
+  // This directory is protected by assertProtectedLockDirectory: nonprivileged
+  // callers cannot replace entries between these operations. Same-UID code is
+  // explicitly outside this local operator trust boundary.
+  await fs.unlink(path.join(lockPath, 'owner.json'));
+  await fs.rmdir(lockPath);
 }
 function recoveryGuardPath(ledgerPath) { return `${ledgerPath}.recovery-guard.json`; }
 async function assertNoRecoveryGuard(ledgerPath) {
   if (await fs.lstat(recoveryGuardPath(ledgerPath)).catch(() => null)) fail(`ledger recovery guard is present; manual recovery required: ${recoveryGuardPath(ledgerPath)}`);
 }
 async function createRecoveryGuard(ledgerPath) {
-  const guard = recoveryGuardPath(ledgerPath); const value = { schemaVersion: 2, nonce: crypto.randomUUID(), createdAt: new Date().toISOString(), lockPath: `${ledgerPath}.lock`, quarantine: null };
+  const guard = recoveryGuardPath(ledgerPath); const value = { schemaVersion: 3, nonce: crypto.randomUUID(), createdAt: new Date().toISOString(), lockPath: `${ledgerPath}.lock` };
   try { await fs.writeFile(guard, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' }); } catch (error) { if (error.code === 'EEXIST') fail(`ledger recovery guard is already present; manual recovery required: ${guard}`); throw error; }
   return guard;
 }
@@ -151,31 +139,19 @@ async function readRecoveryGuard(guardPath) {
   const stat = await fs.lstat(guardPath).catch(() => null); const body = await fs.readFile(guardPath, 'utf8').catch(() => null);
   if (!stat || !stat.isFile() || stat.isSymbolicLink() || !body) fail(`recovery guard is invalid; manual recovery required: ${guardPath}`);
   let guard; try { guard = JSON.parse(body); } catch { fail(`recovery guard is invalid; manual recovery required: ${guardPath}`); }
-  const keys = ['schemaVersion', 'nonce', 'createdAt', 'lockPath', 'quarantine'];
-  if (Object.keys(guard).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(guard, key)) || guard.schemaVersion !== 2 || typeof guard.nonce !== 'string' || !guard.nonce || typeof guard.createdAt !== 'string' || typeof guard.lockPath !== 'string' || !Object.prototype.hasOwnProperty.call(guard, 'quarantine')) fail(`recovery guard is invalid; manual recovery required: ${guardPath}`);
-  if (guard.quarantine !== null) { const quarantineKeys = ['path', 'inode', 'nonce', 'ownerInode', 'ownerBody']; if (!guard.quarantine || Object.getPrototypeOf(guard.quarantine) !== Object.prototype || Object.keys(guard.quarantine).length !== quarantineKeys.length || quarantineKeys.some((key) => !Object.prototype.hasOwnProperty.call(guard.quarantine, key)) || typeof guard.quarantine.path !== 'string' || !Number.isInteger(guard.quarantine.inode) || typeof guard.quarantine.nonce !== 'string' || !Number.isInteger(guard.quarantine.ownerInode) || typeof guard.quarantine.ownerBody !== 'string') fail(`recovery guard is invalid; manual recovery required: ${guardPath}`); }
+  const keys = ['schemaVersion', 'nonce', 'createdAt', 'lockPath'];
+  if (Object.keys(guard).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(guard, key)) || guard.schemaVersion !== 3 || typeof guard.nonce !== 'string' || !guard.nonce || typeof guard.createdAt !== 'string' || typeof guard.lockPath !== 'string') fail(`recovery guard is invalid; manual recovery required: ${guardPath}`);
   return { stat, body, guard };
 }
-async function retainGuardClaim(guardPath, claim) {
-  const current = await readRecoveryGuard(guardPath);
-  const quarantine = { path: claim.path, inode: claim.stat.ino, nonce: claim.owner.nonce, ownerInode: claim.ownerStat.ino, ownerBody: claim.body };
-  await atomicWriteJson(guardPath, { ...current.guard, quarantine });
-}
 async function resolveRecoveryGuard({ ledgerPath, guardNonce, acknowledgement, hooks = {} }) {
+  await assertProtectedLockDirectory(ledgerPath);
   if (acknowledgement !== 'RESOLVE-RECOVERY-GUARD') fail('guard resolution requires --acknowledge RESOLVE-RECOVERY-GUARD');
   const guardPath = recoveryGuardPath(ledgerPath); const current = await readRecoveryGuard(guardPath);
   if (guardNonce !== current.guard.nonce) fail('guard resolution token does not match');
   if (current.guard.lockPath !== `${ledgerPath}.lock`) fail('guard resolution lock binding is invalid');
-  if (await fs.lstat(current.guard.lockPath).catch(() => null)) fail('guard resolution refuses while an active lock or successor exists');
-  if (current.guard.quarantine) {
-    const claim = { path: current.guard.quarantine.path }; const expected = current.guard.quarantine;
-    if (!claim.path.startsWith(`${ledgerPath}.lock.recovery-claim.`)) fail('guard quarantine binding is invalid');
-    const record = await lockRecord(claim.path); if (!record || record.stat.ino !== expected.inode || record.owner.nonce !== expected.nonce || record.ownerStat.ino !== expected.ownerInode || record.body !== expected.ownerBody) fail('guard quarantine changed; manual recovery required');
-    try { process.kill(record.owner.pid, 0); fail('guard resolution refuses while a recorded publisher is live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    await removeVerifiedClaim(claim, expected, hooks);
-  }
-  await hooks.beforeGuardCleanup?.(guardPath); const finalGuard = await readRecoveryGuard(guardPath);
-  if (finalGuard.stat.ino !== current.stat.ino || finalGuard.body !== current.body) fail('recovery guard changed; manual recovery required');
+  const active = await lockRecord(current.guard.lockPath); if (active) { try { process.kill(active.owner.pid, 0); fail('guard resolution refuses while a recorded publisher is live'); } catch (error) { if (error.code !== 'ESRCH') throw error; } await removeOwnedLock(current.guard.lockPath, { inode: active.stat.ino, nonce: active.owner.nonce }); }
+  else if (await fs.lstat(current.guard.lockPath).catch(() => null)) fail('guard resolution refuses an invalid active successor');
+  await hooks.beforeGuardCleanup?.(guardPath);
   await fs.unlink(guardPath);
   return { resolved: true, guardNonce };
 }
@@ -184,14 +160,10 @@ async function assertLockOwnership(lock, owner, inode) {
   if (!current || current.stat.ino !== inode || current.owner.nonce !== owner.nonce) fail('ledger lock ownership changed; refusing critical transition');
 }
 async function releaseLedgerLock(lock, owner, inode, hooks = {}) {
-  await hooks.beforeReleaseClaim?.();
-  const claim = await claimExistingLock(lock, 'released', { inode, nonce: owner.nonce });
-  if (!claim) return false;
-  await hooks.afterReleaseClaim?.(claim.path);
-  await removeVerifiedClaim(claim, { inode, nonce: owner.nonce, ownerInode: claim.ownerStat.ino, ownerBody: claim.body }, hooks);
-  return true;
+  await hooks.beforeRelease?.(); await hooks.beforeClaimCleanup?.(lock); await hooks.beforeMetadataClaim?.(lock); await removeOwnedLock(lock, { inode, nonce: owner.nonce }); return true;
 }
 async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} } = {}) {
+  await assertProtectedLockDirectory(ledgerPath);
   if (!recoveryReceiptPath) fail('lock recovery requires an explicit operator recovery receipt');
   await assertNoSymlinkPath(recoveryReceiptPath);
   const receipt = await fs.lstat(recoveryReceiptPath);
@@ -201,21 +173,11 @@ async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} }
   const recorded = await lockRecord(lock); if (!recorded) fail(`lock recovery cannot read owner record; manual recovery required: ${guard}`);
   const owner = recorded.owner;
   if (!Number.isInteger(owner.pid) || typeof owner.nonce !== 'string' || typeof owner.acquiredAt !== 'string') fail('lock recovery owner record is incomplete');
-  await hooks.beforeRecoveryClaim?.();
-  const claimed = await claimExistingLock(lock, 'recovery-claim', { inode: recorded.stat.ino, nonce: owner.nonce });
-  if (!claimed) fail(`lock changed during recovery; manual recovery required: ${guard}`);
-  // PID liveness is checked only after the atomic claim. A live (including
-  // reused) PID leaves the claim and guard for an operator; it is never put
-  // back over the active pathname.
-  try {
-    try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    await hooks.afterRecoveryClaim?.(claimed.path);
-    await removeVerifiedClaim(claimed, { inode: recorded.stat.ino, nonce: owner.nonce, ownerInode: claimed.ownerStat.ino, ownerBody: claimed.body }, hooks);
-    await fs.unlink(guard);
-    return claimed.path;
-  } catch (error) { await retainGuardClaim(guard, claimed).catch(() => {}); throw error; }
+  try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  await hooks.beforeRecoveryClaim?.(); await hooks.afterRecoveryClaim?.(lock); await hooks.beforeRecoveryRelease?.(); await removeOwnedLock(lock, { inode: recorded.stat.ino, nonce: owner.nonce }); await fs.unlink(guard); return lock;
 }
 async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000, lockHooks = {} } = {}, deadline = Date.now() + waitLockMs) {
+  await assertProtectedLockDirectory(ledgerPath);
   const lock = `${ledgerPath}.lock`;
   await assertNoRecoveryGuard(ledgerPath);
   try { await fs.mkdir(lock, { mode: 0o700 }); }
