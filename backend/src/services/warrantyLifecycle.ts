@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { Op, Transaction } from 'sequelize';
+import { Op, QueryTypes, Transaction } from 'sequelize';
 import {
 	Client,
 	Warranty,
@@ -44,7 +44,7 @@ export const warrantyRequestDigest = ({
 		startDate: Date;
 		durationYears: number;
 		pdfSha256: string;
-		targetWarrantyId?: string;
+		targetWarrantyId: string;
 	};
 }) =>
 	createHash('sha256')
@@ -65,9 +65,7 @@ export const warrantyRequestDigest = ({
 								startDate: replacement.startDate.toISOString(),
 								durationYears: replacement.durationYears,
 								pdfSha256: replacement.pdfSha256,
-								...(replacement.targetWarrantyId
-									? { targetWarrantyId: replacement.targetWarrantyId }
-									: {}),
+								targetWarrantyId: replacement.targetWarrantyId,
 							},
 						}
 					: {}),
@@ -171,6 +169,21 @@ export const findReservedWarrantyId = (warrantyId: string, transaction?: Transac
 		transaction,
 		...(transaction ? { lock: transaction.LOCK.UPDATE } : {}),
 	});
+
+const lockWarrantyUuidReservation = async (warrantyId: string, transaction: Transaction) => {
+	const lockClause = sequelize.getDialect() === 'postgres' ? ' FOR UPDATE' : '';
+	const reservations = await sequelize.query(
+		`SELECT warranty_id
+		 FROM warranty_uuid_reservations
+		 WHERE warranty_id = :warrantyId${lockClause}`,
+		{
+			replacements: { warrantyId },
+			type: QueryTypes.SELECT,
+			transaction,
+		},
+	);
+	return reservations.length > 0;
+};
 
 const createWarrantyTombstone = async ({
 	warrantyId,
@@ -277,11 +290,21 @@ export const backfillLegacySoftDeletedWarranties = async ({
 		transaction,
 	});
 	if (!ownedClients.length) return [] as string[];
+	const where = {
+		clientId: { [Op.in]: ownedClients.map((client) => client.id) },
+		deletedAt: { [Op.ne]: null },
+	};
+	const legacyIds = await Warranty.findAll({
+		where,
+		attributes: ['id'],
+		paranoid: false,
+		transaction,
+	});
+	for (const legacyId of legacyIds.map(({ id }) => id).sort()) {
+		await lockWarrantyUuidReservation(legacyId, transaction);
+	}
 	const warranties = await Warranty.findAll({
-		where: {
-			clientId: { [Op.in]: ownedClients.map((client) => client.id) },
-			deletedAt: { [Op.ne]: null },
-		},
+		where,
 		paranoid: false,
 		transaction,
 		lock: transaction.LOCK.UPDATE,
@@ -373,7 +396,24 @@ export const deleteConfirmedWarranty = async ({
 		if (!candidate) {
 			throw new WarrantyLifecycleError('not_found', 'Warranty not found.');
 		}
-		await findOwnedClientForUpdate(candidate.clientId, franchiseeId, transaction);
+		const client = await Client.findByPk(candidate.clientId, {
+			paranoid: false,
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!client || client.franchiseeId !== franchiseeId) {
+			throw new WarrantyLifecycleError('not_found', 'Warranty not found.');
+		}
+		if (client.deletedAt) {
+			throw new WarrantyLifecycleError(
+				'client_deleted',
+				'A deleted client cannot receive or delete a warranty.',
+			);
+		}
+		// Production rollout keeps the UUID guard active for old writers. Lock
+		// its reservation before the live row so an old INSERT cannot invert the
+		// tombstone transaction's lock order.
+		await lockWarrantyUuidReservation(warrantyId, transaction);
 		if (candidate.deletedAt) {
 			const legacy = await Warranty.findByPk(warrantyId, {
 				paranoid: false,
@@ -537,13 +577,21 @@ export const createOrReplaceConfirmedWarranty = async ({
 			}
 		}
 
-		if (await findReservedWarrantyId(values.id, transaction)) {
+		if (await lockWarrantyUuidReservation(values.id, transaction)) {
 			throw new WarrantyLifecycleError(
 				'warranty_id_reserved',
 				'The new warranty UUID is permanently reserved.',
 			);
 		}
 
+		const activeIds = await Warranty.findAll({
+			where: { clientId: values.clientId },
+			attributes: ['id'],
+			transaction,
+		});
+		for (const activeId of activeIds.map(({ id }) => id).sort()) {
+			await lockWarrantyUuidReservation(activeId, transaction);
+		}
 		const active = await Warranty.findAll({
 			where: { clientId: values.clientId },
 			transaction,
@@ -627,6 +675,15 @@ export const tombstoneClientWarranties = async ({
 	franchiseeId: string;
 	transaction: Transaction;
 }) => {
+	const warrantyIds = await Warranty.findAll({
+		where: { clientId },
+		attributes: ['id'],
+		paranoid: false,
+		transaction,
+	});
+	for (const warrantyId of warrantyIds.map(({ id }) => id).sort()) {
+		await lockWarrantyUuidReservation(warrantyId, transaction);
+	}
 	const warranties = await Warranty.findAll({
 		where: { clientId },
 		paranoid: false,

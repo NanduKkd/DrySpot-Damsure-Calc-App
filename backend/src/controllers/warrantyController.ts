@@ -17,27 +17,78 @@ import {
 
 const pdfUrlFor = (id: string) => `/api/warranty/${id}/download`;
 
-const confirmationFrom = (body: Record<string, unknown>): WarrantyConfirmation | undefined => {
+const confirmationFields = [
+	'confirmed_warranty_id',
+	'confirmed_warranty_card_number',
+	'confirmed_warranty_version',
+	'irreversible_confirmation',
+] as const;
+
+const confirmationFrom = (
+	body: Record<string, unknown>,
+): { present: boolean; confirmation?: WarrantyConfirmation } => {
+	const present = confirmationFields.some((field) =>
+		Object.prototype.hasOwnProperty.call(body, field),
+	);
+	if (!present) return { present: false };
 	const warrantyId = body.confirmed_warranty_id;
+	const canonicalWarrantyId = canonicalConfirmedWarrantyUuid(warrantyId);
 	const warrantyCardNumber = body.confirmed_warranty_card_number;
-	const warrantyVersion = Number(body.confirmed_warranty_version);
+	const rawWarrantyVersion = body.confirmed_warranty_version;
+	const warrantyVersion =
+		typeof rawWarrantyVersion === 'number'
+			? rawWarrantyVersion
+			: typeof rawWarrantyVersion === 'string' && /^[1-9]\d*$/.test(rawWarrantyVersion)
+				? Number(rawWarrantyVersion)
+				: Number.NaN;
 	const irreversibleConfirmation = body.irreversible_confirmation;
 	if (
-		typeof warrantyId !== 'string' ||
+		!canonicalWarrantyId ||
 		typeof warrantyCardNumber !== 'string' ||
-		!Number.isInteger(warrantyVersion) ||
+		!warrantyCardNumber.trim() ||
+		!Number.isSafeInteger(warrantyVersion) ||
 		warrantyVersion < 1 ||
-		typeof irreversibleConfirmation !== 'string'
+		typeof irreversibleConfirmation !== 'string' ||
+		!irreversibleConfirmation.trim()
+	) {
+		return { present: true };
+	}
+	return {
+		present: true,
+		confirmation: {
+			warrantyId: canonicalWarrantyId,
+			warrantyCardNumber,
+			warrantyVersion,
+			irreversibleConfirmation,
+		},
+	};
+};
+
+function canonicalConfirmedWarrantyUuid(value: unknown) {
+	if (
+		typeof value !== 'string' ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
 	) {
 		return undefined;
 	}
-	return {
-		warrantyId,
-		warrantyCardNumber,
-		warrantyVersion,
-		irreversibleConfirmation,
-	};
-};
+	return value.toLowerCase();
+}
+
+function canonicalWarrantyUuid(value: unknown) {
+	if (
+		typeof value !== 'string' ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+	) {
+		return undefined;
+	}
+	return value.toLowerCase();
+}
+
+const invalidConfirmationResponse = (res: Response) =>
+	res.status(422).json({
+		error: 'Named, version-bound irreversible confirmation is required',
+		code: 'confirmation_invalid',
+	});
 
 const lifecycleErrorResponse = (res: Response, error: unknown) => {
 	if (!(error instanceof WarrantyLifecycleError)) return false;
@@ -48,7 +99,9 @@ const lifecycleErrorResponse = (res: Response, error: unknown) => {
 				? 403
 				: error.code === 'invariant_violation'
 					? 500
-					: 409;
+					: error.code === 'confirmation_required'
+						? 422
+						: 409;
 	res.status(status).json({ error: error.message, code: error.code });
 	return true;
 };
@@ -76,7 +129,16 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 	if (typeof warranty_card_number !== 'string' || !warranty_card_number.trim()) {
 		return reject(400, 'warranty_card_number is required');
 	}
-	const confirmation = confirmationFrom(req.body);
+	const confirmationEnvelope = confirmationFrom(req.body);
+	const targetWarrantyId = canonicalWarrantyUuid(req.body.replacement_warranty_id);
+	const replacementRequested =
+		confirmationEnvelope.present ||
+		Object.prototype.hasOwnProperty.call(req.body, 'replacement_warranty_id');
+	if (replacementRequested && (!confirmationEnvelope.confirmation || !targetWarrantyId)) {
+		await removeUploadedFile(file);
+		return invalidConfirmationResponse(res);
+	}
+	const confirmation = confirmationEnvelope.confirmation;
 	const idempotencyKey = req.get('Idempotency-Key');
 	if (confirmation && !validIdempotencyKey(idempotencyKey)) {
 		return reject(400, 'A valid Idempotency-Key header is required for replacement');
@@ -86,7 +148,7 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 		const pdfSha256 = createHash('sha256')
 			.update(await fs.promises.readFile(file.path))
 			.digest('hex');
-		const id = randomUUID();
+		const id = confirmation ? targetWarrantyId! : randomUUID();
 		const result = await createOrReplaceConfirmedWarranty({
 			franchiseeId,
 			idempotencyKey: validIdempotencyKey(idempotencyKey) ? idempotencyKey : undefined,
@@ -101,6 +163,7 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 							durationYears: parsedDurationYears,
 							warrantyCardNumber: warranty_card_number.trim(),
 							pdfSha256,
+							targetWarrantyId: id,
 						},
 					})
 				: undefined,
@@ -162,15 +225,11 @@ export const downloadWarranty = async (req: AuthRequest, res: Response) => {
 export const deleteWarranty = async (req: AuthRequest, res: Response) => {
 	const franchiseeId = req.user?.franchiseeId;
 	if (!franchiseeId) return res.status(401).json({ error: 'Unauthorized' });
+	const confirmation = confirmationFrom(req.body).confirmation;
+	if (!confirmation) return invalidConfirmationResponse(res);
 	const idempotencyKey = req.get('Idempotency-Key');
 	if (!validIdempotencyKey(idempotencyKey)) {
 		return res.status(400).json({ error: 'A valid Idempotency-Key header is required' });
-	}
-	const confirmation = confirmationFrom(req.body);
-	if (!confirmation || confirmation.warrantyId !== req.params.id) {
-		return res.status(400).json({
-			error: 'Named, version-bound irreversible confirmation is required',
-		});
 	}
 	try {
 		const requestDigest = warrantyRequestDigest({

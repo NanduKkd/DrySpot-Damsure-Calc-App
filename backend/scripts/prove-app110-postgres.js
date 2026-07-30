@@ -177,10 +177,41 @@ const main = async () => {
 		'reapply must leave exactly one copy of each guard trigger',
 	);
 
-	// A rolled-back writer that starts while the tombstone transaction holds
-	// the reservation row must wake after commit and still fail.
+	// Reproduce the production lock order: Client, UUID reservation, warranty
+	// row, tombstone. An old writer takes the UUID reservation in its INSERT
+	// trigger before it reaches the warranty primary key. It must wait, wake
+	// after commit, and fail without a reservation/warranty row deadlock.
 	await insertLiveWarranty(raceId);
 	const tombstoneTransaction = await database.transaction();
+	await database.query(
+		'SELECT id FROM clients WHERE id = :clientId FOR UPDATE',
+		{
+			replacements: { clientId },
+			transaction: tombstoneTransaction,
+			type: QueryTypes.SELECT,
+		},
+	);
+	await database.query(
+		`SELECT warranty_id
+     FROM warranty_uuid_reservations
+     WHERE warranty_id = :id
+     FOR UPDATE`,
+		{
+			replacements: { id: raceId },
+			transaction: tombstoneTransaction,
+			type: QueryTypes.SELECT,
+		},
+	);
+	await database.query('SELECT id FROM warranties WHERE id = :id FOR UPDATE', {
+		replacements: { id: raceId },
+		transaction: tombstoneTransaction,
+		type: QueryTypes.SELECT,
+	});
+	const oldWriterRejected = insertLiveWarranty(raceId).then(
+		() => false,
+		() => true,
+	);
+	await new Promise((resolve) => setTimeout(resolve, 100));
 	await database.query(
 		`INSERT INTO warranty_deletion_tombstones
      (warranty_id, franchisee_id, deletion_sequence, deleted_at)
@@ -190,11 +221,6 @@ const main = async () => {
 			transaction: tombstoneTransaction,
 		},
 	);
-	const oldWriterRejected = insertLiveWarranty(raceId).then(
-		() => false,
-		() => true,
-	);
-	await new Promise((resolve) => setTimeout(resolve, 100));
 	await database.query('DELETE FROM warranties WHERE id = :id', {
 		replacements: { id: raceId },
 		transaction: tombstoneTransaction,
@@ -237,6 +263,7 @@ const main = async () => {
 			rollback_old_writer: 'passed',
 			insert_and_id_update_blocked: 'passed',
 			concurrency: 'passed',
+			lock_inversion: 'passed',
 			legacy_cleanup_enqueued: 'passed',
 			orphan_rollback: 'passed',
 		})}\n`,

@@ -256,6 +256,9 @@ class SyncService {
     final tombstonedWarranties =
         _outcomeIds(outcomes, 'warranties', 'tombstoned');
     final appliedProposals = _outcomeIds(outcomes, 'proposals', 'applied');
+    final submittedWarrantiesByRemoteId = {
+      for (final warranty in warrantiesToSync) warranty.remoteId: warranty,
+    };
 
     if (shouldFilterByFranchise) {
       final nextCursor = response['warranty_tombstone_cursor']?.toString();
@@ -433,10 +436,22 @@ class SyncService {
           } else {
             final warranty = Warranty.fromMap(warrantyMap)
                 .copyWith(clientId: client.localId!, isDirty: false);
+            final submitted = submittedWarrantiesByRemoteId[remoteId];
             if (existingWarranty != null) {
-              await dbService.updateWarranty(
-                  warranty.copyWith(localId: existingWarranty.localId));
-            } else {
+              if (submitted == null) {
+                await dbService.updateWarranty(
+                  warranty.copyWith(localId: existingWarranty.localId),
+                );
+              } else if (appliedWarranties.contains(remoteId)) {
+                // Applying the server echo is itself compare-and-set. A local
+                // edit made after request capture must survive both response
+                // application and the later dirty-clear acknowledgement.
+                await dbService.applyWarrantyFromServerIfUnchanged(
+                  warranty.copyWith(localId: existingWarranty.localId),
+                  submittedUpdatedAt: submitted.updatedAt.toIso8601String(),
+                );
+              }
+            } else if (submitted == null) {
               await dbService.insertWarranty(warranty);
             }
           }

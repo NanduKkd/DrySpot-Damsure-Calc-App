@@ -12,13 +12,19 @@ class WarrantyFormScreen extends StatefulWidget {
   final Client client;
   final Warranty? warrantyToReplace;
   final String? replacementIdempotencyKey;
+  final String? replacementTargetWarrantyId;
 
   const WarrantyFormScreen({
     super.key,
     required this.client,
     this.warrantyToReplace,
     this.replacementIdempotencyKey,
-  });
+    this.replacementTargetWarrantyId,
+  }) : assert(
+          warrantyToReplace == null ||
+              (replacementIdempotencyKey != null &&
+                  replacementTargetWarrantyId != null),
+        );
 
   @override
   State<WarrantyFormScreen> createState() => _WarrantyFormScreenState();
@@ -157,6 +163,7 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
           'irreversible_confirmation': irreversibleWarrantyConfirmationText(
             replacement.warrantyCardNumber,
           ),
+          'replacement_warranty_id': widget.replacementTargetWarrantyId!,
         },
       };
       final response = await apiService.uploadWarranty(

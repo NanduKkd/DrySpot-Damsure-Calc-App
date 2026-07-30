@@ -6,10 +6,12 @@ import 'package:app_client/src/services/sync_service.dart';
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/item.dart';
 import 'package:app_client/src/models/rectangle.dart';
+import 'package:app_client/src/models/warranty.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class MockApiService extends ApiService {
   Map<String, dynamic>? lastSyncData;
+  Future<void> Function(Map<String, dynamic> data)? beforeResponse;
   Map<String, dynamic> response = {
     'server_time': '2024-03-22T12:00:00Z',
     'updates': {
@@ -22,6 +24,7 @@ class MockApiService extends ApiService {
   @override
   Future<Map<String, dynamic>> sync(Map<String, dynamic> data) async {
     lastSyncData = data;
+    await beforeResponse?.call(data);
     final changes = data['changes'] as Map<String, dynamic>;
     return {
       ...response,
@@ -106,6 +109,7 @@ void main() {
             start_date TEXT,
             duration_years INTEGER,
             pdf_url TEXT,
+            server_version INTEGER NOT NULL DEFAULT 1,
             is_dirty INTEGER DEFAULT 1,
             updated_at TEXT NOT NULL,
             deleted_at TEXT
@@ -120,6 +124,35 @@ void main() {
             is_dirty INTEGER DEFAULT 1,
             updated_at TEXT NOT NULL,
             deleted_at TEXT
+          )
+        ''');
+      await db.execute('''
+          CREATE TABLE default_prices (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_id TEXT,
+            franchisee_id TEXT,
+            category TEXT,
+            item TEXT,
+            price REAL,
+            enabled INTEGER DEFAULT 1,
+            is_dirty INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT
+          )
+        ''');
+      await db.execute('''
+          CREATE TABLE warranty_deletion_tombstones (
+            warranty_id TEXT NOT NULL,
+            franchisee_id TEXT NOT NULL,
+            deletion_sequence TEXT NOT NULL,
+            deleted_at TEXT NOT NULL,
+            PRIMARY KEY (franchisee_id, warranty_id)
+          )
+        ''');
+      await db.execute('''
+          CREATE TABLE sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
           )
         ''');
     });
@@ -264,5 +297,120 @@ void main() {
       clients[0].items[0].rectangles[0].imageData,
       'data:image/png;base64,ZmFrZQ==',
     );
+  });
+
+  test(
+      'Sync preserves a newer local warranty edit when the submitted server echo arrives',
+      () async {
+    SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
+    const clientRemoteId = 'cas-client';
+    const warrantyRemoteId = 'cas-warranty';
+    final submittedAt = DateTime.utc(2026, 7, 30, 1);
+    final newerAt = DateTime.utc(2026, 7, 30, 1, 0, 1);
+    final clientLocalId = await dbService.insertClient(Client(
+      remoteId: clientRemoteId,
+      franchiseeId: 'tenant-a',
+      name: 'CAS client',
+      isDirty: false,
+      updatedAt: submittedAt,
+    ));
+    await dbService.insertWarranty(Warranty(
+      remoteId: warrantyRemoteId,
+      clientId: clientLocalId,
+      warrantyCardNumber: 'SUBMITTED',
+      startDate: DateTime.utc(2026, 1, 1),
+      durationYears: 5,
+      pdfUrl: '/submitted.pdf',
+      version: 4,
+      isDirty: true,
+      updatedAt: submittedAt,
+    ));
+
+    apiService.beforeResponse = (_) async {
+      final captured =
+          (await dbService.getWarrantyByRemoteId(warrantyRemoteId))!;
+      await dbService.updateWarranty(captured.copyWith(
+        warrantyCardNumber: 'NEWER-LOCAL',
+        isDirty: true,
+        updatedAt: newerAt,
+      ));
+    };
+    apiService.response = {
+      'server_time': '2026-07-30T01:00:02.000Z',
+      'warranty_tombstone_cursor': '0',
+      'updates': {
+        'clients': [],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+        'warranties': [
+          {
+            'remote_id': warrantyRemoteId,
+            'client_id': clientRemoteId,
+            'warranty_card_number': 'SUBMITTED',
+            'start_date': '2026-01-01T00:00:00.000Z',
+            'duration_years': 5,
+            'pdf_url': '/server.pdf',
+            'version': 5,
+            'updated_at': '2026-07-30T01:00:02.000Z',
+            'deleted_at': null,
+          },
+        ],
+        'proposals': [],
+        'warranty_tombstones': [],
+      },
+    };
+
+    await syncService.sync();
+
+    final retained = (await dbService.getWarrantyByRemoteId(warrantyRemoteId))!;
+    expect(retained.warrantyCardNumber, 'NEWER-LOCAL');
+    expect(retained.updatedAt, newerAt);
+    expect(retained.isDirty, isTrue);
+  });
+
+  test('Sync still applies an unrelated new remote warranty', () async {
+    SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
+    const clientRemoteId = 'remote-warranty-client';
+    const warrantyRemoteId = 'unrelated-server-warranty';
+    final clientLocalId = await dbService.insertClient(Client(
+      remoteId: clientRemoteId,
+      franchiseeId: 'tenant-a',
+      name: 'Remote warranty client',
+      isDirty: false,
+      updatedAt: DateTime.utc(2026, 7, 30),
+    ));
+    apiService.response = {
+      'server_time': '2026-07-30T02:00:00.000Z',
+      'warranty_tombstone_cursor': '0',
+      'updates': {
+        'clients': [],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+        'warranties': [
+          {
+            'remote_id': warrantyRemoteId,
+            'client_id': clientRemoteId,
+            'warranty_card_number': 'REMOTE-ONLY',
+            'start_date': '2026-01-01T00:00:00.000Z',
+            'duration_years': 5,
+            'pdf_url': '/remote.pdf',
+            'version': 2,
+            'updated_at': '2026-07-30T02:00:00.000Z',
+            'deleted_at': null,
+          },
+        ],
+        'proposals': [],
+        'warranty_tombstones': [],
+      },
+    };
+
+    await syncService.sync();
+
+    final applied = (await dbService.getWarrantyByRemoteId(warrantyRemoteId))!;
+    expect(applied.clientId, clientLocalId);
+    expect(applied.warrantyCardNumber, 'REMOTE-ONLY');
+    expect(applied.isDirty, isFalse);
   });
 }

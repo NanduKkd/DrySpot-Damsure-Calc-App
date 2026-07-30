@@ -499,6 +499,19 @@ class DbService {
     });
   }
 
+  Future<int> applyWarrantyFromServerIfUnchanged(
+    Warranty warranty, {
+    required String submittedUpdatedAt,
+  }) async {
+    final db = await database;
+    return db.update(
+      'warranties',
+      warranty.toMap(),
+      where: 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      whereArgs: [warranty.remoteId, submittedUpdatedAt],
+    );
+  }
+
   Future<void> applyWarrantyTombstone(
     WarrantyDeletionTombstone tombstone,
   ) async {

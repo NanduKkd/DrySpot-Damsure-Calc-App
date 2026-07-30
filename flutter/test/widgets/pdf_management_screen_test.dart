@@ -8,6 +8,7 @@ import 'package:app_client/src/screens/clients/warranty_form_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class MockClientProvider extends ClientProvider {
   MockClientProvider({
@@ -33,6 +34,10 @@ class MockClientProvider extends ClientProvider {
 }
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets(
       'PdfManagementScreen allows creating another warranty when one already exists',
       (tester) async {
@@ -41,6 +46,7 @@ void main() {
     final provider = MockClientProvider(
       warranties: [
         Warranty(
+          remoteId: 'warranty-remote-id',
           clientId: 1,
           warrantyCardNumber: 'W-1',
           startDate: DateTime(2026, 1, 1),
@@ -96,6 +102,11 @@ void main() {
     expect(form.warrantyToReplace?.warrantyCardNumber, 'W-1');
     expect(form.warrantyToReplace?.version, 4);
     expect(form.replacementIdempotencyKey, isNotEmpty);
+    expect(form.replacementTargetWarrantyId, isNotEmpty);
+    expect(
+      form.replacementTargetWarrantyId,
+      isNot(form.replacementIdempotencyKey),
+    );
   });
 
   testWidgets('warranty deletion confirmation names the exact server version',

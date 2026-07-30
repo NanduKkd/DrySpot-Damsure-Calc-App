@@ -9,6 +9,7 @@ import {
 	User,
 	Warranty,
 	WarrantyDeletionTombstone,
+	sequelize,
 } from '../models';
 import { irreversibleWarrantyConfirmation } from '../services/warrantyLifecycle';
 
@@ -99,12 +100,30 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			.set('Idempotency-Key', key)
 			.send(body);
 
-	it('requires authentication, derives the tenant from auth, and rejects stale confirmation', async () => {
+	it('requires authentication, derives the tenant from auth, hides foreign existence, and rejects stale confirmation', async () => {
 		const id = '10000000-0000-0000-0000-000000000010';
 		const warranty = await createWarranty(id);
 
 		expect((await request(app).delete(`/api/warranty/${id}`)).status).toBe(401);
-		expect((await deleteRequest(warranty, otherToken, 'foreign-delete-key')).status).toBe(403);
+		const foreign = await deleteRequest(warranty, otherToken, 'foreign-delete-key');
+		const absentId = '10000000-0000-0000-0000-000000000099';
+		const absent = await request(app)
+			.delete(`/api/warranty/${absentId}`)
+			.set('Authorization', `Bearer ${otherToken}`)
+			.set('Idempotency-Key', 'absent-delete-key')
+			.send({
+				confirmed_warranty_id: absentId,
+				confirmed_warranty_card_number: 'OPAQUE',
+				confirmed_warranty_version: 1,
+				irreversible_confirmation: irreversibleWarrantyConfirmation('OPAQUE'),
+			});
+		expect(foreign.status).toBe(404);
+		expect(foreign.body).toEqual({
+			error: 'Warranty not found.',
+			code: 'not_found',
+		});
+		expect(absent.status).toBe(foreign.status);
+		expect(absent.body).toEqual(foreign.body);
 
 		const stale = await deleteRequest(warranty, token, 'stale-delete-key', {
 			...confirmationFor(warranty),
@@ -113,6 +132,87 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		expect(stale.status).toBe(409);
 		expect(stale.body.code).toBe('stale_confirmation');
 		expect(await Warranty.findByPk(id)).not.toBeNull();
+		await warranty.destroy({ force: true });
+	});
+
+	it('rejects every malformed confirmation envelope with 422 before lifecycle entry', async () => {
+		const id = '10000000-0000-0000-0000-000000000015';
+		const warranty = await createWarranty(id);
+		const valid = confirmationFor(warranty);
+		const malformed: Record<string, unknown>[] = [
+			{},
+			{
+				confirmed_warranty_card_number: valid.confirmed_warranty_card_number,
+				confirmed_warranty_version: valid.confirmed_warranty_version,
+				irreversible_confirmation: valid.irreversible_confirmation,
+			},
+			{
+				confirmed_warranty_id: valid.confirmed_warranty_id,
+				confirmed_warranty_version: valid.confirmed_warranty_version,
+				irreversible_confirmation: valid.irreversible_confirmation,
+			},
+			{
+				confirmed_warranty_id: valid.confirmed_warranty_id,
+				confirmed_warranty_card_number: valid.confirmed_warranty_card_number,
+				irreversible_confirmation: valid.irreversible_confirmation,
+			},
+			{
+				confirmed_warranty_id: valid.confirmed_warranty_id,
+				confirmed_warranty_card_number: valid.confirmed_warranty_card_number,
+				confirmed_warranty_version: valid.confirmed_warranty_version,
+			},
+			{ ...valid, confirmed_warranty_id: '' },
+			{ ...valid, confirmed_warranty_id: 'not-a-uuid' },
+			{ ...valid, confirmed_warranty_id: 7 },
+			{ ...valid, confirmed_warranty_card_number: '' },
+			{ ...valid, confirmed_warranty_card_number: { value: 'CARD' } },
+			{ ...valid, confirmed_warranty_version: 0 },
+			{ ...valid, confirmed_warranty_version: -1 },
+			{ ...valid, confirmed_warranty_version: 1.5 },
+			{ ...valid, confirmed_warranty_version: '1.5' },
+			{ ...valid, confirmed_warranty_version: '01' },
+			{ ...valid, confirmed_warranty_version: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...valid, irreversible_confirmation: '' },
+			{ ...valid, irreversible_confirmation: true },
+		];
+		const transactionSpy = jest.spyOn(sequelize, 'transaction');
+		try {
+			const missingEnvelopeAndKey = await request(app)
+				.delete(`/api/warranty/${id}`)
+				.set('Authorization', `Bearer ${token}`)
+				.send({});
+			expect(missingEnvelopeAndKey.status).toBe(422);
+			for (const [index, body] of malformed.entries()) {
+				const response = await deleteRequest(
+					warranty,
+					token,
+					`malformed-confirmation-${index}`,
+					body,
+				);
+				expect(response.status).toBe(422);
+				expect(response.body).toEqual({
+					error: 'Named, version-bound irreversible confirmation is required',
+					code: 'confirmation_invalid',
+				});
+			}
+			expect(transactionSpy).not.toHaveBeenCalled();
+		} finally {
+			transactionSpy.mockRestore();
+		}
+		expect(await Warranty.findByPk(id)).not.toBeNull();
+		expect(await WarrantyDeletionTombstone.count({ where: { warrantyId: id } })).toBe(0);
+
+		const structurallyValidButWrongSource = await deleteRequest(
+			warranty,
+			token,
+			'structurally-valid-stale-source',
+			{
+				...valid,
+				confirmed_warranty_id: '10000000-0000-0000-0000-000000000016',
+			},
+		);
+		expect(structurallyValidButWrongSource.status).toBe(409);
+		expect(structurallyValidButWrongSource.body.code).toBe('stale_confirmation');
 		await warranty.destroy({ force: true });
 	});
 
@@ -259,32 +359,43 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		});
 		const old = await createWarranty(oldId, replacementClientId);
 		const key = 'replacement-idempotency-key-001';
+		const targetId = '10000000-0000-4000-8000-000000000022';
 		const upload = ({
 			card = 'CARD-REPLACEMENT',
 			pdf = samplePdf,
 			version = old.version,
 			targetClientId = replacementClientId,
+			targetWarrantyId = targetId,
+			startDate = '2026-07-30T00:00:00.000Z',
+			durationYears = '10',
+			sourceWarrantyId = old.id,
+			confirmedCard = old.warrantyCardNumber,
+			phrase = irreversibleWarrantyConfirmation(old.warrantyCardNumber),
 		}: {
 			card?: string;
 			pdf?: Buffer;
 			version?: number;
 			targetClientId?: string;
+			targetWarrantyId?: string;
+			startDate?: string;
+			durationYears?: string;
+			sourceWarrantyId?: string;
+			confirmedCard?: string;
+			phrase?: string;
 		} = {}) =>
 			request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
 				.set('Idempotency-Key', key)
 				.field('client_id', targetClientId)
-				.field('start_date', '2026-07-30T00:00:00.000Z')
-				.field('duration_years', '10')
+				.field('start_date', startDate)
+				.field('duration_years', durationYears)
 				.field('warranty_card_number', card)
-				.field('confirmed_warranty_id', old.id)
-				.field('confirmed_warranty_card_number', old.warrantyCardNumber)
+				.field('replacement_warranty_id', targetWarrantyId)
+				.field('confirmed_warranty_id', sourceWarrantyId)
+				.field('confirmed_warranty_card_number', confirmedCard)
 				.field('confirmed_warranty_version', version.toString())
-				.field(
-					'irreversible_confirmation',
-					irreversibleWarrantyConfirmation(old.warrantyCardNumber),
-				)
+				.field('irreversible_confirmation', phrase)
 				.attach('file', pdf, {
 					filename: 'replacement.PDF',
 					contentType: 'application/pdf',
@@ -292,6 +403,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 
 		const first = await upload();
 		expect(first.status).toBe(201);
+		expect(first.body.id).toBe(targetId);
 		expect(first.body.replayed).toBe(false);
 		expect(first.body.pdfFileName).toMatch(/\.pdf$/);
 		expect(first.body.pdfFileName).not.toMatch(/\.PDF$/);
@@ -329,6 +441,25 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		expect(changedParent.status).toBe(409);
 		expect(changedParent.body.code).toBe('idempotency_conflict');
 
+		const changedTarget = await upload({
+			targetWarrantyId: '10000000-0000-4000-8000-000000000023',
+		});
+		expect(changedTarget.status).toBe(409);
+		expect(changedTarget.body).toEqual(
+			expect.objectContaining({ code: 'idempotency_conflict' }),
+		);
+		for (const mismatch of [
+			{ startDate: '2026-07-31T00:00:00.000Z' },
+			{ durationYears: '9' },
+			{ sourceWarrantyId: '10000000-0000-0000-0000-000000000025' },
+			{ confirmedCard: 'CHANGED-CONFIRMED-CARD' },
+			{ phrase: 'PERMANENTLY DELETE WARRANTY CHANGED' },
+		]) {
+			const response = await upload(mismatch);
+			expect(response.status).toBe(409);
+			expect(response.body.code).toBe('idempotency_conflict');
+		}
+
 		const stale = await request(app)
 			.post('/api/warranty/upload')
 			.set('Authorization', `Bearer ${token}`)
@@ -337,6 +468,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			.field('start_date', '2026-07-30T00:00:00.000Z')
 			.field('duration_years', '10')
 			.field('warranty_card_number', 'SHOULD-NOT-WIN')
+			.field('replacement_warranty_id', '10000000-0000-4000-8000-000000000024')
 			.field('confirmed_warranty_id', old.id)
 			.field('confirmed_warranty_card_number', old.warrantyCardNumber)
 			.field('confirmed_warranty_version', old.version.toString())
@@ -362,7 +494,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			franchiseeId: tenantId,
 		});
 		const old = await createWarranty(oldId, raceClientId);
-		const upload = (key: string, card: string) =>
+		const upload = (key: string, card: string, targetWarrantyId: string) =>
 			request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
@@ -371,6 +503,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 				.field('start_date', '2026-07-30T00:00:00.000Z')
 				.field('duration_years', '5')
 				.field('warranty_card_number', card)
+				.field('replacement_warranty_id', targetWarrantyId)
 				.field('confirmed_warranty_id', old.id)
 				.field('confirmed_warranty_card_number', old.warrantyCardNumber)
 				.field('confirmed_warranty_version', old.version.toString())
@@ -389,16 +522,97 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		const responses =
 			Warranty.sequelize!.getDialect() === 'sqlite'
 				? [
-						await upload('replacement-race-key-001', 'RACE-A'),
-						await upload('replacement-race-key-002', 'RACE-B'),
+						await upload(
+							'replacement-race-key-001',
+							'RACE-A',
+							'10000000-0000-4000-8000-000000000032',
+						),
+						await upload(
+							'replacement-race-key-002',
+							'RACE-B',
+							'10000000-0000-4000-8000-000000000033',
+						),
 					]
 				: await Promise.all([
-						upload('replacement-race-key-001', 'RACE-A'),
-						upload('replacement-race-key-002', 'RACE-B'),
+						upload(
+							'replacement-race-key-001',
+							'RACE-A',
+							'10000000-0000-4000-8000-000000000032',
+						),
+						upload(
+							'replacement-race-key-002',
+							'RACE-B',
+							'10000000-0000-4000-8000-000000000033',
+						),
 					]);
 		expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
 		expect(await Warranty.count({ where: { clientId: raceClientId } })).toBe(1);
 		expect(await WarrantyDeletionTombstone.count({ where: { warrantyId: oldId } })).toBe(1);
+	});
+
+	it('rejects malformed replacement identity before mutation and globally reserved targets', async () => {
+		const replacementClientId = '10000000-0000-0000-0000-000000000034';
+		const oldId = '10000000-0000-0000-0000-000000000035';
+		const reservedTargetId = '20000000-0000-4000-8000-000000000036';
+		const liveReservedTargetId = '20000000-0000-4000-8000-000000000037';
+		await Client.create({
+			id: replacementClientId,
+			name: 'Reserved target client',
+			franchiseeId: tenantId,
+		});
+		const old = await createWarranty(oldId, replacementClientId);
+		await WarrantyDeletionTombstone.create({
+			warrantyId: reservedTargetId,
+			franchiseeId: otherTenantId,
+			deletionSequence: '900000',
+			deletedAt: new Date('2026-07-30T00:00:00.000Z'),
+		});
+		await createWarranty(liveReservedTargetId, otherClientId);
+
+		const upload = (targetWarrantyId?: string) => {
+			let pending = request(app)
+				.post('/api/warranty/upload')
+				.set('Authorization', `Bearer ${token}`)
+				.set('Idempotency-Key', 'reserved-target-replacement-key')
+				.field('client_id', replacementClientId)
+				.field('start_date', '2026-07-30T00:00:00.000Z')
+				.field('duration_years', '5')
+				.field('warranty_card_number', 'RESERVED-TARGET')
+				.field('confirmed_warranty_id', old.id)
+				.field('confirmed_warranty_card_number', old.warrantyCardNumber)
+				.field('confirmed_warranty_version', old.version.toString())
+				.field(
+					'irreversible_confirmation',
+					irreversibleWarrantyConfirmation(old.warrantyCardNumber),
+				);
+			if (targetWarrantyId != null) {
+				pending = pending.field('replacement_warranty_id', targetWarrantyId);
+			}
+			return pending.attach('file', samplePdf, {
+				filename: 'reserved-target.pdf',
+				contentType: 'application/pdf',
+			});
+		};
+
+		for (const malformedTarget of [undefined, '', 'not-a-uuid']) {
+			const response = await upload(malformedTarget);
+			expect(response.status).toBe(422);
+			expect(response.body.code).toBe('confirmation_invalid');
+		}
+		expect(await Warranty.findByPk(old.id)).not.toBeNull();
+		expect(await WarrantyDeletionTombstone.findByPk(old.id)).toBeNull();
+
+		const liveReserved = await upload(liveReservedTargetId);
+		expect(liveReserved.status).toBe(409);
+		expect(liveReserved.body.code).toBe('warranty_id_reserved');
+		expect(await Warranty.findByPk(old.id)).not.toBeNull();
+		expect(await Warranty.findByPk(liveReservedTargetId)).not.toBeNull();
+
+		const reserved = await upload(reservedTargetId);
+		expect(reserved.status).toBe(409);
+		expect(reserved.body.code).toBe('warranty_id_reserved');
+		expect(await Warranty.findByPk(old.id)).not.toBeNull();
+		expect(await Warranty.findByPk(reservedTargetId, { paranoid: false })).toBeNull();
 	});
 
 	it('emits permanent warranty tombstones when a client is deleted', async () => {

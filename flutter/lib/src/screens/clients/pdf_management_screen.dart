@@ -8,13 +8,19 @@ import '../../models/proposal.dart';
 import '../../providers/client_provider.dart';
 import '../../services/api_service.dart';
 import '../../services/pdf_service.dart';
+import '../../services/warranty_replacement_intent_store.dart';
 import '../../widgets/pdf_list_item.dart';
 import 'warranty_form_screen.dart';
 
 class PdfManagementScreen extends StatefulWidget {
   final Client client;
+  final WarrantyReplacementIntentStore? replacementIntentStore;
 
-  const PdfManagementScreen({super.key, required this.client});
+  const PdfManagementScreen({
+    super.key,
+    required this.client,
+    this.replacementIntentStore,
+  });
 
   @override
   State<PdfManagementScreen> createState() => _PdfManagementScreenState();
@@ -24,11 +30,14 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
   bool _isGenerating = false;
   bool _isWarrantyMutationInFlight = false;
   late final PdfService _pdfService;
+  late final WarrantyReplacementIntentStore _replacementIntentStore;
 
   @override
   void initState() {
     super.initState();
     _pdfService = PdfService(apiService: context.read<ApiService>());
+    _replacementIntentStore =
+        widget.replacementIntentStore ?? WarrantyReplacementIntentStore();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadData();
     });
@@ -113,7 +122,7 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
           context.read<ClientProvider>().currentClientWarranties;
       final activeWarranty =
           activeWarranties.isEmpty ? null : activeWarranties.first;
-      String? idempotencyKey;
+      WarrantyReplacementIntent? replacementIntent;
       if (activeWarranty != null) {
         final replace = await showDialog<bool>(
           context: context,
@@ -138,7 +147,10 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
           ),
         );
         if (replace != true || !mounted) return;
-        idempotencyKey = const Uuid().v4();
+        replacementIntent = await _replacementIntentStore.loadOrCreate(
+          activeWarranty.remoteId,
+        );
+        if (!mounted) return;
       }
 
       final result = await Navigator.push<bool>(
@@ -147,12 +159,16 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
           builder: (context) => WarrantyFormScreen(
             client: widget.client,
             warrantyToReplace: activeWarranty,
-            replacementIdempotencyKey: idempotencyKey,
+            replacementIdempotencyKey: replacementIntent?.idempotencyKey,
+            replacementTargetWarrantyId: replacementIntent?.targetWarrantyId,
           ),
         ),
       );
 
       if (result == true) {
+        if (activeWarranty != null) {
+          await _replacementIntentStore.clear(activeWarranty.remoteId);
+        }
         await _loadData();
       }
     } finally {
