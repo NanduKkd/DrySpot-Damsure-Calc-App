@@ -43,7 +43,7 @@ The local `codex/product-roadmap` integration lane now includes APP-101 measurem
 - Integrated Flutter gate: 102 tests pass; `flutter analyze` reports no issues.
 - APP-109 forward/undo/reapply/idempotent migration behavior passes against a disposable SQLite database. PostgreSQL-copy proof remains required before deployment.
 - APP-103 still requires the planned physical-device photo-picker/camera/location permission scenario.
-- APP-104's exact-tip independent review passed 14 focused tests, 70 adversarial parser assertions, targeted analysis/format checks, and strict schema, origin, timestamp, numeric-bound, required-reason, legacy-response, classification, and anti-rollback verification.
+- APP-104's initial exact-tip review passed 14 focused tests and 70 adversarial parser assertions. A separately verified hardening follow-up adds collision-free canonical JSON policy identity and strict disabled/legacy high-water transitions; its 17 focused tests and 21 independent transition/collision assertions pass with clean analysis and formatting.
 
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 

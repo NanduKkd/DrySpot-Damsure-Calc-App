@@ -189,7 +189,7 @@ Frozen contract summary:
 | APP-101 | Portfolio manager | `019fb3a7-ec62-7302-af36-fefc0667e8bc` | Integrated as `b7ac581`; focused tests and analyze pass |
 | APP-103 | Portfolio manager | `019fb3a7-ec63-7dd2-b9d8-5c653622d49f` | Integrated as `b29b631`; automated gates pass, device proof pending |
 | APP-104 design | Portfolio manager | `019fb3a7-ec62-7302-af36-ff12211ab995` | Read-only contract frozen against `54b5c5b` |
-| APP-104 implementation | Portfolio manager | `019fb3c8-5ff6-7df1-8c41-9c2d5acc363c` | Integrated as `0d8ded9` + `fa6d360`; verifier `019fb3d6-cb2e-79b1-b7d6-5f2fcb6e0821` passed |
+| APP-104 implementation | Portfolio manager | `019fb3c8-5ff6-7df1-8c41-9c2d5acc363c` | Integrated as `0d8ded9` + `fa6d360` + `fe0c79a`; verifier `019fb3d6-cb2e-79b1-b7d6-5f2fcb6e0821` passed both exact tips |
 | APP-105 | Portfolio manager | `019fb3ac-5e7b-73b3-80f9-a8d3b42e2c77` | Integrated as `e6144d0`; Unicode render evidence and gates pass |
 | APP-109 | Portfolio manager | `019fb3b0-1b41-7971-8506-629401f2cf41` | Integrated as `bb6ee08` + `7319450`; verifier `019fb3b5-eeae-7660-b05e-4ebd8e12f2a1` passed |
 | APP-110 design | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen |
