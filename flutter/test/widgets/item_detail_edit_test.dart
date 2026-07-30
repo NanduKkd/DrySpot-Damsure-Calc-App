@@ -123,27 +123,18 @@ void main() {
 
     await tester.pumpAndSettle();
 
-    expect(find.text('10.0 x 20.0'), findsOneWidget);
+    expect(find.text('200.0 sqft'), findsOneWidget);
 
-    final editIconFinder = find.byIcon(Icons.edit_outlined);
-    expect(editIconFinder, findsOneWidget);
-
-    await tester.tap(editIconFinder);
-    await tester.pumpAndSettle();
-
-    expect(find.text('Edit Rectangle'), findsOneWidget);
-
-    // Change length to 15
-    final lengthField = find.descendant(
-      of: find.byType(AlertDialog),
-      matching: find.widgetWithText(TextField, 'Length'),
-    );
+    // Change length inline, then press Next on width to save the row.
+    final lengthField = find.widgetWithText(TextField, 'Length (ft)').first;
     await tester.enterText(lengthField, '15.0');
 
-    await tester.tap(find.text('Save'));
+    await tester.testTextInput.receiveAction(TextInputAction.next);
+    await tester.pump();
+    await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pumpAndSettle();
 
-    expect(find.text('15.0 x 20.0'), findsOneWidget);
-    expect(find.text('Area: 300.00 sqft'), findsOneWidget);
+    expect(mockProvider._item.rectangles.first.length, 15.0);
+    expect(find.text('300.0 sqft'), findsOneWidget);
   });
 }

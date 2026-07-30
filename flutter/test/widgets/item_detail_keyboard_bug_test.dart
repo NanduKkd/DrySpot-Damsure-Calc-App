@@ -124,8 +124,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // Verify initial focus is on Length
-    final lengthFieldFinder = find.widgetWithText(TextField, 'Length');
-    final widthFieldFinder = find.widgetWithText(TextField, 'Width');
+    final lengthFieldFinder = find.widgetWithText(TextField, 'Length (ft)');
+    final widthFieldFinder = find.widgetWithText(TextField, 'Width (ft)');
 
     expect(lengthFieldFinder, findsOneWidget);
     expect(widthFieldFinder, findsOneWidget);
@@ -138,8 +138,8 @@ void main() {
 
     // Enter width
     await tester.enterText(widthFieldFinder, '20');
-    // Submit width (TextInputAction.done)
-    await tester.testTextInput.receiveAction(TextInputAction.done);
+    // Submit width (TextInputAction.next)
+    await tester.testTextInput.receiveAction(TextInputAction.next);
 
     // Pump a few times to allow async operations and animations
     await tester.pump();
@@ -147,14 +147,14 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
 
     // After submission, there should be one new rectangle in the list (the saved one)
-    expect(find.text('10.0 x 20.0'), findsOneWidget);
+    expect(find.text('200.0 sqft'), findsOneWidget);
 
     // And there should be a fresh empty input row for the next rectangle
-    expect(lengthFieldFinder, findsOneWidget);
-    expect(widthFieldFinder, findsOneWidget);
+    expect(lengthFieldFinder, findsNWidgets(2));
+    expect(widthFieldFinder, findsNWidgets(2));
 
     // The Length text field should be focused so the keyboard remains visible
-    final lengthTextField = tester.widget<TextField>(lengthFieldFinder);
+    final lengthTextField = tester.widget<TextField>(lengthFieldFinder.last);
     expect(lengthTextField.focusNode?.hasFocus, isTrue,
         reason: 'Length field should have focus after submission');
   });

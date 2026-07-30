@@ -70,7 +70,7 @@ void main() {
     await tester.pumpAndSettle(); // Wait for _loadItem
 
     // Initial focus should be on length field of first row (the new entry row)
-    final lengthFieldFinder = find.widgetWithText(TextField, 'Length');
+    final lengthFieldFinder = find.widgetWithText(TextField, 'Length (ft)');
     expect(lengthFieldFinder, findsOneWidget);
 
     // Type Length and press Next
@@ -79,24 +79,16 @@ void main() {
     await tester.pump();
 
     // Focus should be on width field
-    final widthFieldFinder = find.widgetWithText(TextField, 'Width');
+    final widthFieldFinder = find.widgetWithText(TextField, 'Width (ft)');
     expect(widthFieldFinder, findsOneWidget);
 
-    // Type Width and press Done/Enter
+    // Type Width and press Next
     await tester.enterText(widthFieldFinder, '20');
-    await tester.testTextInput.receiveAction(TextInputAction.done);
-    // Note: In my implementation, _submitNewRectangle clears controllers and requests focus on length again.
-    // It also calls _loadItem(), so we might need to pump.
+    await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pump();
 
     // Verify focus is back on Length
-    // In my implementation, I don't automatically add a NEW row of TextFields,
-    // I just have ONE new entry row at the bottom that clears itself.
-    // The test expects 2 Length fields, but my implementation has one existing (if any) and one new.
-    // Wait, existing rectangles in my ItemDetailScreen are shown as Text in ListTile, not as TextFields.
-    // So there will always be only ONE 'Length' field (the new entry one).
-
-    expect(find.widgetWithText(TextField, 'Length'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'Length (ft)'), findsOneWidget);
   });
 
   testWidgets('ItemDetailScreen shows total area for entered rectangles',
