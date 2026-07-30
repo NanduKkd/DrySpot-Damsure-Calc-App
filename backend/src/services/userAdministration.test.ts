@@ -1,5 +1,5 @@
 import bcrypt from 'bcrypt';
-import { UserAdministrationService, USER_ADMIN_BCRYPT_COST, type AdminActor } from './userAdministration';
+import { UserAdministrationService, USER_ADMIN_BCRYPT_COST, type AdminActor, type LifecycleRequest } from './userAdministration';
 import { Franchisee, User, UserAdminAuditEvent, sequelize } from '../models';
 
 const tenantA = '10000000-0000-4000-8000-000000000001';
@@ -77,6 +77,22 @@ describe('APP-108 user administration', () => {
     }
   });
 
+  it('rejects unsupported runtime actions before changing user state', async () => {
+    const created = await service.execute(actor, request('create', '28'));
+    const before = await User.findByPk(created.user.id);
+    const unsupported = {
+      action: 'delete', franchiseeId: tenantA, email: 'operator@example.com', reason: 'APP-108 test', idempotencyKey: key('29'),
+    } as unknown as LifecycleRequest;
+    await expect(service.execute(actor, unsupported)).rejects.toMatchObject({ code: 'UNSUPPORTED_ACTION' });
+    const after = await User.findByPk(created.user.id);
+    expect(after!.isActive).toBe(before!.isActive);
+    expect(after!.tokenVersion).toBe(before!.tokenVersion);
+    expect(after!.password).toBe(before!.password);
+    const audit = await UserAdminAuditEvent.findOne({ where: { idempotencyKey: key('29') } });
+    expect(audit!.get('outcome')).toBe('rejected');
+    expect(audit!.get('reasonCode')).toBe('UNSUPPORTED_ACTION');
+  });
+
   it('fails fast on overlong UTF-8 reasons while preserving a redacted rejected audit event', async () => {
     for (const [suffix, reason] of [['26', 'x'.repeat(256)], ['27', 'é'.repeat(150)]]) {
       await expect(service.execute(actor, request('create', suffix, { email: `${suffix}@example.com`, reason }))).rejects.toMatchObject({ code: 'REASON_TOO_LONG' });
@@ -99,28 +115,32 @@ describe('APP-108 user administration', () => {
     await service.execute(actor, request('deactivate', '19'));
     const page = await service.auditEvents(actor, tenantA, 999);
     expect(page.events).toHaveLength(Math.min(await UserAdminAuditEvent.count({ where: { franchiseeId: tenantA } }), 100));
-    expect(page.events.map((event) => event.get('idempotencyKey'))).toEqual(expect.arrayContaining([key('18'), key('19')]));
-    expect(page.events.every((event) => event.get('franchiseeId') === tenantA)).toBe(true);
+    expect(page.events.map((event) => event.idempotencyKey)).toEqual(expect.arrayContaining([key('18'), key('19')]));
+    expect(page.events.every((event) => event.franchiseeId === tenantA)).toBe(true);
     await expect(service.auditEvents(actor, tenantB)).rejects.toMatchObject({ code: 'OUT_OF_SCOPE' });
   });
 
-  it('uses an opaque occurred-at/id cursor without tenant leakage, duplicates, or equal-time skips', async () => {
-    const createAudit = (id: string, idempotencyKey: string, franchiseeId: string, createdAt: Date) => UserAdminAuditEvent.create({
-      id, idempotencyKey, canonicalRequestSha256: 'a'.repeat(64), actor: 'cursor-test', actorUid: 1001, authMode: 'test', scopeSnapshot: { franchiseeIds: [franchiseeId] }, action: 'create', targetUserId: null, normalizedEmail: `${id}@example.com`, franchiseeId, reason: 'cursor test', outcome: 'succeeded', reasonCode: 'APPLIED', beforeState: null, afterState: { isActive: true, tokenVersion: 0 }, hostname: 'test', appVersion: 'test', createdAt,
+  it('uses an opaque decimal sequence cursor without tenant leakage, duplicates, or precision loss', async () => {
+    const createAudit = (id: string, idempotencyKey: string, franchiseeId: string, auditSequence: string) => UserAdminAuditEvent.create({
+      id, idempotencyKey, canonicalRequestSha256: 'a'.repeat(64), auditSequence, actor: 'cursor-test', actorUid: 1001, authMode: 'test', scopeSnapshot: { franchiseeIds: [franchiseeId] }, action: 'create', targetUserId: null, normalizedEmail: `${id}@example.com`, franchiseeId, reason: 'cursor test', outcome: 'succeeded', reasonCode: 'APPLIED', beforeState: null, afterState: { isActive: true, tokenVersion: 0 }, hostname: 'test', appVersion: 'test', createdAt: new Date('2035-01-01T00:00:00.123Z'),
     });
     const latest = '90000000-0000-4000-8000-000000000003';
     const sameLow = '90000000-0000-4000-8000-000000000001';
     const sameHigh = '90000000-0000-4000-8000-000000000002';
-    await createAudit(latest, key('30'), tenantA, new Date('2035-01-02T00:00:00.000Z'));
-    await createAudit(sameLow, key('31'), tenantA, new Date('2035-01-01T00:00:00.000Z'));
-    await createAudit(sameHigh, key('32'), tenantA, new Date('2035-01-01T00:00:00.000Z'));
-    await createAudit('90000000-0000-4000-8000-000000000004', key('33'), tenantB, new Date('2036-01-01T00:00:00.000Z'));
+    await createAudit(latest, key('30'), tenantA, '9007199254740995');
+    await createAudit(sameLow, key('31'), tenantA, '9007199254740993');
+    await createAudit(sameHigh, key('32'), tenantA, '9007199254740994');
+    await createAudit('90000000-0000-4000-8000-000000000004', key('33'), tenantB, '9007199254740996');
     const first = await service.auditEvents(actor, tenantA, 1);
+    expect(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')).toBe('{"sequence":"9007199254740995"}');
     const second = await service.auditEvents(actor, tenantA, 1, first.nextCursor);
     const third = await service.auditEvents(actor, tenantA, 1, second.nextCursor);
     expect([first.events[0].id, second.events[0].id, third.events[0].id]).toEqual([latest, sameHigh, sameLow]);
     expect(new Set([first.events[0].id, second.events[0].id, third.events[0].id]).size).toBe(3);
+    expect(first.events[0].auditSequence).toBe('9007199254740995');
     await expect(service.auditEvents(actor, tenantA, 1, 'not-a-cursor')).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
+    const future = Buffer.from(JSON.stringify({ sequence: '9223372036854775807' })).toString('base64url');
+    await expect(service.auditEvents(actor, tenantA, 1, future)).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
   });
 
   it('requires an explicit deployed version for production audit operations', () => {

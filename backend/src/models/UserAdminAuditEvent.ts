@@ -5,6 +5,7 @@ export class UserAdminAuditEvent extends Model {
   declare id: string;
   declare idempotencyKey: string;
   declare canonicalRequestSha256: string;
+  declare auditSequence: string;
   declare outcome: 'succeeded' | 'noop' | 'rejected';
   declare createdAt: Date;
 }
@@ -14,6 +15,7 @@ UserAdminAuditEvent.init(
     id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
     idempotencyKey: { type: DataTypes.UUID, allowNull: false, unique: true },
     canonicalRequestSha256: { type: DataTypes.STRING(64), allowNull: false },
+    auditSequence: { type: DataTypes.BIGINT, allowNull: false, unique: true },
     actor: { type: DataTypes.STRING, allowNull: false },
     actorUid: { type: DataTypes.INTEGER, allowNull: false },
     authMode: { type: DataTypes.STRING, allowNull: false },

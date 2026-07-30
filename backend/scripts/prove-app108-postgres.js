@@ -42,7 +42,22 @@ const main = async () => {
   assert.equal(Number((await database.query('SELECT COUNT(*) AS count FROM users', { type: QueryTypes.SELECT }))[0].count), 2, 'collision abort must retain users');
 
   await reset(); queryInterface = await createBaseSchema();
+  await database.query(`CREATE TABLE user_admin_audit_events (
+    id uuid PRIMARY KEY, idempotency_key uuid UNIQUE NOT NULL, canonical_request_sha256 varchar(64) NOT NULL,
+    occurred_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP, actor varchar NOT NULL, actor_uid integer NOT NULL,
+    auth_mode varchar NOT NULL, scope_snapshot jsonb NOT NULL, action varchar NOT NULL, target_user_id uuid,
+    normalized_email varchar NOT NULL, franchisee_id uuid NOT NULL, reason varchar(255) NOT NULL,
+    outcome varchar NOT NULL, reason_code varchar NOT NULL, before_state jsonb, after_state jsonb,
+    hostname varchar NOT NULL, app_version varchar NOT NULL
+  )`);
+  await database.query(`INSERT INTO user_admin_audit_events
+    (id, idempotency_key, canonical_request_sha256, occurred_at, actor, actor_uid, auth_mode, scope_snapshot,
+     action, normalized_email, franchisee_id, reason, outcome, reason_code, hostname, app_version)
+    VALUES ('30000000-0000-4000-8000-000000000010', '40000000-0000-4000-8000-000000000010', repeat('a', 64),
+      '2035-01-01T00:00:00.123900Z', 'legacy', 1, 'legacy', '{}'::jsonb, 'create', 'legacy@example.com', :tenant,
+      'legacy audit', 'succeeded', 'APPLIED', 'proof', 'abcdef1')`, { replacements: { tenant: tenantA } });
   await migration.up(queryInterface, Sequelize); await migration.up(queryInterface, Sequelize);
+  assert.match(String((await database.query(`SELECT audit_sequence::text AS sequence FROM user_admin_audit_events WHERE id = '30000000-0000-4000-8000-000000000010'`, { type: QueryTypes.SELECT }))[0].sequence), /^[1-9]\d*$/, 'existing audit must receive a sequence');
   const { UserAdministrationService } = require('../dist/services/userAdministration.js');
   const { User } = require('../dist/models');
   const { normalizedEmailWhere } = require('../dist/utils/userEmail.js');
@@ -65,11 +80,27 @@ const main = async () => {
   await expectReject(database.query('UPDATE user_admin_audit_events SET reason = :reason', { replacements: { reason: 'mutated' } }), 'append-only update trigger');
   await expectReject(database.query('DELETE FROM user_admin_audit_events'), 'append-only delete trigger');
   const audits = await database.query('SELECT actor, before_state, after_state, outcome FROM user_admin_audit_events WHERE franchisee_id = :tenant', { replacements: { tenant: tenantA }, type: QueryTypes.SELECT });
-  assert(audits.length >= 4 && audits.every((event) => event.actor === 'proof-operator'), 'audit records must be complete and attributed');
+  const proofAudits = audits.filter((event) => event.actor === 'proof-operator');
+  assert(proofAudits.length >= 4, 'audit records must be complete and attributed');
+  await database.query(`INSERT INTO user_admin_audit_events
+    (id, idempotency_key, canonical_request_sha256, audit_sequence, occurred_at, actor, actor_uid, auth_mode, scope_snapshot,
+     action, normalized_email, franchisee_id, reason, outcome, reason_code, hostname, app_version)
+    VALUES
+    ('30000000-0000-4000-8000-000000000020', '40000000-0000-4000-8000-000000000020', repeat('b', 64), 9007199254740993, '2035-01-01T00:00:00.123700Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-a@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
+    ('30000000-0000-4000-8000-000000000021', '40000000-0000-4000-8000-000000000021', repeat('c', 64), 9007199254740994, '2035-01-01T00:00:00.123800Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-b@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
+    ('30000000-0000-4000-8000-000000000022', '40000000-0000-4000-8000-000000000022', repeat('d', 64), 9007199254740995, '2035-01-01T00:00:00.123900Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-c@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
+    ('30000000-0000-4000-8000-000000000023', '40000000-0000-4000-8000-000000000023', repeat('e', 64), 9007199254740996, '2035-01-01T00:00:00.123950Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'foreign-cursor@example.com', :tenantB, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1')`, { replacements: { tenant: tenantA, tenantB } });
+  const cursorA = await service.auditEvents(actor, tenantA, 1);
+  const cursorB = await service.auditEvents(actor, tenantA, 1, cursorA.nextCursor);
+  const cursorC = await service.auditEvents(actor, tenantA, 1, cursorB.nextCursor);
+  assert.deepEqual(cursorA.events.map((event) => event.id).concat(cursorB.events.map((event) => event.id), cursorC.events.map((event) => event.id)), [
+    '30000000-0000-4000-8000-000000000022', '30000000-0000-4000-8000-000000000021', '30000000-0000-4000-8000-000000000020',
+  ], 'microsecond-distinct events must page without skips or duplicates');
+  assert.equal(cursorA.events[0].auditSequence, '9007199254740995', 'audit sequence must serialize safely above 2^53');
   await migration.down(queryInterface);
   assert((await queryInterface.showAllTables()).includes('user_admin_audit_events'), 'down must retain audit data');
   await migration.up(queryInterface, Sequelize);
-  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', normalized_legacy_login: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
+  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', normalized_legacy_login: 'passed', audit_sequence_backfill: 'passed', microsecond_cursor: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
 };
 
 main().finally(() => database.close()).catch((error) => { console.error(error); process.exitCode = 1; });

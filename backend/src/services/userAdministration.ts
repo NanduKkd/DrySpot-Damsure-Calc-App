@@ -1,7 +1,7 @@
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import os from 'os';
-import { Op, Transaction, UniqueConstraintError } from 'sequelize';
+import { Op, QueryTypes, Transaction, UniqueConstraintError } from 'sequelize';
 import sequelize from '../config/database';
 import { Franchisee } from '../models/Franchisee';
 import { User } from '../models/User';
@@ -16,6 +16,7 @@ const COMMON_PASSWORDS = new Set([
   'adminadminadmin12', 'iloveyouiloveyou', 'changemechangeme1', 'monkeymonkeymonk',
 ]);
 export type UserAdminAction = 'create' | 'deactivate' | 'reactivate' | 'revoke-all-tokens' | 'reset-password';
+const USER_ADMIN_ACTIONS = new Set<string>(['create', 'deactivate', 'reactivate', 'revoke-all-tokens', 'reset-password']);
 
 export interface AdminActor { actor: string; uid: number; authMode: string; franchiseeIds: string[] | '*'; }
 export interface LifecycleRequest {
@@ -23,7 +24,8 @@ export interface LifecycleRequest {
   name?: string; password?: string;
 }
 export interface LifecycleResult { outcome: 'succeeded' | 'noop'; reasonCode: string; user: { id: string; email: string; franchiseeId: string; isActive: boolean; tokenVersion: number }; generatedPassword?: string; }
-export interface AuditPage { events: UserAdminAuditEvent[]; nextCursor?: string; }
+export interface AuditEventOutput extends Record<string, unknown> { id: string; auditSequence: string; }
+export interface AuditPage { events: AuditEventOutput[]; nextCursor?: string; }
 
 export class UserAdminError extends Error {
   constructor(public readonly code: string, message = code) { super(message); }
@@ -38,18 +40,16 @@ const requestHash = (request: LifecycleRequest) => crypto.createHash('sha256').u
 const snapshot = (user: User | null) => user ? { isActive: user.isActive, tokenVersion: user.tokenVersion } : null;
 const publicUser = (user: User) => ({ id: user.id, email: normalizeUserEmail(user.email), franchiseeId: user.franchiseeId, isActive: user.isActive, tokenVersion: user.tokenVersion });
 const isEmail = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && Buffer.byteLength(email, 'utf8') <= 320;
-const isAuditId = (value: string) => isUuid(value);
-type AuditCursor = { occurredAt: string; id: string };
+const MAX_AUDIT_SEQUENCE = 9223372036854775807n;
+type AuditCursor = { sequence: string };
 
-const encodeAuditCursor = (event: UserAdminAuditEvent): string => Buffer.from(JSON.stringify({
-  occurredAt: event.createdAt.toISOString(), id: event.id,
-})).toString('base64url');
+const encodeAuditCursor = (sequence: string): string => Buffer.from(JSON.stringify({ sequence })).toString('base64url');
 
 const decodeAuditCursor = (value: string): AuditCursor => {
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as AuditCursor;
-    const occurredAt = new Date(parsed.occurredAt);
-    if (!isAuditId(parsed.id) || Number.isNaN(occurredAt.getTime()) || occurredAt.toISOString() !== parsed.occurredAt) throw new Error('invalid');
+    const sequence = BigInt(parsed.sequence);
+    if (!/^[1-9]\d*$/.test(parsed.sequence) || sequence > MAX_AUDIT_SEQUENCE || sequence.toString() !== parsed.sequence) throw new Error('invalid');
     return parsed;
   } catch (_) { throw new UserAdminError('INVALID_AUDIT_CURSOR'); }
 };
@@ -92,9 +92,28 @@ export class UserAdministrationService {
     this.appVersion = appVersion || 'unknown';
   }
 
+  private async nextAuditSequence(transaction: Transaction): Promise<string> {
+    if (sequelize.getDialect() === 'postgres') {
+      const rows = await sequelize.query(
+        "SELECT nextval('user_admin_audit_events_audit_sequence_seq')::text AS audit_sequence",
+        { type: QueryTypes.SELECT, transaction },
+      ) as Array<{ audit_sequence: string }>;
+      return rows[0].audit_sequence;
+    }
+    await sequelize.query(
+      'UPDATE user_admin_audit_event_sequence SET next_value = next_value + 1 WHERE singleton = 1',
+      { transaction },
+    );
+    const rows = await sequelize.query(
+      'SELECT CAST(next_value AS TEXT) AS audit_sequence FROM user_admin_audit_event_sequence WHERE singleton = 1',
+      { type: QueryTypes.SELECT, transaction },
+    ) as Array<{ audit_sequence: string }>;
+    return rows[0].audit_sequence;
+  }
+
   private async audit(transaction: Transaction, actor: AdminActor, request: LifecycleRequest, outcome: 'succeeded' | 'noop' | 'rejected', reasonCode: string, target: User | null, before: object | null, after: object | null) {
     await UserAdminAuditEvent.create({
-      id: crypto.randomUUID(), idempotencyKey: request.idempotencyKey, canonicalRequestSha256: requestHash(request),
+      id: crypto.randomUUID(), idempotencyKey: request.idempotencyKey, canonicalRequestSha256: requestHash(request), auditSequence: await this.nextAuditSequence(transaction),
       actor: actor.actor, actorUid: actor.uid, authMode: actor.authMode, scopeSnapshot: { franchiseeIds: actor.franchiseeIds },
       action: request.action, targetUserId: target?.id || null, normalizedEmail: normalizeUserEmail(request.email), franchiseeId: request.franchiseeId,
       reason: Buffer.byteLength(request.reason, 'utf8') > 255 ? '[redacted:reason-too-long]' : request.reason,
@@ -104,6 +123,9 @@ export class UserAdministrationService {
 
   private validate(actor: AdminActor, request: LifecycleRequest) {
     const normalizedEmail = normalizeUserEmail(request.email);
+    // The service is reusable outside the CLI, so do not rely on the TypeScript
+    // union or the CLI parser to constrain untrusted runtime values.
+    if (!USER_ADMIN_ACTIONS.has(request.action)) throw new UserAdminError('UNSUPPORTED_ACTION');
     if (!isUuid(request.franchiseeId) || !isUuid(request.idempotencyKey) || !request.reason.trim()) throw new UserAdminError('INVALID_REQUEST');
     if (Buffer.byteLength(request.reason, 'utf8') > 255) throw new UserAdminError('REASON_TOO_LONG');
     if (!isEmail(normalizedEmail)) throw new UserAdminError('INVALID_EMAIL');
@@ -165,11 +187,14 @@ export class UserAdministrationService {
             else { target.isActive = true; await target.save({ transaction }); }
           } else if (request.action === 'revoke-all-tokens') {
             this.incrementTokenVersion(target); await target.save({ transaction });
-          } else {
+          } else if (request.action === 'reset-password') {
             const password = request.password || generatePolicyCompliantPassword(normalizedEmail, target.name);
             ensurePassword(password, normalizedEmail, target.name);
             this.incrementTokenVersion(target); target.password = await bcrypt.hash(password, USER_ADMIN_BCRYPT_COST); await target.save({ transaction });
             if (!request.password) generatedPassword = password;
+          } else {
+            // Kept as a defence in depth guard if this branch is refactored.
+            throw new UserAdminError('UNSUPPORTED_ACTION');
           }
         }
         await this.audit(transaction, actor, request, outcome, reasonCode, target!, before, snapshot(target!));
@@ -202,14 +227,34 @@ export class UserAdministrationService {
     const whereClause: Record<string | symbol, unknown> = { franchiseeId };
     if (cursor) {
       const point = decodeAuditCursor(cursor);
-      whereClause[Op.or] = [
-        { createdAt: { [Op.lt]: new Date(point.occurredAt) } },
-        { [Op.and]: [{ createdAt: new Date(point.occurredAt) }, { id: { [Op.lt]: point.id } }] },
-      ];
+      const newest = await UserAdminAuditEvent.findOne({
+        where: { franchiseeId }, order: [['auditSequence', 'DESC']],
+        attributes: [[sequelize.literal('CAST(audit_sequence AS TEXT)'), 'auditSequenceText']], raw: true,
+      }) as unknown as Record<string, unknown> | null;
+      // A cursor can only originate from an immutable event in this tenant.
+      // Reject a made-up future value rather than treating it as the first page.
+      if (!newest || BigInt(point.sequence) > BigInt(String(newest.auditSequenceText))) throw new UserAdminError('INVALID_AUDIT_CURSOR');
+      whereClause.auditSequence = { [Op.lt]: point.sequence };
     }
     const cappedLimit = Math.min(Math.max(limit, 1), 100);
-    const rows = await UserAdminAuditEvent.findAll({ where: whereClause, order: [['createdAt', 'DESC'], ['id', 'DESC']], limit: cappedLimit + 1 });
+    // `raw` preserves the text cast below. Model hydration can coerce BIGINT
+    // through a JavaScript number, which would corrupt values above 2^53.
+    const rows = await UserAdminAuditEvent.findAll({
+      where: whereClause,
+      order: [['auditSequence', 'DESC']],
+      limit: cappedLimit + 1,
+      attributes: { include: [[sequelize.literal('CAST(audit_sequence AS TEXT)'), 'auditSequenceText']] },
+      raw: true,
+    }) as unknown as Array<Record<string, unknown>>;
     const events = rows.slice(0, cappedLimit);
-    return { events, nextCursor: rows.length > cappedLimit ? encodeAuditCursor(events[events.length - 1]) : undefined };
+    return {
+      events: events.map((row) => {
+        const values = { ...row };
+        const auditSequence = String(values.auditSequenceText);
+        delete values.auditSequenceText;
+        return { ...values, auditSequence } as AuditEventOutput;
+      }),
+      nextCursor: rows.length > cappedLimit ? encodeAuditCursor(String(events[events.length - 1].auditSequenceText)) : undefined,
+    };
   }
 }
