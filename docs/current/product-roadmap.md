@@ -7,7 +7,7 @@ This roadmap derives from [product decisions](product-decisions.md) and the deta
 | Lane | Scope | Ordered tasks | Primary shared surface |
 | :--- | :--- | :--- | :--- |
 | A — Mobile quality | Fast field-workflow safety and platform quality | APP-101 → APP-102 → APP-105 → APP-103 → APP-106 | Flutter UI, providers, Android project |
-| B — Identity and operations | Account lifecycle and cleanup reliability | APP-108 → APP-109 | Backend auth/models, operations |
+| B — Identity and operations | Account lifecycle and cleanup reliability | APP-109 → APP-108 | Backend managed storage, auth/models, operations |
 | C — Data consistency | Destructive warranty lifecycle and conflicts | APP-110 → APP-111 → APP-112 | Sync protocol, warranty controllers, local database |
 | D — Releases | Optional/required update delivery | APP-104 → APP-107 → APP-113 | Manifest contract, hosting, Flutter startup |
 
@@ -36,14 +36,14 @@ These lanes are independent in code and runtime. Integrate each task separately 
 
 ### Wave 2 — Data safety plus release hosting
 
-- Slot 1, Lane C: APP-110, then APP-111.
+- Slot 1, operations prerequisite: APP-109, then Lane C APP-110 and APP-111.
 - Slot 2, Lane D: APP-107 against the frozen APP-104 contract.
 
-Do not run APP-110 and APP-111 concurrently. Both are T3 and require exact-commit independent verification.
+APP-109 must provide the durable cleanup outbox before APP-110 changes warranty deletion. Do not run APP-110 and APP-111 concurrently. Both are T3 and require exact-commit independent verification.
 
 ### Wave 3 — Operational resilience
 
-- Slot 1, Lane B: APP-109.
+- Slot 1, Lane B: APP-108.
 - Slot 2, Lane A: APP-106.
 
 APP-106 should use two real accounts and a physical device. APP-109 uses isolated failure injection and must not operate against production storage.

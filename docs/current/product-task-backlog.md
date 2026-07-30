@@ -4,17 +4,17 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 
 | ID | Weight | Priority | Risk | Status | Task | Dependencies |
 | :--- | ---: | :--- | :--- | :--- | :--- | :--- |
-| APP-101 | 2 | P1 | T1 | Ready | Visible measurement validation | None |
+| APP-101 | 2 | P1 | T1 | Integrated locally | Visible measurement validation | None |
 | APP-102 | 2 | P1 | T1 | Draft | Measurement deletion safety | Interaction decision |
-| APP-103 | 3 | P1 | T2 | Ready | Android permission minimization | None |
-| APP-104 | 3 | P0 | T2 | Ready | Update manifest and enforcement contract | PD-003 |
-| APP-105 | 4 | P1 | T1 | Ready | PDF Unicode font support | None |
+| APP-103 | 3 | P1 | T2 | Integrated; device proof required | Android permission minimization | None |
+| APP-104 | 3 | P0 | T2 | Contract frozen | Update manifest and enforcement contract | PD-003; PD-005 |
+| APP-105 | 4 | P1 | T1 | In progress | PDF Unicode font support | None |
 | APP-106 | 4 | P0 | T2 | Draft | Shared-device session hardening | Shared-device policy |
 | APP-107 | 5 | P0 | T2 | Blocked | Update publishing and hosting workflow | APP-104; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Draft | User provisioning and lifecycle MVP | Administration-surface decision |
-| APP-109 | 7 | P1 | T2 | Ready | Durable managed-file cleanup reconciliation | None |
-| APP-110 | 8 | P0 | T3 | Ready for design | Sync-safe permanent warranty deletion | PD-001 |
-| APP-111 | 8 | P0 | T3 | Ready for design | Last-write-wins synchronization | PD-002; clock policy |
+| APP-109 | 7 | P1 | T2 | In progress | Durable managed-file cleanup reconciliation | None |
+| APP-110 | 8 | P0 | T3 | Contract frozen; blocked | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
+| APP-111 | 8 | P0 | T3 | Contract design in progress | Last-write-wins synchronization | PD-002; clock policy |
 | APP-112 | 8 | P1 | T2 | Pending | Sync status and recovery UX | APP-111 |
 | APP-113 | 9 | P0 | T3 | Pending | Optional and required Android updater | APP-104; APP-107 test endpoint |
 
@@ -69,6 +69,13 @@ Acceptance:
 - Host allowlist, checksum, version monotonicity, cache, and failure behavior are explicit.
 
 Gates: schema fixtures, parser contract tests, and security review.
+
+Frozen contract summary:
+
+- Versioned strict schema with immutable HTTPS APK URL, exact host/path allowlist, SHA-256, byte size, monotonically increasing version code and manifest revision, publication time, and release notes.
+- States are disabled, current, optional, required, malformed, and offline/fetch failure.
+- Malformed or unreachable metadata cannot create a new block. A previously validated required policy remains enforced offline under PD-005.
+- APP-107 publishes immutable artifacts before atomically replacing the no-store manifest. APP-113 verifies size, hash, package ID, version code, and release certificate before installation.
 
 ### APP-105 — PDF Unicode font support
 
@@ -148,6 +155,26 @@ Acceptance:
 - A new warranty can be created only after the confirmed deletion succeeds.
 
 Gates: T3 authorization, offline-resurrection, concurrent replacement, file-failure, idempotency, migration, and independent verification.
+
+Frozen contract summary:
+
+- Online, server-authoritative deletion with a named, version-bound confirmation and idempotency key.
+- Permanently retained minimal tenant tombstone with a monotonic sequence cursor; tombstones always beat later edits.
+- Atomic replacement locks the client, tombstones the confirmed old warranty, queues managed-file cleanup, hard-deletes the old row, and creates the new active warranty in one transaction.
+- Flutter applies tombstones before live updates and clears dirty state only from per-change outcomes.
+- APP-109 is a hard dependency for the transactional cleanup outbox and operator reconciliation path.
+
+## Active manager program
+
+| Task | Owner | Execution task | Baseline / result |
+| :--- | :--- | :--- | :--- |
+| APP-101 | Portfolio manager | `019fb3a7-ec62-7302-af36-fefc0667e8bc` | Integrated as `b7ac581`; focused tests and analyze pass |
+| APP-103 | Portfolio manager | `019fb3a7-ec63-7dd2-b9d8-5c653622d49f` | Integrated as `b29b631`; automated gates pass, device proof pending |
+| APP-104 | Portfolio manager | `019fb3a7-ec62-7302-af36-ff12211ab995` | Read-only contract frozen against `54b5c5b` |
+| APP-105 | Portfolio manager | `019fb3ac-5e7b-73b3-80f9-a8d3b42e2c77` | Isolated Flutter/PDF worktree |
+| APP-109 | Portfolio manager | `019fb3b0-1b41-7971-8506-629401f2cf41` | Isolated backend worktree |
+| APP-110 | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen; waits for APP-109 |
+| APP-111 | Portfolio manager | `019fb3b0-1b41-7971-8506-627611c50f1e` | Read-only T3 contract design |
 
 ### APP-111 — Last-write-wins synchronization
 
