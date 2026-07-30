@@ -208,6 +208,12 @@ Integrated evidence at `7319450`:
 - APP-109 disposable SQLite migration: forward creates the cleanup table and due index; undo retains the table/data surface and removes only the due index; reapply succeeds; a second forward run is a no-op.
 - PostgreSQL migration rehearsal and the APP-103 physical-device permission scenario remain release evidence, not local completion blockers.
 
+Current integrated checkpoint after APP-102 and the final APP-104 hardening:
+
+- Backend `npm run verify`: lint exits with 91 warnings and no errors; 15 suites / 65 tests pass; TypeScript build passes.
+- Flutter `flutter test && flutter analyze`: 122 tests pass; analysis reports no issues.
+- APP-110 remains excluded from this checkpoint until its failed T3 candidate is remediated and independently reverified.
+
 ### APP-111 — Last-write-wins synchronization
 
 Objective: make the newest valid edit win deterministically across devices.

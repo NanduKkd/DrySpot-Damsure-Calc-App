@@ -44,6 +44,7 @@ The local `codex/product-roadmap` integration lane now includes APP-101 measurem
 - APP-109 forward/undo/reapply/idempotent migration behavior passes against a disposable SQLite database. PostgreSQL-copy proof remains required before deployment.
 - APP-103 still requires the planned physical-device photo-picker/camera/location permission scenario.
 - APP-104's initial exact-tip review passed 14 focused tests and 70 adversarial parser assertions. A separately verified hardening follow-up adds collision-free canonical JSON policy identity and strict disabled/legacy high-water transitions; its 17 focused tests and 21 independent transition/collision assertions pass with clean analysis and formatting.
+- Current manager-branch gate after APP-102/APP-104 integration: backend 15 suites / 65 tests and TypeScript build pass with lint warnings only; Flutter 122 tests pass and analysis reports no issues. APP-110 is deliberately not included in this checkpoint.
 
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
