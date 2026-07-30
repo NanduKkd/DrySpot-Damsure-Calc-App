@@ -5,6 +5,7 @@ import { Franchisee, User, UserAdminAuditEvent, sequelize } from '../models';
 const tenantA = '10000000-0000-4000-8000-000000000001';
 const tenantB = '20000000-0000-4000-8000-000000000002';
 const actor: AdminActor = { actor: 'operator-a', uid: 1001, authMode: 'test', franchiseeIds: [tenantA] };
+const tenantBActor: AdminActor = { actor: 'operator-b', uid: 1002, authMode: 'test', franchiseeIds: [tenantB] };
 const key = (suffix: string) => `40000000-0000-4000-8000-${suffix.padStart(12, '0')}`;
 const request = (action: 'create' | 'deactivate' | 'reactivate' | 'revoke-all-tokens' | 'reset-password', suffix: string, extra = {}) => ({
   action, franchiseeId: tenantA, email: '  Operator@Example.COM ', reason: 'APP-108 test', idempotencyKey: key(suffix), name: 'Operator Name', ...extra,
@@ -120,7 +121,7 @@ describe('APP-108 user administration', () => {
     await expect(service.auditEvents(actor, tenantB)).rejects.toMatchObject({ code: 'OUT_OF_SCOPE' });
   });
 
-  it('uses an opaque decimal sequence cursor without tenant leakage, duplicates, or precision loss', async () => {
+  it('uses a tenant-bound decimal sequence cursor without tenant leakage, skips, or precision loss', async () => {
     const createAudit = (id: string, idempotencyKey: string, franchiseeId: string, auditSequence: string) => UserAdminAuditEvent.create({
       id, idempotencyKey, canonicalRequestSha256: 'a'.repeat(64), auditSequence, actor: 'cursor-test', actorUid: 1001, authMode: 'test', scopeSnapshot: { franchiseeIds: [franchiseeId] }, action: 'create', targetUserId: null, normalizedEmail: `${id}@example.com`, franchiseeId, reason: 'cursor test', outcome: 'succeeded', reasonCode: 'APPLIED', beforeState: null, afterState: { isActive: true, tokenVersion: 0 }, hostname: 'test', appVersion: 'test', createdAt: new Date('2035-01-01T00:00:00.123Z'),
     });
@@ -130,14 +131,23 @@ describe('APP-108 user administration', () => {
     await createAudit(latest, key('30'), tenantA, '9007199254740995');
     await createAudit(sameLow, key('31'), tenantA, '9007199254740993');
     await createAudit(sameHigh, key('32'), tenantA, '9007199254740994');
-    await createAudit('90000000-0000-4000-8000-000000000004', key('33'), tenantB, '9007199254740996');
+    const foreignLatest = '90000000-0000-4000-8000-000000000004';
+    await createAudit(foreignLatest, key('33'), tenantB, '9007199254740992');
+    await createAudit('90000000-0000-4000-8000-000000000005', key('34'), tenantB, '9007199254740991');
     const first = await service.auditEvents(actor, tenantA, 1);
-    expect(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')).toBe('{"sequence":"9007199254740995"}');
+    expect(Buffer.from(first.nextCursor!, 'base64url').toString('utf8')).toBe(`{"franchiseeId":"${tenantA}","sequence":"9007199254740995"}`);
     const second = await service.auditEvents(actor, tenantA, 1, first.nextCursor);
     const third = await service.auditEvents(actor, tenantA, 1, second.nextCursor);
     expect([first.events[0].id, second.events[0].id, third.events[0].id]).toEqual([latest, sameHigh, sameLow]);
     expect(new Set([first.events[0].id, second.events[0].id, third.events[0].id]).size).toBe(3);
     expect(first.events[0].auditSequence).toBe('9007199254740995');
+    const legacyCursor = Buffer.from(JSON.stringify({ sequence: '9007199254740994' })).toString('base64url');
+    expect((await service.auditEvents(actor, tenantA, 1, legacyCursor)).events[0].id).toBe(sameLow);
+    const foreignCursor = (await service.auditEvents(tenantBActor, tenantB, 1)).nextCursor;
+    expect(Buffer.from(foreignCursor!, 'base64url').toString('utf8')).toContain(tenantB);
+    await expect(service.auditEvents(actor, tenantA, 1, foreignCursor)).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
+    const foreignLegacyCursor = Buffer.from(JSON.stringify({ sequence: '9007199254740992' })).toString('base64url');
+    await expect(service.auditEvents(actor, tenantA, 1, foreignLegacyCursor)).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
     await expect(service.auditEvents(actor, tenantA, 1, 'not-a-cursor')).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });
     const future = Buffer.from(JSON.stringify({ sequence: '9223372036854775807' })).toString('base64url');
     await expect(service.auditEvents(actor, tenantA, 1, future)).rejects.toMatchObject({ code: 'INVALID_AUDIT_CURSOR' });

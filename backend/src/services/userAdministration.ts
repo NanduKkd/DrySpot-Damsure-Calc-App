@@ -41,15 +41,19 @@ const snapshot = (user: User | null) => user ? { isActive: user.isActive, tokenV
 const publicUser = (user: User) => ({ id: user.id, email: normalizeUserEmail(user.email), franchiseeId: user.franchiseeId, isActive: user.isActive, tokenVersion: user.tokenVersion });
 const isEmail = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && Buffer.byteLength(email, 'utf8') <= 320;
 const MAX_AUDIT_SEQUENCE = 9223372036854775807n;
-type AuditCursor = { sequence: string };
+type AuditCursor = { sequence: string; franchiseeId?: string };
 
-const encodeAuditCursor = (sequence: string): string => Buffer.from(JSON.stringify({ sequence })).toString('base64url');
+const encodeAuditCursor = (franchiseeId: string, sequence: string): string =>
+  Buffer.from(JSON.stringify({ franchiseeId, sequence })).toString('base64url');
 
 const decodeAuditCursor = (value: string): AuditCursor => {
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as AuditCursor;
     const sequence = BigInt(parsed.sequence);
-    if (!/^[1-9]\d*$/.test(parsed.sequence) || sequence > MAX_AUDIT_SEQUENCE || sequence.toString() !== parsed.sequence) throw new Error('invalid');
+    if (
+      !/^[1-9]\d*$/.test(parsed.sequence) || sequence > MAX_AUDIT_SEQUENCE || sequence.toString() !== parsed.sequence
+      || (parsed.franchiseeId !== undefined && !isUuid(parsed.franchiseeId))
+    ) throw new Error('invalid');
     return parsed;
   } catch (_) { throw new UserAdminError('INVALID_AUDIT_CURSOR'); }
 };
@@ -227,13 +231,14 @@ export class UserAdministrationService {
     const whereClause: Record<string | symbol, unknown> = { franchiseeId };
     if (cursor) {
       const point = decodeAuditCursor(cursor);
-      const newest = await UserAdminAuditEvent.findOne({
-        where: { franchiseeId }, order: [['auditSequence', 'DESC']],
-        attributes: [[sequelize.literal('CAST(audit_sequence AS TEXT)'), 'auditSequenceText']], raw: true,
-      }) as unknown as Record<string, unknown> | null;
-      // A cursor can only originate from an immutable event in this tenant.
-      // Reject a made-up future value rather than treating it as the first page.
-      if (!newest || BigInt(point.sequence) > BigInt(String(newest.auditSequenceText))) throw new UserAdminError('INVALID_AUDIT_CURSOR');
+      if (point.franchiseeId && point.franchiseeId !== franchiseeId) throw new UserAdminError('INVALID_AUDIT_CURSOR');
+      // New cursors carry a tenant binding. Sequence-only cursors from the
+      // previous format remain valid only when their immutable anchor belongs
+      // to this tenant, so they cannot suppress newer tenant-local events.
+      const anchor = await UserAdminAuditEvent.findOne({
+        where: { franchiseeId, auditSequence: point.sequence }, attributes: ['id'], raw: true,
+      });
+      if (!anchor) throw new UserAdminError('INVALID_AUDIT_CURSOR');
       whereClause.auditSequence = { [Op.lt]: point.sequence };
     }
     const cappedLimit = Math.min(Math.max(limit, 1), 100);
@@ -254,7 +259,7 @@ export class UserAdministrationService {
         delete values.auditSequenceText;
         return { ...values, auditSequence } as AuditEventOutput;
       }),
-      nextCursor: rows.length > cappedLimit ? encodeAuditCursor(String(events[events.length - 1].auditSequenceText)) : undefined,
+      nextCursor: rows.length > cappedLimit ? encodeAuditCursor(franchiseeId, String(events[events.length - 1].auditSequenceText)) : undefined,
     };
   }
 }

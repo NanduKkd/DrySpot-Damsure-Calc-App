@@ -33,6 +33,7 @@ const database = new Sequelize(databaseUrl, {
 const tenantA = '10000000-0000-4000-8000-000000000001';
 const tenantB = '20000000-0000-4000-8000-000000000002';
 const actor = { actor: 'proof-operator', uid: 1001, authMode: 'proof', franchiseeIds: [tenantA] };
+const tenantBActor = { actor: 'proof-operator-b', uid: 1002, authMode: 'proof', franchiseeIds: [tenantB] };
 const request = (action, key, extra = {}) => ({ action, franchiseeId: tenantA, email: 'proof@example.com', reason: 'APP-108 PostgreSQL proof', idempotencyKey: key, name: 'Proof User', ...extra });
 
 const expectReject = async (promise, label) => {
@@ -122,7 +123,8 @@ const main = async () => {
     ('30000000-0000-4000-8000-000000000020', '40000000-0000-4000-8000-000000000020', repeat('b', 64), 9007199254740993, '2035-01-01T00:00:00.123700Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-a@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
     ('30000000-0000-4000-8000-000000000021', '40000000-0000-4000-8000-000000000021', repeat('c', 64), 9007199254740994, '2035-01-01T00:00:00.123800Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-b@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
     ('30000000-0000-4000-8000-000000000022', '40000000-0000-4000-8000-000000000022', repeat('d', 64), 9007199254740995, '2035-01-01T00:00:00.123900Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'cursor-c@example.com', :tenant, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
-    ('30000000-0000-4000-8000-000000000023', '40000000-0000-4000-8000-000000000023', repeat('e', 64), 9007199254740996, '2035-01-01T00:00:00.123950Z', 'proof-operator', 1001, 'proof', '{}'::jsonb, 'create', 'foreign-cursor@example.com', :tenantB, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1')`, { replacements: { tenant: tenantA, tenantB } });
+    ('30000000-0000-4000-8000-000000000023', '40000000-0000-4000-8000-000000000023', repeat('e', 64), 9007199254740992, '2035-01-01T00:00:00.123950Z', 'proof-operator-b', 1002, 'proof', '{}'::jsonb, 'create', 'foreign-cursor@example.com', :tenantB, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1'),
+    ('30000000-0000-4000-8000-000000000024', '40000000-0000-4000-8000-000000000024', repeat('f', 64), 9007199254740991, '2035-01-01T00:00:00.123960Z', 'proof-operator-b', 1002, 'proof', '{}'::jsonb, 'create', 'foreign-cursor-old@example.com', :tenantB, 'cursor', 'succeeded', 'APPLIED', 'proof', 'abcdef1')`, { replacements: { tenant: tenantA, tenantB } });
   const cursorA = await service.auditEvents(actor, tenantA, 1);
   const cursorB = await service.auditEvents(actor, tenantA, 1, cursorA.nextCursor);
   const cursorC = await service.auditEvents(actor, tenantA, 1, cursorB.nextCursor);
@@ -130,13 +132,17 @@ const main = async () => {
     '30000000-0000-4000-8000-000000000022', '30000000-0000-4000-8000-000000000021', '30000000-0000-4000-8000-000000000020',
   ], 'microsecond-distinct events must page without skips or duplicates');
   assert.equal(cursorA.events[0].auditSequence, '9007199254740995', 'audit sequence must serialize safely above 2^53');
+  const cursorForTenantB = await service.auditEvents(tenantBActor, tenantB, 1);
+  await expectReject(service.auditEvents(actor, tenantA, 1, cursorForTenantB.nextCursor), 'foreign tenant-bound cursor must not skip tenant A events');
+  const foreignLegacyCursor = Buffer.from(JSON.stringify({ sequence: '9007199254740992' })).toString('base64url');
+  await expectReject(service.auditEvents(actor, tenantA, 1, foreignLegacyCursor), 'foreign legacy cursor must not skip tenant A events');
   runSequelizeCli('db:migrate:undo');
   assert.equal(Number((await database.query('SELECT COUNT(*) AS count FROM user_admin_audit_events', { type: QueryTypes.SELECT }))[0].count) > 0, true, 'additive down must retain audit data');
   runSequelizeCli('db:migrate');
   await expectReject(database.query(`UPDATE user_admin_audit_events SET reason = 'mutated after reapply'`), 'append-only update trigger after reapply');
   await expectReject(database.query('DELETE FROM user_admin_audit_events'), 'append-only delete trigger after reapply');
   assert.deepEqual(await database.query('SELECT name FROM "SequelizeMeta" ORDER BY name', { type: QueryTypes.SELECT }), [...priorMigrationNames, auditSequenceMigrationName].map((name) => ({ name })));
-  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', sequelize_meta_additive_path: 'passed', guarded_legacy_rollback: 'passed', guarded_legacy_upgrade: 'passed', transactional_catalog_reads: 'passed', normalized_legacy_login: 'passed', audit_sequence_backfill: 'passed', microsecond_cursor: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
+  process.stdout.write(`${JSON.stringify({ dialect: database.getDialect(), collision_redacted: 'passed', sequelize_meta_additive_path: 'passed', guarded_legacy_rollback: 'passed', guarded_legacy_upgrade: 'passed', transactional_catalog_reads: 'passed', normalized_legacy_login: 'passed', audit_sequence_backfill: 'passed', microsecond_cursor: 'passed', tenant_bound_cursor: 'passed', forward: 'passed', idempotent: 'passed', advisory_idempotency: 'passed', tenancy: 'passed', lifecycle: 'passed', append_only: 'passed', down_non_destructive: 'passed', reapply: 'passed' })}\n`);
 };
 
 main().finally(() => database.close()).catch((error) => { console.error(error); process.exitCode = 1; });
