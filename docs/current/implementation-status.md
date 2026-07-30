@@ -37,12 +37,13 @@ The next delivery program is documented in three durable records:
 
 ### Active delivery integration (2026-07-30)
 
-The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-103 Android permission minimization, APP-105 Unicode PDF fonts, and APP-109 durable managed-file cleanup. APP-110 and APP-102 are active in isolated worktrees; APP-104 and APP-111 contracts are frozen.
+The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-102 measurement deletion confirmation, APP-103 Android permission minimization, APP-104 strict update-manifest parsing, APP-105 Unicode PDF fonts, and APP-109 durable managed-file cleanup. APP-110 is active in an isolated T3 worktree; APP-106, APP-108, APP-111, and APP-112 contracts are frozen.
 
 - Integrated backend gate: lint exits successfully with warnings; 15 suites / 65 tests pass; build passes.
 - Integrated Flutter gate: 102 tests pass; `flutter analyze` reports no issues.
 - APP-109 forward/undo/reapply/idempotent migration behavior passes against a disposable SQLite database. PostgreSQL-copy proof remains required before deployment.
 - APP-103 still requires the planned physical-device photo-picker/camera/location permission scenario.
+- APP-104's exact-tip independent review passed 14 focused tests, 70 adversarial parser assertions, targeted analysis/format checks, and strict schema, origin, timestamp, numeric-bound, required-reason, legacy-response, classification, and anti-rollback verification.
 
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
