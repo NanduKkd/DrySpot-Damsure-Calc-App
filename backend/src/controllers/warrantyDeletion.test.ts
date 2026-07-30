@@ -11,7 +11,10 @@ import {
 	WarrantyDeletionTombstone,
 	sequelize,
 } from '../models';
-import { irreversibleWarrantyConfirmation } from '../services/warrantyLifecycle';
+import {
+	irreversibleWarrantyConfirmation,
+	warrantyReplacementConflict,
+} from '../services/warrantyLifecycle';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const samplePdf = Buffer.from('%PDF-1.4\nAPP-110 test\n%%EOF');
@@ -550,30 +553,54 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		expect(await WarrantyDeletionTombstone.count({ where: { warrantyId: oldId } })).toBe(1);
 	});
 
-	it('rejects malformed replacement identity before mutation and globally reserved targets', async () => {
+	it('returns one opaque conflict for every unavailable replacement target without mutation', async () => {
 		const replacementClientId = '10000000-0000-0000-0000-000000000034';
 		const oldId = '10000000-0000-0000-0000-000000000035';
-		const reservedTargetId = '20000000-0000-4000-8000-000000000036';
-		const liveReservedTargetId = '20000000-0000-4000-8000-000000000037';
+		const foreignTombstonedTargetId = '20000000-0000-4000-8000-000000000036';
+		const foreignLiveTargetId = '20000000-0000-4000-8000-000000000037';
+		const ownHistoricalTargetId = '10000000-0000-4000-8000-000000000038';
+		const ownActiveTargetId = '10000000-0000-4000-8000-000000000039';
+		const raceTargetId = '10000000-0000-4000-8000-000000000090';
+		const availableTargetId = '10000000-0000-4000-8000-000000000091';
+		const sourceStorageKey = 'replacement-conflict-source.pdf';
 		await Client.create({
 			id: replacementClientId,
 			name: 'Reserved target client',
 			franchiseeId: tenantId,
 		});
-		const old = await createWarranty(oldId, replacementClientId);
+		const old = await createWarranty(oldId, replacementClientId, {
+			pdfFileName: sourceStorageKey,
+		});
+		await Client.create({
+			id: '10000000-0000-0000-0000-000000000036',
+			name: 'Own active target client',
+			franchiseeId: tenantId,
+		});
+		await Client.create({
+			id: '20000000-0000-0000-0000-000000000036',
+			name: 'Foreign live target client',
+			franchiseeId: otherTenantId,
+		});
 		await WarrantyDeletionTombstone.create({
-			warrantyId: reservedTargetId,
+			warrantyId: foreignTombstonedTargetId,
 			franchiseeId: otherTenantId,
 			deletionSequence: '900000',
 			deletedAt: new Date('2026-07-30T00:00:00.000Z'),
 		});
-		await createWarranty(liveReservedTargetId, otherClientId);
+		await WarrantyDeletionTombstone.create({
+			warrantyId: ownHistoricalTargetId,
+			franchiseeId: tenantId,
+			deletionSequence: '900001',
+			deletedAt: new Date('2026-07-30T00:00:00.000Z'),
+		});
+		await createWarranty(foreignLiveTargetId, '20000000-0000-0000-0000-000000000036');
+		await createWarranty(ownActiveTargetId, '10000000-0000-0000-0000-000000000036');
 
-		const upload = (targetWarrantyId?: string) => {
+		const upload = (targetWarrantyId: string | undefined, key: string) => {
 			let pending = request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
-				.set('Idempotency-Key', 'reserved-target-replacement-key')
+				.set('Idempotency-Key', key)
 				.field('client_id', replacementClientId)
 				.field('start_date', '2026-07-30T00:00:00.000Z')
 				.field('duration_years', '5')
@@ -594,25 +621,57 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			});
 		};
 
-		for (const malformedTarget of [undefined, '', 'not-a-uuid']) {
-			const response = await upload(malformedTarget);
-			expect(response.status).toBe(422);
-			expect(response.body.code).toBe('confirmation_invalid');
+		for (const [targetWarrantyId, key] of [
+			[undefined, 'missing-target-key'],
+			['', 'empty-target-key'],
+			['not-a-uuid', 'malformed-target-key'],
+		] as const) {
+			const malformed = await upload(targetWarrantyId, key);
+			expect(malformed.status).toBe(422);
+			expect(malformed.body.code).toBe('confirmation_invalid');
+		}
+
+		const collisions = [];
+		for (const [targetWarrantyId, key] of [
+			[foreignLiveTargetId, 'foreign-live-target-key'],
+			[foreignTombstonedTargetId, 'foreign-tombstoned-target-key'],
+			[ownHistoricalTargetId, 'own-historical-target-key'],
+			[ownActiveTargetId, 'own-active-target-key'],
+		]) {
+			collisions.push(await upload(targetWarrantyId, key));
+		}
+		const databaseCollision = Object.assign(new Error('sensitive database uniqueness detail'), {
+			name: 'SequelizeUniqueConstraintError',
+			original: { code: '23505', constraint: 'sensitive_constraint_name' },
+		});
+		const create = jest.spyOn(Warranty, 'create').mockRejectedValueOnce(databaseCollision);
+		try {
+			collisions.push(await upload(raceTargetId, 'database-race-target-key'));
+		} finally {
+			create.mockRestore();
+		}
+
+		const expectedBody = {
+			error: warrantyReplacementConflict.message,
+			code: warrantyReplacementConflict.code,
+		};
+		const expectedBytes = JSON.stringify(expectedBody);
+		for (const collision of collisions) {
+			expect(collision.status).toBe(409);
+			expect(collision.body).toEqual(expectedBody);
+			expect(collision.text).toBe(expectedBytes);
 		}
 		expect(await Warranty.findByPk(old.id)).not.toBeNull();
 		expect(await WarrantyDeletionTombstone.findByPk(old.id)).toBeNull();
+		expect(await ManagedFileCleanup.count({ where: { storageKey: sourceStorageKey } })).toBe(0);
+		expect(await Warranty.findByPk(foreignLiveTargetId)).not.toBeNull();
+		expect(await Warranty.findByPk(ownActiveTargetId)).not.toBeNull();
+		expect(await WarrantyDeletionTombstone.findByPk(foreignTombstonedTargetId)).not.toBeNull();
+		expect(await WarrantyDeletionTombstone.findByPk(ownHistoricalTargetId)).not.toBeNull();
 
-		const liveReserved = await upload(liveReservedTargetId);
-		expect(liveReserved.status).toBe(409);
-		expect(liveReserved.body.code).toBe('warranty_id_reserved');
-		expect(await Warranty.findByPk(old.id)).not.toBeNull();
-		expect(await Warranty.findByPk(liveReservedTargetId)).not.toBeNull();
-
-		const reserved = await upload(reservedTargetId);
-		expect(reserved.status).toBe(409);
-		expect(reserved.body.code).toBe('warranty_id_reserved');
-		expect(await Warranty.findByPk(old.id)).not.toBeNull();
-		expect(await Warranty.findByPk(reservedTargetId, { paranoid: false })).toBeNull();
+		const available = await upload(availableTargetId, 'available-target-key');
+		expect(available.status).toBe(201);
+		expect(available.body.id).toBe(availableTargetId);
 	});
 
 	it('emits permanent warranty tombstones when a client is deleted', async () => {

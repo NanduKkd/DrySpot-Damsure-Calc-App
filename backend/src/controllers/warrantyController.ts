@@ -13,6 +13,7 @@ import {
 	warrantyRequestDigest,
 	WarrantyConfirmation,
 	WarrantyLifecycleError,
+	warrantyReplacementConflict,
 } from '../services/warrantyLifecycle';
 
 const pdfUrlFor = (id: string) => `/api/warranty/${id}/download`;
@@ -89,6 +90,28 @@ const invalidConfirmationResponse = (res: Response) =>
 		error: 'Named, version-bound irreversible confirmation is required',
 		code: 'confirmation_invalid',
 	});
+
+const replacementConflictResponse = (res: Response) =>
+	res.status(409).json({
+		error: warrantyReplacementConflict.message,
+		code: warrantyReplacementConflict.code,
+	});
+
+const isDatabaseWarrantyConflict = (error: unknown) => {
+	if (typeof error !== 'object' || error === null) return false;
+	const candidate = error as {
+		name?: unknown;
+		original?: { code?: unknown };
+		parent?: { code?: unknown };
+	};
+	return (
+		candidate.name === 'SequelizeUniqueConstraintError' ||
+		candidate.original?.code === '23505' ||
+		candidate.parent?.code === '23505' ||
+		candidate.original?.code === 'SQLITE_CONSTRAINT' ||
+		candidate.parent?.code === 'SQLITE_CONSTRAINT'
+	);
+};
 
 const lifecycleErrorResponse = (res: Response, error: unknown) => {
 	if (!(error instanceof WarrantyLifecycleError)) return false;
@@ -185,6 +208,13 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 		});
 	} catch (error: any) {
 		await removeUploadedFile(file);
+		if (
+			(error instanceof WarrantyLifecycleError &&
+				error.code === warrantyReplacementConflict.code) ||
+			(confirmation && isDatabaseWarrantyConflict(error))
+		) {
+			return replacementConflictResponse(res);
+		}
 		if (lifecycleErrorResponse(res, error)) return;
 		if (error?.name === 'SequelizeUniqueConstraintError') {
 			return res.status(409).json({

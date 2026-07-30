@@ -21,6 +21,11 @@ export type WarrantyConfirmation = {
 
 export type WarrantyIdempotencyAction = 'delete' | 'replace';
 
+export const warrantyReplacementConflict = {
+	code: 'warranty_conflict',
+	message: 'Warranty replacement could not be completed. Retry or contact support.',
+} as const;
+
 export type NewWarrantyValues = {
 	id: string;
 	clientId: string;
@@ -83,6 +88,7 @@ export class WarrantyLifecycleError extends Error {
 			| 'stale_confirmation'
 			| 'confirmation_required'
 			| 'idempotency_conflict'
+			| 'warranty_conflict'
 			| 'warranty_id_reserved'
 			| 'invariant_violation',
 		message: string,
@@ -579,8 +585,8 @@ export const createOrReplaceConfirmedWarranty = async ({
 
 		if (await lockWarrantyUuidReservation(values.id, transaction)) {
 			throw new WarrantyLifecycleError(
-				'warranty_id_reserved',
-				'The new warranty UUID is permanently reserved.',
+				warrantyReplacementConflict.code,
+				warrantyReplacementConflict.message,
 			);
 		}
 
