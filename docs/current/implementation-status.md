@@ -2,12 +2,12 @@
 
 ## Current reconciliation (2026-07)
 
-The integrated backend and Flutter implementation has passed automated and production-copy migration verification. Production deployment and Android publication remain separately gated.
+The integrated backend and Flutter implementation has passed automated, production-copy, and controlled production verification. Android publication remains separately gated.
 
 - Backend: authenticated tenant-scoped sync, user activation/token-version revocation, public-registration removal, default-price sync, managed PDF metadata/files, one-active-warranty enforcement, and portable client photos are implemented.
 - Flutter: PDF/warranty/proposal flows, local migration behavior, and sync support are implemented and validated by the current automated suite.
 - Android release configuration blocks cleartext traffic and a local signed release APK has passed signing verification. The artifact has not been published.
-- The release branch is pushed in a draft pull request. No production deployment, APK publication, real-device pilot, or updater rollout has occurred. HTTPS hosting exposes only a disabled, non-actionable release manifest.
+- Release-hardening PR #1 and inline-measurement PR #2 are merged. Production runs combined `main` commit `369ce46`; no APK publication, real-device pilot, or updater rollout has occurred. HTTPS hosting exposes only a disabled, non-actionable release manifest.
 
 ### Current evidence
 
@@ -17,6 +17,7 @@ The integrated backend and Flutter implementation has passed automated and produ
 | Flutter verification | 99 tests pass; `flutter analyze` exits 0 with no issues. Coverage includes one-time ownership assignment for SQLite v7 default-price rows and safe behavior when a photo upload only partially succeeds. |
 | Android signing verification | `flutter build apk --release` passes. The resulting APK passed `apksigner` v2 verification with an RSA-4096 certificate; its SHA-256 is recorded in test results. It was not published. |
 | Migration confidence | PASS against a disposable PostgreSQL database restored from the production backup: forward migration, both active-warranty uniqueness guards, old-process duplicate-write rejection, non-destructive undo, reapply, and idempotent rerun were verified. The disposable database was removed; the root-only production backup was retained. |
+| Production backend | DEPLOYED at `369ce46`: a fresh root-only database backup and environment backup were created, the weak JWT secret was rotated to 64 characters, `.env` was restricted to `0600`, the migration is recorded once, all 5 required columns and both warranty indexes exist, PM2 is online, local/public health return `200`, public registration returns `404`, invalid login returns `401`, and the production worktree is clean. |
 | Release hosting | `https://damsure.nandakrishnan.in/releases/manifest.json` serves an unavailable manifest over valid HTTPS; HSTS is enabled, the server version is hidden, directory listing and missing artifacts return `404`, and the API remains healthy. |
 
 ### Remaining release gates
