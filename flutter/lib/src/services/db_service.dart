@@ -5,6 +5,7 @@ import '../models/item.dart';
 import '../models/rectangle.dart';
 import '../models/default_price.dart';
 import '../models/warranty.dart';
+import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
 
 class DbService {
@@ -30,7 +31,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 8,
+      version: 9,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
@@ -60,6 +61,21 @@ class DbService {
     if (oldVersion < 8) {
       await db
           .execute('ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT');
+    }
+    if (oldVersion < 9 && newVersion >= 9) {
+      final warrantyColumns =
+          await db.rawQuery('PRAGMA table_info(warranties)');
+      if (!warrantyColumns
+          .any((column) => column['name'] == 'server_version')) {
+        await db.execute(
+          'ALTER TABLE warranties ADD COLUMN server_version INTEGER NOT NULL DEFAULT 1',
+        );
+      }
+      await _createWarrantyDeletionTombstonesTable(db);
+      // Pre-APP-110 local soft deletes are not authoritative deletion requests.
+      // Removing them prevents an old device from initiating deletion through
+      // sync; the server's live row or permanent tombstone will converge later.
+      await db.delete('warranties', where: 'deleted_at IS NOT NULL');
     }
   }
 
@@ -116,6 +132,7 @@ class DbService {
 
     await _createDefaultPricesTable(db);
     await _createWarrantiesTable(db);
+    await _createWarrantyDeletionTombstonesTable(db);
     await _createProposalsTable(db);
   }
 
@@ -144,11 +161,29 @@ class DbService {
         start_date TEXT,
         duration_years INTEGER,
         pdf_url TEXT,
+        server_version INTEGER NOT NULL DEFAULT 1,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
         FOREIGN KEY (client_id) REFERENCES clients (local_id) ON DELETE CASCADE
       )
+    ''');
+  }
+
+  static Future<void> _createWarrantyDeletionTombstonesTable(
+      Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS warranty_deletion_tombstones (
+        warranty_id TEXT NOT NULL,
+        franchisee_id TEXT NOT NULL,
+        deletion_sequence TEXT NOT NULL,
+        deleted_at TEXT NOT NULL,
+        PRIMARY KEY (franchisee_id, warranty_id)
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS warranty_deletion_tombstones_tenant_cursor
+      ON warranty_deletion_tombstones (franchisee_id, deletion_sequence)
     ''');
   }
 
@@ -405,14 +440,83 @@ class DbService {
     );
   }
 
-  Future<int> softDeleteWarranty(int localId) async {
+  Future<int> hardDeleteWarranty(int localId) async {
     final db = await database;
-    return await db.update(
+    return db.delete(
       'warranties',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
       where: 'local_id = ?',
       whereArgs: [localId],
     );
+  }
+
+  Future<int> hardDeleteWarrantyByRemoteId(String remoteId) async {
+    final db = await database;
+    return db.delete(
+      'warranties',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
+  }
+
+  Future<void> replaceWarrantyFromServer(Warranty warranty) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      await transaction.delete(
+        'warranties',
+        where: 'client_id = ? AND remote_id <> ?',
+        whereArgs: [warranty.clientId, warranty.remoteId],
+      );
+      final existing = await transaction.query(
+        'warranties',
+        columns: ['local_id'],
+        where: 'remote_id = ?',
+        whereArgs: [warranty.remoteId],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        await transaction.insert('warranties', warranty.toMap());
+      } else {
+        await transaction.update(
+          'warranties',
+          warranty.copyWith(localId: existing.first['local_id'] as int).toMap(),
+          where: 'remote_id = ?',
+          whereArgs: [warranty.remoteId],
+        );
+      }
+    });
+  }
+
+  Future<void> applyWarrantyTombstone(
+    WarrantyDeletionTombstone tombstone,
+  ) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      await transaction.insert(
+        'warranty_deletion_tombstones',
+        tombstone.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await transaction.delete(
+        'warranties',
+        where: 'remote_id = ?',
+        whereArgs: [tombstone.warrantyId],
+      );
+    });
+  }
+
+  Future<bool> hasWarrantyTombstone(
+    String warrantyId, {
+    required String franchiseeId,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'warranty_deletion_tombstones',
+      columns: ['warranty_id'],
+      where: 'franchisee_id = ? AND warranty_id = ?',
+      whereArgs: [franchiseeId, warrantyId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
   }
 
   // Proposal CRUD

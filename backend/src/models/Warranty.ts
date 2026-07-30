@@ -2,65 +2,72 @@ import { DataTypes, Model } from 'sequelize';
 import sequelize from '../config/database';
 
 export class Warranty extends Model {
-  public id!: string;
-  public clientId!: string;
-  public warrantyCardNumber!: string;
-  public startDate!: Date;
-  public durationYears!: number;
-  public pdfUrl!: string;
-  public pdfFileName!: string;
-  /** Non-null only for the one currently active warranty for a client. */
-  public activeClientId!: string | null;
-  public readonly createdAt!: Date;
-  public readonly updatedAt!: Date;
-  public readonly deletedAt!: Date;
+	public id!: string;
+	public clientId!: string;
+	public warrantyCardNumber!: string;
+	public startDate!: Date;
+	public durationYears!: number;
+	public pdfUrl!: string;
+	public pdfFileName!: string;
+	/** Server-owned optimistic version used by destructive confirmations. */
+	public version!: number;
+	/** Non-null only for the one currently active warranty for a client. */
+	public activeClientId!: string | null;
+	public readonly createdAt!: Date;
+	public readonly updatedAt!: Date;
+	public readonly deletedAt!: Date;
 }
 
 Warranty.init(
-  {
-    id: {
-      type: DataTypes.UUID,
-      defaultValue: DataTypes.UUIDV4,
-      primaryKey: true,
-    },
-    clientId: {
-      type: DataTypes.UUID,
-      allowNull: false,
-    },
-    warrantyCardNumber: {
-      type: DataTypes.STRING,
-      allowNull: false,
-    },
-    startDate: {
-      type: DataTypes.DATE,
-      allowNull: false,
-    },
-    durationYears: {
-      type: DataTypes.INTEGER,
-      allowNull: false,
-    },
-    pdfUrl: {
-      type: DataTypes.STRING,
-      allowNull: false,
-    },
-    pdfFileName: {
-      type: DataTypes.STRING,
-      allowNull: true,
-    },
-    activeClientId: {
-      type: DataTypes.UUID,
-      allowNull: true,
-      unique: true,
-    },
-    deletedAt: {
-      type: DataTypes.DATE,
-      allowNull: true,
-    },
-  },
-  {
-    sequelize,
-    modelName: 'Warranty',
-    tableName: 'warranties',
-    paranoid: true,
-  }
+	{
+		id: {
+			type: DataTypes.UUID,
+			defaultValue: DataTypes.UUIDV4,
+			primaryKey: true,
+		},
+		clientId: {
+			type: DataTypes.UUID,
+			allowNull: false,
+		},
+		warrantyCardNumber: {
+			type: DataTypes.STRING,
+			allowNull: false,
+		},
+		startDate: {
+			type: DataTypes.DATE,
+			allowNull: false,
+		},
+		durationYears: {
+			type: DataTypes.INTEGER,
+			allowNull: false,
+		},
+		pdfUrl: {
+			type: DataTypes.STRING,
+			allowNull: false,
+		},
+		pdfFileName: {
+			type: DataTypes.STRING,
+			allowNull: true,
+		},
+		version: {
+			type: DataTypes.INTEGER,
+			allowNull: false,
+			defaultValue: 1,
+		},
+		activeClientId: {
+			type: DataTypes.UUID,
+			allowNull: true,
+			unique: true,
+		},
+		deletedAt: {
+			type: DataTypes.DATE,
+			allowNull: true,
+		},
+	},
+	{
+		sequelize,
+		modelName: 'Warranty',
+		tableName: 'warranties',
+		paranoid: true,
+	},
 );

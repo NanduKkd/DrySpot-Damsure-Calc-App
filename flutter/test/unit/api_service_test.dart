@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:app_client/src/services/api_service.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -82,4 +83,41 @@ void main() {
       );
     },
   );
+
+  test('deleteWarranty sends version-bound confirmation and idempotency key',
+      () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    Map<String, dynamic>? body;
+    String? idempotencyKey;
+
+    server.listen((request) async {
+      expect(request.method, 'DELETE');
+      expect(request.uri.path, '/api/warranty/warranty-1');
+      idempotencyKey = request.headers.value('Idempotency-Key');
+      body = jsonDecode(await utf8.decoder.bind(request).join())
+          as Map<String, dynamic>;
+      request.response.statusCode = HttpStatus.noContent;
+      await request.response.close();
+    });
+
+    final apiService = ApiService(
+      serverUrl: 'http://${server.address.host}:${server.port}',
+    );
+    await apiService.deleteWarranty(
+      id: 'warranty-1',
+      warrantyCardNumber: 'CARD-1',
+      warrantyVersion: 3,
+      irreversibleConfirmation: 'PERMANENTLY DELETE WARRANTY CARD-1',
+      idempotencyKey: 'delete-request-key-001',
+    );
+
+    expect(idempotencyKey, 'delete-request-key-001');
+    expect(body, {
+      'confirmed_warranty_id': 'warranty-1',
+      'confirmed_warranty_card_number': 'CARD-1',
+      'confirmed_warranty_version': 3,
+      'irreversible_confirmation': 'PERMANENTLY DELETE WARRANTY CARD-1',
+    });
+  });
 }

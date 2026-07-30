@@ -11,6 +11,9 @@ bool _parseBool(dynamic value) {
   return value == true || value == 1 || value == '1';
 }
 
+String irreversibleWarrantyConfirmationText(String warrantyCardNumber) =>
+    'PERMANENTLY DELETE WARRANTY $warrantyCardNumber';
+
 class Warranty {
   final int? localId;
   final String remoteId;
@@ -20,6 +23,7 @@ class Warranty {
   final DateTime startDate;
   final int durationYears;
   final String pdfUrl;
+  final int version;
   final bool isDirty;
   final DateTime updatedAt;
   final DateTime? deletedAt;
@@ -33,6 +37,7 @@ class Warranty {
     required this.startDate,
     required this.durationYears,
     required this.pdfUrl,
+    this.version = 1,
     this.isDirty = true,
     DateTime? updatedAt,
     this.deletedAt,
@@ -48,6 +53,7 @@ class Warranty {
       'start_date': startDate.toIso8601String(),
       'duration_years': durationYears,
       'pdf_url': pdfUrl,
+      'server_version': version,
       'is_dirty': isDirty ? 1 : 0,
       'updated_at': updatedAt.toIso8601String(),
       'deleted_at': deletedAt?.toIso8601String(),
@@ -67,6 +73,7 @@ class Warranty {
       startDate: DateTime.parse(map['start_date']),
       durationYears: _parseInt(map['duration_years']) ?? 0,
       pdfUrl: map['pdf_url']?.toString() ?? '',
+      version: _parseInt(map['server_version'] ?? map['version']) ?? 1,
       isDirty: _parseBool(map['is_dirty']),
       updatedAt: DateTime.parse(map['updated_at']),
       deletedAt:
@@ -83,6 +90,7 @@ class Warranty {
     DateTime? startDate,
     int? durationYears,
     String? pdfUrl,
+    int? version,
     bool? isDirty,
     DateTime? updatedAt,
     DateTime? deletedAt,
@@ -96,6 +104,7 @@ class Warranty {
       startDate: startDate ?? this.startDate,
       durationYears: durationYears ?? this.durationYears,
       pdfUrl: pdfUrl ?? this.pdfUrl,
+      version: version ?? this.version,
       isDirty: isDirty ?? this.isDirty,
       updatedAt: updatedAt ?? this.updatedAt,
       deletedAt: deletedAt ?? this.deletedAt,

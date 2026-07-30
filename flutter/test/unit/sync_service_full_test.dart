@@ -4,6 +4,7 @@ import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/services/db_service.dart';
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/default_price.dart';
+import 'package:app_client/src/models/warranty.dart';
 import 'package:mockito/mockito.dart';
 import 'package:mockito/annotations.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,7 +13,7 @@ import 'sync_service_full_test.mocks.dart';
 
 @GenerateMocks([ApiService, DbService])
 void main() {
-  setUpAll(() {
+  setUp(() {
     SharedPreferences.setMockInitialValues({});
   });
 
@@ -113,6 +114,11 @@ void main() {
           invocation.positionalArguments.single as Map<String, dynamic>;
       return {
         'server_time': now,
+        'outcomes': {
+          'clients': [
+            {'remote_id': 'client-remote-id', 'status': 'applied'}
+          ],
+        },
         'updates': {'clients': [], 'items': [], 'rectangles': []},
       };
     });
@@ -168,6 +174,9 @@ void main() {
           invocation.positionalArguments.single as Map<String, dynamic>;
       return {
         'server_time': now,
+        'outcomes': {
+          'clients': [],
+        },
         'updates': {
           'clients': [
             {
@@ -243,6 +252,11 @@ void main() {
           invocation.positionalArguments.single as Map<String, dynamic>;
       return {
         'server_time': now,
+        'outcomes': {
+          'default_prices': [
+            {'remote_id': 'pushed-price', 'status': 'applied'}
+          ],
+        },
         'updates': {
           'clients': [],
           'items': [],
@@ -285,5 +299,150 @@ void main() {
     verify(mockDb.markAsSynced('default_prices', 'pushed-price',
             franchiseeId: 'tenant-a'))
         .called(1);
+  });
+
+  test('applies a permanent tombstone before live warranty data', () async {
+    SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
+    final mockApi = MockApiService();
+    final mockDb = MockDbService();
+    final now = DateTime.utc(2026, 7, 30).toIso8601String();
+    final client = Client(
+      localId: 1,
+      remoteId: 'client-1',
+      franchiseeId: 'tenant-a',
+      name: 'Client',
+    );
+    final dirty = Warranty(
+      localId: 2,
+      remoteId: 'deleted-warranty',
+      clientId: 1,
+      warrantyCardNumber: 'CARD-1',
+      startDate: DateTime.utc(2026),
+      durationYears: 5,
+      pdfUrl: '/api/warranty/deleted-warranty/download',
+    );
+    when(mockDb.getClients()).thenAnswer((_) async => [client]);
+    when(mockDb.getDirtyClients()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyItems()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyRectangles()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyDefaultPrices('tenant-a')).thenAnswer((_) async => []);
+    when(mockDb.getDirtyWarranties()).thenAnswer((_) async => [dirty]);
+    when(mockDb.getDirtyProposals()).thenAnswer((_) async => []);
+    when(mockDb.applyWarrantyTombstone(any)).thenAnswer((_) async {});
+    when(mockDb.hasWarrantyTombstone(
+      'deleted-warranty',
+      franchiseeId: 'tenant-a',
+    )).thenAnswer((_) async => true);
+    when(mockDb.hardDeleteWarrantyByRemoteId('deleted-warranty'))
+        .thenAnswer((_) async => 1);
+    when(mockApi.sync(any)).thenAnswer((_) async => {
+          'server_time': now,
+          'warranty_tombstone_cursor': '7',
+          'outcomes': {
+            'warranties': [
+              {'remote_id': 'deleted-warranty', 'status': 'tombstoned'}
+            ],
+          },
+          'updates': {
+            'clients': [],
+            'items': [],
+            'rectangles': [],
+            'default_prices': [],
+            'warranty_tombstones': [
+              {
+                'warranty_id': 'deleted-warranty',
+                'deletion_sequence': '7',
+                'deleted_at': now,
+              },
+            ],
+            // A stale/malformed response containing both must still converge to
+            // the tombstone rather than recreating the warranty.
+            'warranties': [
+              {
+                'remote_id': 'deleted-warranty',
+                'client_id': 'client-1',
+                'version': 1,
+                'warranty_card_number': 'CARD-1',
+                'start_date': now,
+                'duration_years': 5,
+                'pdf_url': '/api/warranty/deleted-warranty/download',
+                'updated_at': now,
+                'deleted_at': null,
+              },
+            ],
+            'proposals': [],
+          },
+        });
+
+    await SyncService(apiService: mockApi, dbService: mockDb).sync();
+
+    verifyInOrder([
+      mockDb.applyWarrantyTombstone(any),
+      mockDb.hasWarrantyTombstone(
+        'deleted-warranty',
+        franchiseeId: 'tenant-a',
+      ),
+      mockDb.hardDeleteWarrantyByRemoteId('deleted-warranty'),
+    ]);
+    verifyNever(mockDb.insertWarranty(any));
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('warranty_tombstone_cursor_tenant-a'), '7');
+  });
+
+  test('keeps a warranty dirty when its per-change outcome is rejected',
+      () async {
+    SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
+    final mockApi = MockApiService();
+    final mockDb = MockDbService();
+    final now = DateTime.utc(2026, 7, 30).toIso8601String();
+    final client = Client(
+      localId: 1,
+      remoteId: 'client-1',
+      franchiseeId: 'tenant-a',
+      name: 'Client',
+    );
+    final dirty = Warranty(
+      localId: 2,
+      remoteId: 'rejected-warranty',
+      clientId: 1,
+      warrantyCardNumber: 'CARD-2',
+      startDate: DateTime.utc(2026),
+      durationYears: 5,
+      pdfUrl: '/api/warranty/rejected-warranty/download',
+    );
+    when(mockDb.getClients()).thenAnswer((_) async => [client]);
+    when(mockDb.getDirtyClients()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyItems()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyRectangles()).thenAnswer((_) async => []);
+    when(mockDb.getDirtyDefaultPrices('tenant-a')).thenAnswer((_) async => []);
+    when(mockDb.getDirtyWarranties()).thenAnswer((_) async => [dirty]);
+    when(mockDb.getDirtyProposals()).thenAnswer((_) async => []);
+    when(mockApi.sync(any)).thenAnswer((_) async => {
+          'server_time': now,
+          'warranty_tombstone_cursor': '0',
+          'outcomes': {
+            'warranties': [
+              {
+                'remote_id': 'rejected-warranty',
+                'status': 'rejected',
+                'code': 'active_warranty_exists',
+              }
+            ],
+          },
+          'updates': {
+            'clients': [],
+            'items': [],
+            'rectangles': [],
+            'default_prices': [],
+            'warranty_tombstones': [],
+            'warranties': [],
+            'proposals': [],
+          },
+        });
+
+    await SyncService(apiService: mockApi, dbService: mockDb).sync();
+
+    verifyNever(mockDb.markAsSynced('warranties', 'rejected-warranty'));
+    verifyNever(mockDb.hardDeleteWarrantyByRemoteId('rejected-warranty'));
   });
 }

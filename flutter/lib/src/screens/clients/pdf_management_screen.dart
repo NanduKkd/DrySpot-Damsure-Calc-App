@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
 import 'package:provider/provider.dart';
+import 'package:uuid/uuid.dart';
 import '../../models/client.dart';
 import '../../models/warranty.dart';
 import '../../models/proposal.dart';
@@ -106,15 +107,21 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
   Future<void> _createWarranty() async {
     if (!mounted) return;
 
-    final hasActiveWarranty =
-        context.read<ClientProvider>().currentClientWarranties.isNotEmpty;
-    if (hasActiveWarranty) {
+    final activeWarranties =
+        context.read<ClientProvider>().currentClientWarranties;
+    final activeWarranty =
+        activeWarranties.isEmpty ? null : activeWarranties.first;
+    String? idempotencyKey;
+    if (activeWarranty != null) {
       final replace = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
-          title: const Text('Replace active warranty?'),
-          content: const Text(
-            'This client already has an active warranty. Creating a new one will replace it permanently.',
+          title: const Text('Permanently replace warranty?'),
+          content: Text(
+            'Warranty "${activeWarranty.warrantyCardNumber}" '
+            '(server version ${activeWarranty.version}) will be permanently deleted. '
+            'Its record and stored PDF cannot be recovered. Continue only if you '
+            'intend to replace this exact warranty.',
           ),
           actions: [
             TextButton(
@@ -123,12 +130,13 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
             ),
             ElevatedButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('Replace'),
+              child: const Text('Permanently replace'),
             ),
           ],
         ),
       );
       if (replace != true || !mounted) return;
+      idempotencyKey = const Uuid().v4();
     }
 
     final result = await Navigator.push<bool>(
@@ -136,7 +144,8 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
       MaterialPageRoute(
         builder: (context) => WarrantyFormScreen(
           client: widget.client,
-          replaceExisting: hasActiveWarranty,
+          warrantyToReplace: activeWarranty,
+          replacementIdempotencyKey: idempotencyKey,
         ),
       ),
     );
@@ -150,8 +159,12 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete Warranty'),
-        content: const Text('Are you sure you want to delete this warranty?'),
+        title: const Text('Permanently delete warranty?'),
+        content: Text(
+          'Warranty "${warranty.warrantyCardNumber}" '
+          '(server version ${warranty.version}) and its stored PDF will be '
+          'permanently deleted and cannot be recovered.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -159,7 +172,10 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+            child: const Text(
+              'Permanently delete',
+              style: TextStyle(color: Colors.red),
+            ),
           ),
         ],
       ),
@@ -167,9 +183,20 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
 
     if (confirm == true && mounted) {
       try {
-        if (warranty.remoteId.isNotEmpty) {
-          await _pdfService.deleteRemotePdf(warranty.pdfUrl);
+        if (warranty.remoteId.isEmpty) {
+          throw const ApiException(
+            'This warranty has no server ID. Sync and try again.',
+          );
         }
+        await context.read<ApiService>().deleteWarranty(
+              id: warranty.remoteId,
+              warrantyCardNumber: warranty.warrantyCardNumber,
+              warrantyVersion: warranty.version,
+              irreversibleConfirmation: irreversibleWarrantyConfirmationText(
+                warranty.warrantyCardNumber,
+              ),
+              idempotencyKey: const Uuid().v4(),
+            );
         if (!mounted) return;
         await context
             .read<ClientProvider>()

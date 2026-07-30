@@ -36,7 +36,8 @@ void main() {
   testWidgets(
       'PdfManagementScreen allows creating another warranty when one already exists',
       (tester) async {
-    final client = Client(name: 'Acme', localId: 1);
+    final client =
+        Client(name: 'Acme', localId: 1, remoteId: 'client-remote-id');
     final provider = MockClientProvider(
       warranties: [
         Warranty(
@@ -45,6 +46,7 @@ void main() {
           startDate: DateTime(2026, 1, 1),
           durationYears: 5,
           pdfUrl: 'https://example.com/w1.pdf',
+          version: 4,
         ),
       ],
     );
@@ -71,17 +73,69 @@ void main() {
     await tester.tap(find.widgetWithText(ElevatedButton, 'Create Warranty'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Replace active warranty?'), findsOneWidget);
+    expect(find.text('Permanently replace warranty?'), findsOneWidget);
     expect(
       find.text(
-        'This client already has an active warranty. Creating a new one will replace it permanently.',
+        'Warranty "W-1" (server version 4) will be permanently deleted. Its record and stored PDF cannot be recovered. Continue only if you intend to replace this exact warranty.',
       ),
       findsOneWidget,
     );
 
-    await tester.tap(find.widgetWithText(ElevatedButton, 'Replace'));
+    await tester
+        .tap(find.widgetWithText(ElevatedButton, 'Permanently replace'));
     await tester.pumpAndSettle();
 
     expect(find.byType(WarrantyFormScreen), findsOneWidget);
+    final form = tester.widget<WarrantyFormScreen>(
+      find.byType(WarrantyFormScreen),
+    );
+    expect(form.warrantyToReplace?.warrantyCardNumber, 'W-1');
+    expect(form.warrantyToReplace?.version, 4);
+    expect(form.replacementIdempotencyKey, isNotEmpty);
+  });
+
+  testWidgets('warranty deletion confirmation names the exact server version',
+      (tester) async {
+    final client =
+        Client(name: 'Acme', localId: 1, remoteId: 'client-remote-id');
+    final provider = MockClientProvider(
+      warranties: [
+        Warranty(
+          localId: 2,
+          remoteId: 'warranty-remote-id',
+          clientId: 1,
+          warrantyCardNumber: 'W-DELETE',
+          startDate: DateTime(2026, 1, 1),
+          durationYears: 5,
+          pdfUrl: '/api/warranty/warranty-remote-id/download',
+          version: 7,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: provider),
+          Provider<ApiService>.value(
+            value: ApiService(serverUrl: 'http://localhost'),
+          ),
+        ],
+        child: MaterialApp(home: PdfManagementScreen(client: client)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.delete).first);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Permanently delete warranty?'), findsOneWidget);
+    expect(
+      find.text(
+        'Warranty "W-DELETE" (server version 7) and its stored PDF will be permanently deleted and cannot be recovered.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Permanently delete'), findsOneWidget);
   });
 }

@@ -29,9 +29,8 @@ class ClientProvider extends ChangeNotifier {
     required bool isAuthenticated,
     String? franchiseeId,
   }) {
-    final normalizedFranchiseeId = franchiseeId?.trim().isNotEmpty == true
-        ? franchiseeId!.trim()
-        : null;
+    final normalizedFranchiseeId =
+        franchiseeId?.trim().isNotEmpty == true ? franchiseeId!.trim() : null;
     final hasChanged = !_sessionBound ||
         _isAuthenticated != isAuthenticated ||
         _activeFranchiseeId != normalizedFranchiseeId;
@@ -147,13 +146,9 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> addWarranty(Warranty warranty) async {
-    // Keep the offline view consistent with the server's one-active-warranty rule.
-    for (final existing in List<Warranty>.from(_currentClientWarranties)) {
-      if (existing.localId != null) {
-        await _dbService.softDeleteWarranty(existing.localId!);
-      }
-    }
-    await _dbService.insertWarranty(warranty);
+    // The server has already committed either creation or atomic replacement.
+    // Mirror that result locally without creating a dirty offline delete.
+    await _dbService.replaceWarrantyFromServer(warranty);
     await loadWarranties(warranty.clientId);
   }
 
@@ -163,7 +158,9 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> deleteWarranty(int localId, int clientLocalId) async {
-    await _dbService.softDeleteWarranty(localId);
+    // Permanent warranty deletion is online/server-authoritative. This method
+    // is called only after the confirmed API request succeeds.
+    await _dbService.hardDeleteWarranty(localId);
     await loadWarranties(clientLocalId);
   }
 

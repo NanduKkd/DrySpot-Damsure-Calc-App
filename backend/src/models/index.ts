@@ -8,6 +8,8 @@ import { Warranty } from './Warranty';
 import { Proposal } from './Proposal';
 import { DefaultPrice } from './DefaultPrice';
 import { ManagedFileCleanup } from './ManagedFileCleanup';
+import { WarrantyDeletionSequence } from './WarrantyDeletionSequence';
+import { WarrantyDeletionTombstone } from './WarrantyDeletionTombstone';
 
 // Associations
 Franchisee.hasMany(User, { foreignKey: 'franchiseeId' });
@@ -32,14 +34,16 @@ Client.hasMany(Proposal, { foreignKey: 'clientId' });
 Proposal.belongsTo(Client, { foreignKey: 'clientId' });
 
 export {
-  sequelize,
-  Franchisee,
-  User,
-  Client,
-  Item,
-  Rectangle,
-  Warranty,
-  Proposal,
-  DefaultPrice,
-  ManagedFileCleanup,
+	sequelize,
+	Franchisee,
+	User,
+	Client,
+	Item,
+	Rectangle,
+	Warranty,
+	Proposal,
+	DefaultPrice,
+	ManagedFileCleanup,
+	WarrantyDeletionSequence,
+	WarrantyDeletionTombstone,
 };

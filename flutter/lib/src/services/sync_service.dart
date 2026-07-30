@@ -6,6 +6,7 @@ import '../models/item.dart';
 import '../models/rectangle.dart';
 import '../models/default_price.dart';
 import '../models/warranty.dart';
+import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
 
 class SyncService {
@@ -22,6 +23,24 @@ class SyncService {
     return 'last_sync_time_$franchiseeId';
   }
 
+  String _warrantyTombstoneCursorKey(String franchiseeId) =>
+      'warranty_tombstone_cursor_$franchiseeId';
+
+  Set<String> _outcomeIds(
+    dynamic outcomes,
+    String collection,
+    String status,
+  ) {
+    final values = outcomes is Map ? outcomes[collection] : null;
+    if (values is! List) return {};
+    return values
+        .whereType<Map>()
+        .where((outcome) => outcome['status'] == status)
+        .map((outcome) => outcome['remote_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
   Future<void> sync() async {
     final prefs = await SharedPreferences.getInstance();
     final activeFranchiseeId = prefs.getString('franchisee_id')?.trim();
@@ -30,6 +49,12 @@ class SyncService {
     final syncTimeKey = _syncKeyForFranchisee(activeFranchiseeId);
     final lastSyncTime =
         prefs.getString(syncTimeKey) ?? prefs.getString('last_sync_time');
+    final warrantyTombstoneCursor = shouldFilterByFranchise
+        ? prefs.getString(
+              _warrantyTombstoneCursorKey(activeFranchiseeId),
+            ) ??
+            '0'
+        : '0';
 
     // Build active-session maps once so all payloads resolve IDs consistently.
     final allClients = await dbService.getClients();
@@ -123,6 +148,8 @@ class SyncService {
       final map = warranty.toMap();
       map['remote_id'] = warranty.remoteId;
       map['client_id'] = client.remoteId;
+      map['version'] = warranty.version;
+      map.remove('server_version');
       resolvedWarranties.add(map);
       warrantiesToSync.add(warranty);
     }
@@ -207,6 +234,7 @@ class SyncService {
 
     final syncData = {
       'last_sync_time': lastSyncTime,
+      'warranty_tombstone_cursor': warrantyTombstoneCursor,
       'changes': {
         'clients': resolvedClients,
         'items': resolvedItems,
@@ -222,9 +250,31 @@ class SyncService {
     final response = await apiService.sync(syncData);
     final serverTime = response['server_time'];
     final updates = response['updates'];
+    final outcomes = response['outcomes'];
+    final appliedClients = _outcomeIds(outcomes, 'clients', 'applied');
+    final appliedItems = _outcomeIds(outcomes, 'items', 'applied');
+    final appliedRectangles = _outcomeIds(outcomes, 'rectangles', 'applied');
+    final appliedDefaultPrices =
+        _outcomeIds(outcomes, 'default_prices', 'applied');
+    final appliedWarranties = _outcomeIds(outcomes, 'warranties', 'applied');
+    final tombstonedWarranties =
+        _outcomeIds(outcomes, 'warranties', 'tombstoned');
+    final appliedProposals = _outcomeIds(outcomes, 'proposals', 'applied');
 
     // 3. Apply updates to local DB
     if (updates != null) {
+      // Permanent warranty tombstones are applied before any live warranty.
+      // Their sequence cursor is independent of wall-clock sync timestamps.
+      if (shouldFilterByFranchise) {
+        for (final rawTombstone in updates['warranty_tombstones'] ?? const []) {
+          final tombstone = WarrantyDeletionTombstone.fromServer(
+            Map<String, dynamic>.from(rawTombstone as Map),
+            franchiseeId: activeFranchiseeId,
+          );
+          await dbService.applyWarrantyTombstone(tombstone);
+        }
+      }
+
       // Clients
       for (var clientMap in updates['clients']) {
         final remoteId = clientMap['remote_id'];
@@ -353,6 +403,13 @@ class SyncService {
       // Warranties
       for (var warrantyMap in updates['warranties'] ?? []) {
         final remoteId = warrantyMap['remote_id'];
+        if (shouldFilterByFranchise &&
+            await dbService.hasWarrantyTombstone(
+              remoteId,
+              franchiseeId: activeFranchiseeId,
+            )) {
+          continue;
+        }
         final existingWarranty =
             await dbService.getWarrantyByRemoteId(remoteId);
         final client =
@@ -360,9 +417,9 @@ class SyncService {
 
         if (client != null) {
           if (warrantyMap['deleted_at'] != null) {
-            if (existingWarranty != null) {
-              await dbService.softDeleteWarranty(existingWarranty.localId!);
-            }
+            // APP-110 never treats a soft-deleted warranty row as permanent
+            // deletion. Only the sequenced tombstone stream can remove it.
+            continue;
           } else {
             final warranty = Warranty.fromMap(warrantyMap)
                 .copyWith(clientId: client.localId!, isDirty: false);
@@ -405,32 +462,55 @@ class SyncService {
 
     // 4. Clear dirty flags for records we just sent
     for (var c in clientsToMarkSynced) {
-      await dbService.markAsSynced('clients', c.remoteId);
+      if (appliedClients.contains(c.remoteId)) {
+        await dbService.markAsSynced('clients', c.remoteId);
+      }
     }
     for (var i in itemsToSync) {
-      await dbService.markAsSynced('items', i.remoteId);
+      if (appliedItems.contains(i.remoteId)) {
+        await dbService.markAsSynced('items', i.remoteId);
+      }
     }
     for (var r in rectanglesToSync) {
-      await dbService.markAsSynced('rectangles', r.remoteId);
+      if (appliedRectangles.contains(r.remoteId)) {
+        await dbService.markAsSynced('rectangles', r.remoteId);
+      }
     }
     for (final price in dirtyDefaultPrices) {
-      await dbService.markAsSynced(
-        'default_prices',
-        price.remoteId,
-        franchiseeId: activeFranchiseeId,
-      );
+      if (appliedDefaultPrices.contains(price.remoteId)) {
+        await dbService.markAsSynced(
+          'default_prices',
+          price.remoteId,
+          franchiseeId: activeFranchiseeId,
+        );
+      }
     }
     for (var w in warrantiesToSync) {
-      await dbService.markAsSynced('warranties', w.remoteId);
+      if (tombstonedWarranties.contains(w.remoteId)) {
+        await dbService.hardDeleteWarrantyByRemoteId(w.remoteId);
+      } else if (appliedWarranties.contains(w.remoteId)) {
+        await dbService.markAsSynced('warranties', w.remoteId);
+      }
     }
     for (var p in proposalsToSync) {
-      await dbService.markAsSynced('proposals', p.remoteId);
+      if (appliedProposals.contains(p.remoteId)) {
+        await dbService.markAsSynced('proposals', p.remoteId);
+      }
     }
 
     // 5. Save sync time
     await prefs.setString(syncTimeKey, serverTime);
     if (syncTimeKey != 'last_sync_time') {
       await prefs.remove('last_sync_time');
+    }
+    if (shouldFilterByFranchise) {
+      final nextCursor = response['warranty_tombstone_cursor']?.toString();
+      if (nextCursor != null && RegExp(r'^\d+$').hasMatch(nextCursor)) {
+        await prefs.setString(
+          _warrantyTombstoneCursorKey(activeFranchiseeId),
+          nextCursor,
+        );
+      }
     }
   }
 }

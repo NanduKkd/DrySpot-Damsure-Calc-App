@@ -22,7 +22,20 @@ class MockApiService extends ApiService {
   @override
   Future<Map<String, dynamic>> sync(Map<String, dynamic> data) async {
     lastSyncData = data;
-    return response;
+    final changes = data['changes'] as Map<String, dynamic>;
+    return {
+      ...response,
+      'outcomes': {
+        for (final entry in changes.entries)
+          entry.key: [
+            for (final change in entry.value as List)
+              {
+                'remote_id': change['remote_id'],
+                'status': 'applied',
+              },
+          ],
+      },
+    };
   }
 }
 

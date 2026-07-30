@@ -8,9 +8,10 @@ import 'dart:async' as _i5;
 import 'package:app_client/src/models/client.dart' as _i7;
 import 'package:app_client/src/models/default_price.dart' as _i10;
 import 'package:app_client/src/models/item.dart' as _i8;
-import 'package:app_client/src/models/proposal.dart' as _i12;
+import 'package:app_client/src/models/proposal.dart' as _i13;
 import 'package:app_client/src/models/rectangle.dart' as _i9;
 import 'package:app_client/src/models/warranty.dart' as _i11;
+import 'package:app_client/src/models/warranty_deletion_tombstone.dart' as _i12;
 import 'package:app_client/src/services/api_service.dart' as _i3;
 import 'package:app_client/src/services/db_service.dart' as _i6;
 import 'package:mockito/mockito.dart' as _i1;
@@ -156,8 +157,9 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
   @override
   _i5.Future<Map<String, dynamic>> uploadWarranty(
     String? filePath,
-    Map<String, String>? fields,
-  ) =>
+    Map<String, String>? fields, {
+    String? idempotencyKey,
+  }) =>
       (super.noSuchMethod(
         Invocation.method(
           #uploadWarranty,
@@ -165,10 +167,35 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
             filePath,
             fields,
           ],
+          {#idempotencyKey: idempotencyKey},
         ),
         returnValue:
             _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
       ) as _i5.Future<Map<String, dynamic>>);
+
+  @override
+  _i5.Future<void> deleteWarranty({
+    required String? id,
+    required String? warrantyCardNumber,
+    required int? warrantyVersion,
+    required String? irreversibleConfirmation,
+    required String? idempotencyKey,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #deleteWarranty,
+          [],
+          {
+            #id: id,
+            #warrantyCardNumber: warrantyCardNumber,
+            #warrantyVersion: warrantyVersion,
+            #irreversibleConfirmation: irreversibleConfirmation,
+            #idempotencyKey: idempotencyKey,
+          },
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
 
   @override
   _i5.Future<Map<String, dynamic>> uploadProposal(
@@ -505,16 +532,63 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<int>);
 
   @override
-  _i5.Future<int> softDeleteWarranty(int? localId) => (super.noSuchMethod(
+  _i5.Future<int> hardDeleteWarranty(int? localId) => (super.noSuchMethod(
         Invocation.method(
-          #softDeleteWarranty,
+          #hardDeleteWarranty,
           [localId],
         ),
         returnValue: _i5.Future<int>.value(0),
       ) as _i5.Future<int>);
 
   @override
-  _i5.Future<int> insertProposal(_i12.Proposal? proposal) =>
+  _i5.Future<int> hardDeleteWarrantyByRemoteId(String? remoteId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #hardDeleteWarrantyByRemoteId,
+          [remoteId],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<void> replaceWarrantyFromServer(_i11.Warranty? warranty) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #replaceWarrantyFromServer,
+          [warranty],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
+  _i5.Future<void> applyWarrantyTombstone(
+          _i12.WarrantyDeletionTombstone? tombstone) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #applyWarrantyTombstone,
+          [tombstone],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
+  _i5.Future<bool> hasWarrantyTombstone(
+    String? warrantyId, {
+    required String? franchiseeId,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #hasWarrantyTombstone,
+          [warrantyId],
+          {#franchiseeId: franchiseeId},
+        ),
+        returnValue: _i5.Future<bool>.value(false),
+      ) as _i5.Future<bool>);
+
+  @override
+  _i5.Future<int> insertProposal(_i13.Proposal? proposal) =>
       (super.noSuchMethod(
         Invocation.method(
           #insertProposal,
@@ -524,27 +598,27 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<int>);
 
   @override
-  _i5.Future<List<_i12.Proposal>> getProposalsByClientId(int? clientId) =>
+  _i5.Future<List<_i13.Proposal>> getProposalsByClientId(int? clientId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getProposalsByClientId,
           [clientId],
         ),
-        returnValue: _i5.Future<List<_i12.Proposal>>.value(<_i12.Proposal>[]),
-      ) as _i5.Future<List<_i12.Proposal>>);
+        returnValue: _i5.Future<List<_i13.Proposal>>.value(<_i13.Proposal>[]),
+      ) as _i5.Future<List<_i13.Proposal>>);
 
   @override
-  _i5.Future<_i12.Proposal?> getProposalByRemoteId(String? remoteId) =>
+  _i5.Future<_i13.Proposal?> getProposalByRemoteId(String? remoteId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getProposalByRemoteId,
           [remoteId],
         ),
-        returnValue: _i5.Future<_i12.Proposal?>.value(),
-      ) as _i5.Future<_i12.Proposal?>);
+        returnValue: _i5.Future<_i13.Proposal?>.value(),
+      ) as _i5.Future<_i13.Proposal?>);
 
   @override
-  _i5.Future<int> updateProposal(_i12.Proposal? proposal) =>
+  _i5.Future<int> updateProposal(_i13.Proposal? proposal) =>
       (super.noSuchMethod(
         Invocation.method(
           #updateProposal,
@@ -627,13 +701,13 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<List<_i11.Warranty>>);
 
   @override
-  _i5.Future<List<_i12.Proposal>> getDirtyProposals() => (super.noSuchMethod(
+  _i5.Future<List<_i13.Proposal>> getDirtyProposals() => (super.noSuchMethod(
         Invocation.method(
           #getDirtyProposals,
           [],
         ),
-        returnValue: _i5.Future<List<_i12.Proposal>>.value(<_i12.Proposal>[]),
-      ) as _i5.Future<List<_i12.Proposal>>);
+        returnValue: _i5.Future<List<_i13.Proposal>>.value(<_i13.Proposal>[]),
+      ) as _i5.Future<List<_i13.Proposal>>);
 
   @override
   _i5.Future<void> markAsSynced(

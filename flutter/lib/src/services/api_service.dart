@@ -201,11 +201,15 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> uploadWarranty(
-      String filePath, Map<String, String> fields) async {
+    String filePath,
+    Map<String, String> fields, {
+    String? idempotencyKey,
+  }) async {
     final request =
         http.MultipartRequest('POST', Uri.parse('$baseUrl/warranty/upload'));
     request.headers.addAll({
       if (_hasToken) 'Authorization': 'Bearer $_token',
+      if (idempotencyKey != null) 'Idempotency-Key': idempotencyKey,
     });
     request.files.add(await http.MultipartFile.fromPath(
       'file',
@@ -226,6 +230,34 @@ class ApiService {
     } else {
       throw ApiException(
         _extractErrorMessage(response, 'Failed to upload warranty'),
+      );
+    }
+  }
+
+  Future<void> deleteWarranty({
+    required String id,
+    required String warrantyCardNumber,
+    required int warrantyVersion,
+    required String irreversibleConfirmation,
+    required String idempotencyKey,
+  }) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/warranty/$id'),
+      headers: {
+        ..._headers,
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: jsonEncode({
+        'confirmed_warranty_id': id,
+        'confirmed_warranty_card_number': warrantyCardNumber,
+        'confirmed_warranty_version': warrantyVersion,
+        'irreversible_confirmation': irreversibleConfirmation,
+      }),
+    );
+
+    if (response.statusCode != 204) {
+      throw ApiException(
+        _extractErrorMessage(response, 'Failed to delete warranty'),
       );
     }
   }

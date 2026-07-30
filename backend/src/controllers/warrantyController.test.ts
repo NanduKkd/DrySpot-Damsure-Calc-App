@@ -2,6 +2,7 @@ import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import app from '../app';
 import { Client, Franchisee, User, Warranty } from '../models';
+import { irreversibleWarrantyConfirmation } from '../services/warrantyLifecycle';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const samplePdf = Buffer.from('%PDF-1.4\nminimal test PDF\n%%EOF');
@@ -87,14 +88,24 @@ describe('warrantyController', () => {
 		});
 
 		it('serves the PDF only to the owning authenticated franchisee', async () => {
+			const current = (await Warranty.findOne({
+				where: { clientId: client.id },
+			}))!;
 			const upload = await request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
+				.set('Idempotency-Key', 'download-replacement-key')
 				.field('client_id', client.id)
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-DOWNLOAD')
-				.field('replace_existing', 'true')
+				.field('confirmed_warranty_id', current.id)
+				.field('confirmed_warranty_card_number', current.warrantyCardNumber)
+				.field('confirmed_warranty_version', current.version.toString())
+				.field(
+					'irreversible_confirmation',
+					irreversibleWarrantyConfirmation(current.warrantyCardNumber),
+				)
 				.attach('file', samplePdf, {
 					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
@@ -128,15 +139,25 @@ describe('warrantyController', () => {
 				});
 
 			expect(response.status).toBe(409);
+			const current = (await Warranty.findOne({
+				where: { clientId: client.id },
+			}))!;
 
 			const replacement = await request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
+				.set('Idempotency-Key', 'explicit-replacement-key')
 				.field('client_id', client.id)
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-REPLACE')
-				.field('replace_existing', 'true')
+				.field('confirmed_warranty_id', current.id)
+				.field('confirmed_warranty_card_number', current.warrantyCardNumber)
+				.field('confirmed_warranty_version', current.version.toString())
+				.field(
+					'irreversible_confirmation',
+					irreversibleWarrantyConfirmation(current.warrantyCardNumber),
+				)
 				.attach('file', samplePdf, {
 					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
@@ -175,11 +196,18 @@ describe('warrantyController', () => {
 			const replacement = await request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
+				.set('Idempotency-Key', 'rollout-replacement-key')
 				.field('client_id', rolloutClient.id)
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'NEW-PROCESS-WARRANTY')
-				.field('replace_existing', 'true')
+				.field('confirmed_warranty_id', rolloutWarranty.id)
+				.field('confirmed_warranty_card_number', rolloutWarranty.warrantyCardNumber)
+				.field('confirmed_warranty_version', rolloutWarranty.version.toString())
+				.field(
+					'irreversible_confirmation',
+					irreversibleWarrantyConfirmation(rolloutWarranty.warrantyCardNumber),
+				)
 				.attach('file', samplePdf, {
 					filename: 'warranty.pdf',
 					contentType: 'application/octet-stream',
@@ -187,13 +215,7 @@ describe('warrantyController', () => {
 
 			expect(replacement.status).toBe(201);
 			expect(await Warranty.findByPk(rolloutWarranty.id)).toBeNull();
-			expect(
-				(
-					await Warranty.findByPk(migratedWarranty.id, {
-						paranoid: false,
-					})
-				)?.activeClientId,
-			).toBeNull();
+			expect(await Warranty.findByPk(migratedWarranty.id, { paranoid: false })).toBeNull();
 			expect(
 				await Warranty.count({
 					where: { clientId: rolloutClient.id, activeClientId: rolloutClient.id },

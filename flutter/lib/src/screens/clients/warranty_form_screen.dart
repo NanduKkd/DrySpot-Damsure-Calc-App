@@ -10,12 +10,14 @@ import '../../utils/warranty_date_utils.dart';
 
 class WarrantyFormScreen extends StatefulWidget {
   final Client client;
-  final bool replaceExisting;
+  final Warranty? warrantyToReplace;
+  final String? replacementIdempotencyKey;
 
   const WarrantyFormScreen({
     super.key,
     required this.client,
-    this.replaceExisting = false,
+    this.warrantyToReplace,
+    this.replacementIdempotencyKey,
   });
 
   @override
@@ -142,13 +144,26 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
       );
 
       // Upload to API
-      final response = await apiService.uploadWarranty(file.path, {
+      final replacement = widget.warrantyToReplace;
+      final fields = <String, String>{
         'client_id': widget.client.remoteId,
         'start_date': startDate.toIso8601String(),
         'duration_years': _durationYears.toString(),
         'warranty_card_number': _cardNumberController.text,
-        'replace_existing': widget.replaceExisting.toString(),
-      });
+        if (replacement != null) ...{
+          'confirmed_warranty_id': replacement.remoteId,
+          'confirmed_warranty_card_number': replacement.warrantyCardNumber,
+          'confirmed_warranty_version': replacement.version.toString(),
+          'irreversible_confirmation': irreversibleWarrantyConfirmationText(
+            replacement.warrantyCardNumber,
+          ),
+        },
+      };
+      final response = await apiService.uploadWarranty(
+        file.path,
+        fields,
+        idempotencyKey: widget.replacementIdempotencyKey,
+      );
 
       // Save to local DB
       final warranty = Warranty(
@@ -158,6 +173,7 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         startDate: startDate,
         durationYears: _durationYears,
         pdfUrl: response['pdfUrl'],
+        version: response['version'] as int? ?? 1,
         isDirty: false,
         updatedAt: DateTime.parse(response['updatedAt']),
       );
