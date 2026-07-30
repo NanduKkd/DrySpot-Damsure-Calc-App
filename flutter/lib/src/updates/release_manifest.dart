@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 /// The release endpoint is deliberately independent from the configurable API
 /// base URL. It is a release-policy trust boundary, not an API route.
 const String releaseManifestEndpoint =
@@ -45,26 +47,28 @@ class AvailableReleaseManifest {
   final String releaseNotes;
   final String requiredUpdateReason;
 
-  /// A deterministic identity for APP-113 high-water persistence.
+  /// A deterministic, unambiguous identity for APP-113 high-water persistence.
   ///
-  /// This is deliberately an exact canonical payload identity rather than a
-  /// cryptographic signature. APP-113 persists it after trusted transport,
-  /// strict parsing, and anti-rollback validation so required policy survives
-  /// restart/offline. Downloaded-APK verification is a separate install gate.
-  String get canonicalFingerprint => [
-        _schemaVersion,
-        true,
-        manifestRevision,
-        latestVersion,
-        latestVersionCode,
-        minimumSupportedVersionCode,
-        artifactUrl.toString(),
-        sha256,
-        sizeBytes,
-        _formatCanonicalUtc(publishedAt),
-        releaseNotes,
-        requiredUpdateReason,
-      ].join('|');
+  /// This ordered canonical JSON payload is deliberately not a cryptographic
+  /// signature. JSON escaping and fixed field order make every exact field
+  /// boundary unambiguous without a hash dependency. APP-113 persists it after
+  /// trusted transport, strict parsing, and anti-rollback validation so
+  /// required policy survives restart/offline. Downloaded-APK verification is
+  /// a separate install gate.
+  String get canonicalFingerprint => jsonEncode(<String, Object?>{
+        'schemaVersion': _schemaVersion,
+        'updatesEnabled': true,
+        'manifestRevision': manifestRevision,
+        'latestVersion': latestVersion,
+        'latestVersionCode': latestVersionCode,
+        'minimumSupportedVersionCode': minimumSupportedVersionCode,
+        'artifactUrl': artifactUrl.toString(),
+        'sha256': sha256,
+        'sizeBytes': sizeBytes,
+        'publishedAt': _formatCanonicalUtc(publishedAt),
+        'releaseNotes': releaseNotes,
+        'requiredUpdateReason': requiredUpdateReason,
+      });
 }
 
 class DisabledReleaseManifest {
@@ -77,6 +81,15 @@ class DisabledReleaseManifest {
   final int manifestRevision;
   final DateTime publishedAt;
   final String reason;
+
+  /// The canonical identity for a strict v1 disabled policy.
+  String get canonicalFingerprint => jsonEncode(<String, Object?>{
+        'schemaVersion': _schemaVersion,
+        'updatesEnabled': false,
+        'manifestRevision': manifestRevision,
+        'publishedAt': _formatCanonicalUtc(publishedAt),
+        'reason': reason,
+      });
 }
 
 sealed class ReleaseManifestParseResult {
@@ -85,17 +98,45 @@ sealed class ReleaseManifestParseResult {
   bool get isMalformed => this is MalformedReleaseManifest;
 }
 
-class AvailableReleaseManifestResult extends ReleaseManifestParseResult {
+/// A strictly parsed policy that is safe to offer to anti-rollback helpers.
+/// Malformed input has no subtype here and cannot become a high-water value.
+sealed class ValidReleaseManifestResult extends ReleaseManifestParseResult {
+  const ValidReleaseManifestResult();
+
+  int get manifestRevision;
+  String get canonicalFingerprint;
+  bool get isLegacyDisabled;
+}
+
+class AvailableReleaseManifestResult extends ValidReleaseManifestResult {
   const AvailableReleaseManifestResult(this.manifest);
 
   final AvailableReleaseManifest manifest;
+
+  @override
+  int get manifestRevision => manifest.manifestRevision;
+
+  @override
+  String get canonicalFingerprint => manifest.canonicalFingerprint;
+
+  @override
+  bool get isLegacyDisabled => false;
 }
 
-class DisabledReleaseManifestResult extends ReleaseManifestParseResult {
+class DisabledReleaseManifestResult extends ValidReleaseManifestResult {
   const DisabledReleaseManifestResult(this.manifest, {this.isLegacy = false});
 
   final DisabledReleaseManifest manifest;
   final bool isLegacy;
+
+  @override
+  int get manifestRevision => manifest.manifestRevision;
+
+  @override
+  String get canonicalFingerprint => manifest.canonicalFingerprint;
+
+  @override
+  bool get isLegacyDisabled => isLegacy;
 }
 
 /// Does not carry any values from the rejected document.
@@ -393,9 +434,13 @@ ReleaseUpdateClassification classifyReleaseUpdate(
 }
 
 /// The persisted APP-113 high-water values needed to reject policy rollback.
-/// Persistence and lifecycle policy are deliberately outside APP-104.
+///
+/// This represents a strict v1 policy only. A legacy disabled response is
+/// accepted solely before any v1 state exists and therefore cannot create,
+/// replace, or clear one of these values. Persistence and lifecycle policy are
+/// deliberately outside APP-104.
 class ReleaseManifestHighWaterMark {
-  const ReleaseManifestHighWaterMark({
+  const ReleaseManifestHighWaterMark._({
     required this.manifestRevision,
     required this.canonicalFingerprint,
     required this.latestVersionCode,
@@ -404,18 +449,39 @@ class ReleaseManifestHighWaterMark {
 
   final int manifestRevision;
   final String canonicalFingerprint;
-  final int latestVersionCode;
-  final int minimumSupportedVersionCode;
 
-  factory ReleaseManifestHighWaterMark.fromManifest(
-    AvailableReleaseManifest manifest,
-  ) =>
-      ReleaseManifestHighWaterMark(
-        manifestRevision: manifest.manifestRevision,
-        canonicalFingerprint: manifest.canonicalFingerprint,
-        latestVersionCode: manifest.latestVersionCode,
-        minimumSupportedVersionCode: manifest.minimumSupportedVersionCode,
+  /// Historical maximums survive a newer disabled policy so a later available
+  /// policy cannot regress either version-code threshold.
+  final int? latestVersionCode;
+  final int? minimumSupportedVersionCode;
+
+  /// Creates the next persisted high-water value from an accepted strict v1
+  /// policy. Callers must validate it first with [validateManifestHighWater].
+  /// A legacy response intentionally has no v1 high-water representation.
+  factory ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+    ValidReleaseManifestResult policy, {
+    ReleaseManifestHighWaterMark? previous,
+  }) {
+    if (policy.isLegacyDisabled) {
+      throw ArgumentError.value(
+        policy,
+        'policy',
+        'a legacy disabled response must not advance v1 policy state',
       );
+    }
+    final available = switch (policy) {
+      AvailableReleaseManifestResult(:final manifest) => manifest,
+      DisabledReleaseManifestResult() => null,
+    };
+    return ReleaseManifestHighWaterMark._(
+      manifestRevision: policy.manifestRevision,
+      canonicalFingerprint: policy.canonicalFingerprint,
+      latestVersionCode:
+          available?.latestVersionCode ?? previous?.latestVersionCode,
+      minimumSupportedVersionCode: available?.minimumSupportedVersionCode ??
+          previous?.minimumSupportedVersionCode,
+    );
+  }
 }
 
 enum ReleaseManifestRollbackFailure {
@@ -423,6 +489,7 @@ enum ReleaseManifestRollbackFailure {
   changedPayloadAtSameRevision,
   latestVersionCodeRegression,
   minimumSupportedVersionCodeRegression,
+  legacyDisabledAfterV1Policy,
 }
 
 class ReleaseManifestRollbackValidation {
@@ -433,12 +500,25 @@ class ReleaseManifestRollbackValidation {
   bool get isAccepted => failure == null;
 }
 
-/// Rejects a lower revision, a changed payload at the same revision, and
-/// lower latest/minimum codes than a previously accepted available manifest.
+/// Validates a strictly parsed common policy against persisted v1 high-water.
+///
+/// It rejects lower revisions, a changed payload at the same revision, and
+/// lower latest/minimum codes than any previously accepted available policy.
+/// A newer strict disabled policy may relax an active required policy, but its
+/// next high-water mark retains historical version-code maximums. An exact
+/// legacy disabled response is only accepted before v1 state exists.
 ReleaseManifestRollbackValidation validateManifestHighWater(
-  AvailableReleaseManifest candidate, {
+  ValidReleaseManifestResult candidate, {
   ReleaseManifestHighWaterMark? previous,
 }) {
+  if (candidate.isLegacyDisabled) {
+    if (previous != null) {
+      return const ReleaseManifestRollbackValidation._(
+        ReleaseManifestRollbackFailure.legacyDisabledAfterV1Policy,
+      );
+    }
+    return const ReleaseManifestRollbackValidation.accepted();
+  }
   if (previous == null) {
     return const ReleaseManifestRollbackValidation.accepted();
   }
@@ -453,16 +533,20 @@ ReleaseManifestRollbackValidation validateManifestHighWater(
       ReleaseManifestRollbackFailure.changedPayloadAtSameRevision,
     );
   }
-  if (candidate.latestVersionCode < previous.latestVersionCode) {
-    return const ReleaseManifestRollbackValidation._(
-      ReleaseManifestRollbackFailure.latestVersionCodeRegression,
-    );
-  }
-  if (candidate.minimumSupportedVersionCode <
-      previous.minimumSupportedVersionCode) {
-    return const ReleaseManifestRollbackValidation._(
-      ReleaseManifestRollbackFailure.minimumSupportedVersionCodeRegression,
-    );
+  if (candidate case AvailableReleaseManifestResult(:final manifest)) {
+    if (previous.latestVersionCode != null &&
+        manifest.latestVersionCode < previous.latestVersionCode!) {
+      return const ReleaseManifestRollbackValidation._(
+        ReleaseManifestRollbackFailure.latestVersionCodeRegression,
+      );
+    }
+    if (previous.minimumSupportedVersionCode != null &&
+        manifest.minimumSupportedVersionCode <
+            previous.minimumSupportedVersionCode!) {
+      return const ReleaseManifestRollbackValidation._(
+        ReleaseManifestRollbackFailure.minimumSupportedVersionCodeRegression,
+      );
+    }
   }
   return const ReleaseManifestRollbackValidation.accepted();
 }

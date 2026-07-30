@@ -16,10 +16,16 @@ void main() {
   ReleaseManifestParseResult parse(Map<String, Object?> payload) =>
       ReleaseManifestParser.parse(payload, trustedNowUtc: _trustedNow);
 
-  AvailableReleaseManifest available(Map<String, Object?> payload) {
+  AvailableReleaseManifestResult available(Map<String, Object?> payload) {
     final result = parse(payload);
     expect(result, isA<AvailableReleaseManifestResult>());
-    return (result as AvailableReleaseManifestResult).manifest;
+    return result as AvailableReleaseManifestResult;
+  }
+
+  DisabledReleaseManifestResult disabled(Map<String, Object?> payload) {
+    final result = parse(payload);
+    expect(result, isA<DisabledReleaseManifestResult>());
+    return result as DisabledReleaseManifestResult;
   }
 
   test(
@@ -57,8 +63,10 @@ void main() {
         expect(newer.state, ReleaseUpdateState.current);
         expect(newer.manifest!.artifactUrl.path, '/releases/damsure-10400.apk');
         expect(
-          classifyReleaseUpdate(result, installedVersionCode: 10299)
-              .requiredUpdateReason,
+          classifyReleaseUpdate(
+            result,
+            installedVersionCode: 10299,
+          ).requiredUpdateReason,
           'Please update to continue using Damsure.',
         );
       },
@@ -245,7 +253,9 @@ void main() {
       'accepts a matching high-water payload and rejects a revision regression',
       () {
         final baseline = available(fixture('available_current'));
-        final highWater = ReleaseManifestHighWaterMark.fromManifest(baseline);
+        final highWater = ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+          baseline,
+        );
 
         expect(
           validateManifestHighWater(baseline, previous: highWater).isAccepted,
@@ -271,7 +281,7 @@ void main() {
 
       final result = validateManifestHighWater(
         available(changedPayload),
-        previous: ReleaseManifestHighWaterMark.fromManifest(baseline),
+        previous: ReleaseManifestHighWaterMark.fromAcceptedPolicy(baseline),
       );
       expect(
         result.failure,
@@ -281,7 +291,9 @@ void main() {
 
     test('rejects latest and minimum version-code regressions', () {
       final baseline = available(fixture('available_current'));
-      final highWater = ReleaseManifestHighWaterMark.fromManifest(baseline);
+      final highWater = ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+        baseline,
+      );
       final latestRegression = fixture('available_current')
         ..['manifestRevision'] = 43
         ..['latestVersionCode'] = 10399
@@ -307,5 +319,152 @@ void main() {
         ReleaseManifestRollbackFailure.minimumSupportedVersionCodeRegression,
       );
     });
+
+    test(
+      'uses canonical JSON so pipe-delimited field boundaries cannot collide',
+      () {
+        final first = fixture('available_current')
+          ..['releaseNotes'] = 'First|second'
+          ..['requiredUpdateReason'] = 'third';
+        final second = fixture('available_current')
+          ..['releaseNotes'] = 'First'
+          ..['requiredUpdateReason'] = 'second|third';
+        final firstPolicy = available(first);
+        final secondPolicy = available(second);
+
+        // This is the old delimiter representation that collided. Canonical JSON
+        // keeps each string's boundary and type explicit.
+        String oldDelimitedFingerprint(AvailableReleaseManifest manifest) => [
+              1,
+              true,
+              manifest.manifestRevision,
+              manifest.latestVersion,
+              manifest.latestVersionCode,
+              manifest.minimumSupportedVersionCode,
+              manifest.artifactUrl.toString(),
+              manifest.sha256,
+              manifest.sizeBytes,
+              manifest.publishedAt.toIso8601String(),
+              manifest.releaseNotes,
+              manifest.requiredUpdateReason,
+            ].join('|');
+
+        expect(
+          oldDelimitedFingerprint(firstPolicy.manifest),
+          oldDelimitedFingerprint(secondPolicy.manifest),
+        );
+        expect(
+          firstPolicy.canonicalFingerprint,
+          isNot(secondPolicy.canonicalFingerprint),
+        );
+        expect(
+          validateManifestHighWater(
+            secondPolicy,
+            previous: ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+              firstPolicy,
+            ),
+          ).failure,
+          ReleaseManifestRollbackFailure.changedPayloadAtSameRevision,
+        );
+      },
+    );
+
+    test(
+      'validates strict disabled policies across common policy high-water',
+      () {
+        final availablePolicy = available(fixture('available_current'));
+        final availableHighWater =
+            ReleaseManifestHighWaterMark.fromAcceptedPolicy(availablePolicy);
+        final disabledPolicy = disabled(fixture('disabled_v1'));
+
+        expect(
+          validateManifestHighWater(
+            disabledPolicy,
+            previous: availableHighWater,
+          ).isAccepted,
+          isTrue,
+        );
+        final disabledHighWater =
+            ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+          disabledPolicy,
+          previous: availableHighWater,
+        );
+        expect(disabledHighWater.latestVersionCode, 10400);
+        expect(disabledHighWater.minimumSupportedVersionCode, 10300);
+
+        expect(
+          validateManifestHighWater(
+            disabledPolicy,
+            previous: disabledHighWater,
+          ).isAccepted,
+          isTrue,
+        );
+
+        final lowerRevision = fixture('disabled_v1')..['manifestRevision'] = 42;
+        expect(
+          validateManifestHighWater(
+            disabled(lowerRevision),
+            previous: disabledHighWater,
+          ).failure,
+          ReleaseManifestRollbackFailure.revisionRegression,
+        );
+
+        for (final changed in [
+          fixture('disabled_v1')..['reason'] = 'A changed disabled reason.',
+          fixture('disabled_v1')..['publishedAt'] = '2026-07-30T10:04:00Z',
+        ]) {
+          expect(
+            validateManifestHighWater(
+              disabled(changed),
+              previous: disabledHighWater,
+            ).failure,
+            ReleaseManifestRollbackFailure.changedPayloadAtSameRevision,
+          );
+        }
+
+        final laterVersionRegression = fixture('available_current')
+          ..['manifestRevision'] = 44
+          ..['latestVersionCode'] = 10399
+          ..['artifactUrl'] =
+              'https://damsure.nandakrishnan.in/releases/damsure-10399.apk';
+        expect(
+          validateManifestHighWater(
+            available(laterVersionRegression),
+            previous: disabledHighWater,
+          ).failure,
+          ReleaseManifestRollbackFailure.latestVersionCodeRegression,
+        );
+
+        final newerAvailable = fixture('available_current')
+          ..['manifestRevision'] = 44;
+        expect(
+          validateManifestHighWater(
+            available(newerAvailable),
+            previous: disabledHighWater,
+          ).isAccepted,
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'only accepts legacy disabled before v1 state and never persists it',
+      () {
+        final legacy = disabled(fixture('disabled_legacy'));
+        final v1HighWater = ReleaseManifestHighWaterMark.fromAcceptedPolicy(
+          available(fixture('available_current')),
+        );
+
+        expect(validateManifestHighWater(legacy).isAccepted, isTrue);
+        expect(
+          () => ReleaseManifestHighWaterMark.fromAcceptedPolicy(legacy),
+          throwsArgumentError,
+        );
+        expect(
+          validateManifestHighWater(legacy, previous: v1HighWater).failure,
+          ReleaseManifestRollbackFailure.legacyDisabledAfterV1Policy,
+        );
+      },
+    );
   });
 }

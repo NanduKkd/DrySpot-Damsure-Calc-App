@@ -101,12 +101,25 @@ valid-policy rules.
 ## APP-113 anti-rollback integration
 
 The parser provides explicit high-water validation helpers but does not persist
-them. APP-113 should persist the accepted manifest revision, canonical payload
-fingerprint (which includes `requiredUpdateReason`), latest version code, and
-minimum-supported version code immediately after trusted transport, strict
-parsing, and anti-rollback validation. This accepted-policy state is separate
-from downloaded-artifact state: only an APK that subsequently passes byte-size,
-hash, package ID, version code, and signing-certificate verification may be
-offered for installation. The client must reject a lower revision, a different
-payload at the same revision, and a lower latest or minimum version code.
-APP-113 also owns download, install, retry, and startup-gate behavior.
+them. APP-113 should persist each accepted strict v1 policy immediately after
+trusted transport, strict parsing, and anti-rollback validation: its revision,
+canonical payload fingerprint, and the historical maximum latest and minimum
+version codes. The canonical fingerprint is ordered JSON with the exact v1
+available fields in the contract order and their native JSON types; it includes
+`requiredUpdateReason`. This is unambiguous for strings containing delimiters
+and does not require a hash dependency. Strict disabled v1 policies likewise
+use ordered JSON over exactly their five fields.
+
+The client must reject a lower revision and a different payload at the same
+revision for both available and strict disabled v1 policies. It must reject a
+lower latest or minimum version code on a later available policy. A newer
+strict disabled policy may relax cached required policy under PD-005, but it
+retains the historical version-code maximums for a later available policy.
+The exact legacy disabled response is accepted only when no v1 policy
+high-water exists; it is never persisted and never advances or clears that
+high-water. It must be rejected after any v1 state exists.
+
+This accepted-policy state is separate from downloaded-artifact state: only an
+APK that subsequently passes byte-size, hash, package ID, version code, and
+signing-certificate verification may be offered for installation. APP-113 also
+owns download, install, retry, and startup-gate behavior.
