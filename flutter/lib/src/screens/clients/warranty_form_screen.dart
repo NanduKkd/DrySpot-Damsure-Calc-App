@@ -100,10 +100,11 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
     if (!_formKey.currentState!.validate()) return;
 
     final auth = context.read<AuthProvider>();
+    final session = auth.sessionSnapshot;
     final activeFranchiseeId = auth.franchiseeId;
-    if (widget.client.franchiseeId != null &&
-        activeFranchiseeId != null &&
-        widget.client.franchiseeId != activeFranchiseeId) {
+    if (session == null ||
+        widget.client.franchiseeId != activeFranchiseeId ||
+        widget.client.franchiseeId != session.franchiseeId) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
@@ -166,11 +167,13 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
           'replacement_warranty_id': widget.replacementTargetWarrantyId!,
         },
       };
-      final response = await apiService.uploadWarranty(
+      final response = await apiService.uploadWarrantyForSession(
         file.path,
         fields,
+        session,
         idempotencyKey: widget.replacementIdempotencyKey,
       );
+      if (auth.sessionSnapshot?.generation != session.generation) return;
 
       // Save to local DB
       final warranty = Warranty(

@@ -5,6 +5,7 @@ import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/app_config.dart';
+import 'session_manager.dart';
 
 class ApiException implements Exception {
   const ApiException(
@@ -105,6 +106,18 @@ class ApiService {
         if (_hasToken) 'Authorization': 'Bearer $_token',
       };
 
+  Map<String, String> authenticatedHeadersFor(SessionSnapshot? session) => {
+        if (session != null)
+          'Authorization': 'Bearer ${session.token}'
+        else if (_hasToken)
+          'Authorization': 'Bearer $_token',
+      };
+
+  Map<String, String> _headersFor(SessionSnapshot? session) => {
+        'Content-Type': 'application/json',
+        ...authenticatedHeadersFor(session),
+      };
+
   String resolveUrl(String pathOrUrl) {
     final uri = Uri.tryParse(pathOrUrl);
     if (uri != null && uri.hasScheme) return pathOrUrl;
@@ -173,10 +186,7 @@ class ApiService {
     return trimmed;
   }
 
-  ApiException _exceptionFor(
-    http.Response response,
-    String fallbackMessage,
-  ) {
+  ApiException _exceptionFor(http.Response response, String fallbackMessage) {
     var message = _extractErrorMessage(response, fallbackMessage);
     String? code;
     var structuredResponse = false;
@@ -223,10 +233,21 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> sync(Map<String, dynamic> data) async {
+  Future<Map<String, dynamic>> sync(Map<String, dynamic> data) => _sync(data);
+
+  Future<Map<String, dynamic>> syncForSession(
+    Map<String, dynamic> data,
+    SessionSnapshot session,
+  ) =>
+      _sync(data, session);
+
+  Future<Map<String, dynamic>> _sync(
+    Map<String, dynamic> data, [
+    SessionSnapshot? session,
+  ]) async {
     final response = await http.post(
       Uri.parse('$baseUrl/sync'),
-      headers: _headers,
+      headers: _headersFor(session),
       body: jsonEncode(data),
     );
 
@@ -240,10 +261,22 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> syncV2(Map<String, dynamic> data) async {
+  Future<Map<String, dynamic>> syncV2(Map<String, dynamic> data) =>
+      _syncV2(data);
+
+  Future<Map<String, dynamic>> syncV2ForSession(
+    Map<String, dynamic> data,
+    SessionSnapshot session,
+  ) =>
+      _syncV2(data, session);
+
+  Future<Map<String, dynamic>> _syncV2(
+    Map<String, dynamic> data, [
+    SessionSnapshot? session,
+  ]) async {
     final response = await http.post(
       Uri.parse('$baseUrl/sync/v2'),
-      headers: _headers,
+      headers: _headersFor(session),
       body: jsonEncode(data),
     );
 
@@ -261,13 +294,34 @@ class ApiService {
     String filePath,
     Map<String, String> fields, {
     String? idempotencyKey,
+  }) =>
+      _uploadWarranty(filePath, fields, idempotencyKey: idempotencyKey);
+
+  Future<Map<String, dynamic>> uploadWarrantyForSession(
+    String filePath,
+    Map<String, String> fields,
+    SessionSnapshot session, {
+    String? idempotencyKey,
+  }) =>
+      _uploadWarranty(
+        filePath,
+        fields,
+        idempotencyKey: idempotencyKey,
+        session: session,
+      );
+
+  Future<Map<String, dynamic>> _uploadWarranty(
+    String filePath,
+    Map<String, String> fields, {
+    String? idempotencyKey,
+    SessionSnapshot? session,
   }) async {
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/warranty/upload'),
     );
     request.headers.addAll({
-      if (_hasToken) 'Authorization': 'Bearer $_token',
+      ...authenticatedHeadersFor(session),
       if (idempotencyKey != null) 'Idempotency-Key': idempotencyKey,
     });
     request.files.add(
@@ -301,10 +355,43 @@ class ApiService {
     required int warrantyVersion,
     required String irreversibleConfirmation,
     required String idempotencyKey,
+  }) =>
+      _deleteWarranty(
+        id: id,
+        warrantyCardNumber: warrantyCardNumber,
+        warrantyVersion: warrantyVersion,
+        irreversibleConfirmation: irreversibleConfirmation,
+        idempotencyKey: idempotencyKey,
+      );
+
+  Future<Map<String, dynamic>> deleteWarrantyForSession({
+    required String id,
+    required String warrantyCardNumber,
+    required int warrantyVersion,
+    required String irreversibleConfirmation,
+    required String idempotencyKey,
+    required SessionSnapshot session,
+  }) =>
+      _deleteWarranty(
+        id: id,
+        warrantyCardNumber: warrantyCardNumber,
+        warrantyVersion: warrantyVersion,
+        irreversibleConfirmation: irreversibleConfirmation,
+        idempotencyKey: idempotencyKey,
+        session: session,
+      );
+
+  Future<Map<String, dynamic>> _deleteWarranty({
+    required String id,
+    required String warrantyCardNumber,
+    required int warrantyVersion,
+    required String irreversibleConfirmation,
+    required String idempotencyKey,
+    SessionSnapshot? session,
   }) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/warranty/$id'),
-      headers: {..._headers, 'Idempotency-Key': idempotencyKey},
+      headers: {..._headersFor(session), 'Idempotency-Key': idempotencyKey},
       body: jsonEncode({
         'confirmed_warranty_id': id,
         'confirmed_warranty_card_number': warrantyCardNumber,
@@ -334,12 +421,26 @@ class ApiService {
   Future<Map<String, dynamic>> uploadProposal(
     String filePath,
     Map<String, String> fields,
-  ) async {
+  ) =>
+      _uploadProposal(filePath, fields);
+
+  Future<Map<String, dynamic>> uploadProposalForSession(
+    String filePath,
+    Map<String, String> fields,
+    SessionSnapshot session,
+  ) =>
+      _uploadProposal(filePath, fields, session);
+
+  Future<Map<String, dynamic>> _uploadProposal(
+    String filePath,
+    Map<String, String> fields, [
+    SessionSnapshot? session,
+  ]) async {
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/proposal/upload'),
     );
-    request.headers.addAll({if (_hasToken) 'Authorization': 'Bearer $_token'});
+    request.headers.addAll(authenticatedHeadersFor(session));
     request.files.add(
       await http.MultipartFile.fromPath(
         'file',
@@ -365,10 +466,18 @@ class ApiService {
     }
   }
 
-  Future<void> deleteProposal(String id) async {
+  Future<void> deleteProposal(String id) => _deleteProposal(id);
+
+  Future<void> deleteProposalForSession(
+    String id,
+    SessionSnapshot session,
+  ) =>
+      _deleteProposal(id, session);
+
+  Future<void> _deleteProposal(String id, [SessionSnapshot? session]) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/proposal/$id'),
-      headers: _headers,
+      headers: _headersFor(session),
     );
 
     if (response.statusCode != 204) {
@@ -378,12 +487,26 @@ class ApiService {
     }
   }
 
-  Future<String> uploadClientPhoto(String clientId, String filePath) async {
+  Future<String> uploadClientPhoto(String clientId, String filePath) =>
+      _uploadClientPhoto(clientId, filePath);
+
+  Future<String> uploadClientPhotoForSession(
+    String clientId,
+    String filePath,
+    SessionSnapshot session,
+  ) =>
+      _uploadClientPhoto(clientId, filePath, session);
+
+  Future<String> _uploadClientPhoto(
+    String clientId,
+    String filePath, [
+    SessionSnapshot? session,
+  ]) async {
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/photos/client/$clientId'),
     );
-    request.headers.addAll(authenticatedHeaders);
+    request.headers.addAll(authenticatedHeadersFor(session));
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
     final response = await http.Response.fromStream(await request.send());
@@ -409,14 +532,26 @@ class ApiService {
     return url;
   }
 
-  Future<void> deleteClientPhoto(String photoUrl) async {
+  Future<void> deleteClientPhoto(String photoUrl) =>
+      _deleteClientPhoto(photoUrl);
+
+  Future<void> deleteClientPhotoForSession(
+    String photoUrl,
+    SessionSnapshot session,
+  ) =>
+      _deleteClientPhoto(photoUrl, session);
+
+  Future<void> _deleteClientPhoto(
+    String photoUrl, [
+    SessionSnapshot? session,
+  ]) async {
     final resolvedUrl = resolveProtectedClientPhotoUrl(photoUrl);
     if (resolvedUrl == null) {
       throw const ApiException('Photo URL is not on the configured server.');
     }
     final response = await http.delete(
       Uri.parse(resolvedUrl),
-      headers: authenticatedHeaders,
+      headers: authenticatedHeadersFor(session),
     );
     if (response.statusCode != 204) {
       throw ApiException(

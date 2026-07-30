@@ -517,10 +517,7 @@ class DbService {
     ''');
   }
 
-  static bool _isCanonicalClientPhotoPath(
-    String path, {
-    String? remoteId,
-  }) {
+  static bool _isCanonicalClientPhotoPath(String path, {String? remoteId}) {
     final match = _canonicalClientPhoto.firstMatch(path);
     return match != null && (remoteId == null || match.group(1) == remoteId);
   }
@@ -533,9 +530,7 @@ class DbService {
     return decoded.cast<String>();
   }
 
-  static Future<void> _backfillPendingClientPhotos(
-    DatabaseExecutor db,
-  ) async {
+  static Future<void> _backfillPendingClientPhotos(DatabaseExecutor db) async {
     final rows = await db.query(
       'clients',
       columns: ['remote_id', 'franchisee_id', 'photos', 'deleted_at'],
@@ -555,14 +550,13 @@ class DbService {
         (photo) => !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
       )) {
         await db.insert(
-          'pending_client_photos',
-          {
-            'franchisee_id': franchiseeId,
-            'client_remote_id': remoteId,
-            'local_path': path,
-          },
-          conflictAlgorithm: ConflictAlgorithm.ignore,
-        );
+            'pending_client_photos',
+            {
+              'franchisee_id': franchiseeId,
+              'client_remote_id': remoteId,
+              'local_path': path,
+            },
+            conflictAlgorithm: ConflictAlgorithm.ignore);
       }
     }
   }
@@ -676,9 +670,7 @@ class DbService {
     'pending_payload_hash': null,
   };
 
-  Future<bool> _supportsPendingClientPhotos(
-    DatabaseExecutor executor,
-  ) async {
+  Future<bool> _supportsPendingClientPhotos(DatabaseExecutor executor) async {
     final rows = await executor.rawQuery(
       "SELECT name FROM sqlite_master "
       "WHERE type = 'table' AND name = 'pending_client_photos'",
@@ -693,12 +685,7 @@ class DbService {
     if (!await _supportsPendingClientPhotos(executor)) return;
     final rows = await executor.query(
       'clients',
-      columns: [
-        'remote_id',
-        'franchisee_id',
-        'photos',
-        'deleted_at',
-      ],
+      columns: ['remote_id', 'franchisee_id', 'photos', 'deleted_at'],
       where: 'local_id = ?',
       whereArgs: [localId],
       limit: 1,
@@ -740,14 +727,13 @@ class DbService {
     }
     for (final path in desired) {
       await executor.insert(
-        'pending_client_photos',
-        {
-          'franchisee_id': franchiseeId,
-          'client_remote_id': remoteId,
-          'local_path': path,
-        },
-        conflictAlgorithm: ConflictAlgorithm.ignore,
-      );
+          'pending_client_photos',
+          {
+            'franchisee_id': franchiseeId,
+            'client_remote_id': remoteId,
+            'local_path': path,
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
     }
   }
 
@@ -779,6 +765,27 @@ class DbService {
     return clients;
   }
 
+  /// Returns only records owned by [franchiseeId].  Child rows are resolved
+  /// through the already tenant-filtered parent, never after a device-wide
+  /// client read.
+  Future<List<Client>> getClientsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'franchisee_id = ? AND deleted_at IS NULL',
+      whereArgs: [franchiseeId],
+    );
+    final clients = <Client>[];
+    for (final map in maps) {
+      final items = await getItemsByClientIdForFranchisee(
+        map['local_id'] as int,
+        franchiseeId,
+      );
+      clients.add(Client.fromMap(map, items: items));
+    }
+    return clients;
+  }
+
   Future<Client?> getClientByRemoteId(String remoteId) async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -789,6 +796,37 @@ class DbService {
     if (maps.isEmpty) return null;
     final items = await getItemsByClientId(maps.first['local_id']);
     return Client.fromMap(maps.first, items: items);
+  }
+
+  Future<Client?> getClientByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'remote_id = ? AND franchisee_id = ?',
+      whereArgs: [remoteId, franchiseeId],
+      limit: 1,
+    );
+    if (maps.isEmpty) return null;
+    final items = await getItemsByClientIdForFranchisee(
+      maps.first['local_id'] as int,
+      franchiseeId,
+    );
+    return Client.fromMap(maps.first, items: items);
+  }
+
+  Future<bool> ownsClient(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'clients',
+      columns: ['local_id'],
+      where: 'local_id = ? AND franchisee_id = ?',
+      whereArgs: [localId, franchiseeId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
   }
 
   Future<int> updateClient(Client client) async {
@@ -842,17 +880,49 @@ class DbService {
     required String remoteId,
     required String localPath,
     required String canonicalPath,
+  }) =>
+      _acknowledgeClientPhotoUpload(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        localPath: localPath,
+        canonicalPath: canonicalPath,
+      );
+
+  Future<bool> acknowledgeClientPhotoUploadForSession({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _acknowledgeClientPhotoUpload(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        localPath: localPath,
+        canonicalPath: canonicalPath,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<bool> _acknowledgeClientPhotoUpload({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+    bool Function()? isSessionCurrent,
   }) async {
-    if (!_isCanonicalClientPhotoPath(
-      canonicalPath,
-      remoteId: remoteId,
-    )) {
+    if (isSessionCurrent?.call() == false) {
+      throw StateError('A stale session cannot acknowledge a photo upload.');
+    }
+    if (!_isCanonicalClientPhotoPath(canonicalPath, remoteId: remoteId)) {
       throw const FormatException(
         'Photo acknowledgement does not belong to the requested client.',
       );
     }
     final db = await database;
     return db.transaction((transaction) async {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot acknowledge a photo upload.');
+      }
       if (!await _supportsPendingClientPhotos(transaction)) return false;
       final pending = await transaction.query(
         'pending_client_photos',
@@ -899,6 +969,9 @@ class DbService {
         whereArgs: [franchiseeId, remoteId, localPath],
       );
       if (removed != 1) return false;
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot acknowledge a photo upload.');
+      }
       await transaction.update(
         'clients',
         {'photos': jsonEncode(nextPhotos)},
@@ -931,10 +1004,7 @@ class DbService {
           await transaction.delete(
             'pending_client_photos',
             where: 'franchisee_id = ? AND client_remote_id = ?',
-            whereArgs: [
-              rows.single['franchisee_id'],
-              rows.single['remote_id'],
-            ],
+            whereArgs: [rows.single['franchisee_id'], rows.single['remote_id']],
           );
         }
         await _markLocalLwwMutation(transaction, 'clients', localId);
@@ -969,6 +1039,32 @@ class DbService {
     return items;
   }
 
+  Future<List<Item>> getItemsByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.*
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND i.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    final items = <Item>[];
+    for (final map in maps) {
+      final rectangles = await getRectanglesByItemIdForFranchisee(
+        map['local_id'] as int,
+        franchiseeId,
+      );
+      items.add(Item.fromMap(map, rectangles: rectangles));
+    }
+    return items;
+  }
+
   Future<Item?> getItemByRemoteId(String remoteId) async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -978,6 +1074,28 @@ class DbService {
     );
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(maps.first['local_id']);
+    return Item.fromMap(maps.first, rectangles: rectangles);
+  }
+
+  Future<Item?> getItemByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    if (maps.isEmpty) return null;
+    final rectangles = await getRectanglesByItemIdForFranchisee(
+      maps.first['local_id'] as int,
+      franchiseeId,
+    );
     return Item.fromMap(maps.first, rectangles: rectangles);
   }
 
@@ -991,6 +1109,44 @@ class DbService {
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(localId);
     return Item.fromMap(maps.first, rectangles: rectangles);
+  }
+
+  Future<Item?> getItemByLocalIdForFranchisee(
+    int localId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.local_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    if (maps.isEmpty) return null;
+    return Item.fromMap(
+      maps.first,
+      rectangles: await getRectanglesByItemIdForFranchisee(
+        localId,
+        franchiseeId,
+      ),
+    );
+  }
+
+  Future<bool> ownsItem(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT i.local_id FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.local_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    return rows.isNotEmpty;
   }
 
   Future<int> updateItem(Item item) async {
@@ -1047,6 +1203,25 @@ class DbService {
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
+  Future<List<Rectangle>> getRectanglesByItemIdForFranchisee(
+    int itemId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.*
+      FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.item_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND i.deleted_at IS NULL AND r.deleted_at IS NULL
+      ''',
+      [itemId, franchiseeId],
+    );
+    return [for (final map in maps) Rectangle.fromMap(map)];
+  }
+
   Future<Rectangle?> getRectangleByRemoteId(String remoteId) async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -1056,6 +1231,39 @@ class DbService {
     );
     if (maps.isEmpty) return null;
     return Rectangle.fromMap(maps.first);
+  }
+
+  Future<Rectangle?> getRectangleByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.* FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Rectangle.fromMap(maps.first);
+  }
+
+  Future<bool> ownsRectangle(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT r.local_id FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.local_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    return rows.isNotEmpty;
   }
 
   Future<int> updateRectangle(Rectangle rectangle) async {
@@ -1096,23 +1304,46 @@ class DbService {
 
   // DefaultPrice CRUD
   Future<int> claimLegacyDefaultPrices(String franchiseeId) async {
+    return _claimLegacyDefaultPrices(franchiseeId);
+  }
+
+  /// Claims the one-time legacy price rows only while the caller's immutable
+  /// session remains current. A stale login or logout therefore cannot make a
+  /// tenant-visible mutation after the session boundary has moved.
+  Future<int> claimLegacyDefaultPricesForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    return _claimLegacyDefaultPrices(
+      franchiseeId,
+      isSessionCurrent: isSessionCurrent,
+    );
+  }
+
+  Future<int> _claimLegacyDefaultPrices(
+    String franchiseeId, {
+    bool Function()? isSessionCurrent,
+  }) async {
     final normalizedFranchiseeId = franchiseeId.trim();
     if (normalizedFranchiseeId.isEmpty) {
       throw ArgumentError('A franchisee is required to claim legacy prices');
     }
+    if (isSessionCurrent != null && !isSessionCurrent()) return 0;
     final db = await database;
-    return db.update(
+    return db.transaction((transaction) async {
+      if (isSessionCurrent != null && !isSessionCurrent()) return 0;
+      return transaction.update(
         'default_prices',
         {
           'franchisee_id': normalizedFranchiseeId,
           'is_dirty': 1,
         },
-        where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''");
+        where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''",
+      );
+    });
   }
 
-  Future<void> rebasePendingLwwChangesForBootstrap(
-    String franchiseeId,
-  ) async {
+  Future<void> rebasePendingLwwChangesForBootstrap(String franchiseeId) async {
     final db = await database;
     await db.transaction((transaction) async {
       final tableQueries = <String, String>{
@@ -1158,8 +1389,11 @@ class DbService {
             );
           }
           final currentRank = _operationRankForRow(row);
-          final currentHash =
-              _currentLwwPayloadHash(entry.key, row, currentRank);
+          final currentHash = _currentLwwPayloadHash(
+            entry.key,
+            row,
+            currentRank,
+          );
           final pendingRank = row['pending_operation_rank'] as int?;
           final pendingHash = row['pending_payload_hash']?.toString();
           final pendingWriter = row['pending_writer_id']?.toString();
@@ -1189,10 +1423,7 @@ class DbService {
           if (exactCommitted) {
             await transaction.update(
               entry.key,
-              {
-                'is_dirty': 0,
-                ..._clearPendingLww,
-              },
+              {'is_dirty': 0, ..._clearPendingLww},
               where: '''
                 local_id = ?
                 AND is_dirty = 1
@@ -1352,6 +1583,24 @@ class DbService {
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
   }
 
+  Future<List<Warranty>> getWarrantiesByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.*
+      FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE w.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND w.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    return [for (final map in maps) Warranty.fromMap(map)];
+  }
+
   Future<Warranty?> getWarrantyByRemoteId(String remoteId) async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -1361,6 +1610,23 @@ class DbService {
     );
     if (maps.isEmpty) return null;
     return Warranty.fromMap(maps.first);
+  }
+
+  Future<Warranty?> getWarrantyByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.* FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE w.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Warranty.fromMap(maps.first);
   }
 
   Future<int> updateWarranty(Warranty warranty) async {
@@ -1465,10 +1731,44 @@ class DbService {
     List<WarrantyDeletionTombstone> tombstones, {
     required String franchiseeId,
     required String cursor,
+  }) =>
+      _applyWarrantyTombstonesAndCursor(
+        tombstones,
+        franchiseeId: franchiseeId,
+        cursor: cursor,
+      );
+
+  Future<void> applyWarrantyTombstonesAndCursorForSession(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _applyWarrantyTombstonesAndCursor(
+        tombstones,
+        franchiseeId: franchiseeId,
+        cursor: cursor,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _applyWarrantyTombstonesAndCursor(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+    bool Function()? isSessionCurrent,
   }) async {
+    if (isSessionCurrent?.call() == false) {
+      throw StateError('A stale session cannot apply warranty tombstones.');
+    }
     final db = await database;
     await db.transaction((transaction) async {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
+      }
       for (final tombstone in tombstones) {
+        if (isSessionCurrent?.call() == false) {
+          throw StateError('A stale session cannot apply warranty tombstones.');
+        }
         if (tombstone.franchiseeId != franchiseeId) {
           throw ArgumentError('A tombstone cannot cross the active franchisee');
         }
@@ -1482,6 +1782,9 @@ class DbService {
           where: 'remote_id = ?',
           whereArgs: [tombstone.warrantyId],
         );
+      }
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
       }
       await transaction.insert(
           'sync_state',
@@ -1524,6 +1827,24 @@ class DbService {
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
+  Future<List<Proposal>> getProposalsByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.*
+      FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE p.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND p.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    return [for (final map in maps) Proposal.fromMap(map)];
+  }
+
   Future<Proposal?> getProposalByRemoteId(String remoteId) async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -1533,6 +1854,23 @@ class DbService {
     );
     if (maps.isEmpty) return null;
     return Proposal.fromMap(maps.first);
+  }
+
+  Future<Proposal?> getProposalByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.* FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE p.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Proposal.fromMap(maps.first);
   }
 
   Future<int> updateProposal(Proposal proposal) async {
@@ -1778,11 +2116,11 @@ class DbService {
     for (final pair in [
       [
         incoming['writer_id'].toString(),
-        existing['server_writer_id']?.toString() ?? ''
+        existing['server_writer_id']?.toString() ?? '',
       ],
       [
         incoming['change_id'].toString(),
-        existing['server_change_id']?.toString() ?? ''
+        existing['server_change_id']?.toString() ?? '',
       ],
     ]) {
       if (pair[0] != pair[1]) return pair[0].compareTo(pair[1]);
@@ -1811,9 +2149,7 @@ class DbService {
         whereArgs: [franchiseeId, remoteId],
         orderBy: 'rowid',
       );
-      pendingPaths.addAll(
-        rows.map((row) => row['local_path'] as String),
-      );
+      pendingPaths.addAll(rows.map((row) => row['local_path'] as String));
     } else {
       pendingPaths.addAll(
         legacyFallback.where(
@@ -2174,7 +2510,8 @@ class DbService {
     final current = rows.isEmpty ? '0' : rows.first['value'] as String;
     if (current != expected) {
       throw StateError(
-          'A delayed sync response lost its cursor compare-and-set.');
+        'A delayed sync response lost its cursor compare-and-set.',
+      );
     }
   }
 
@@ -2189,10 +2526,12 @@ class DbService {
     }
     if (expected == '0') {
       await executor.insert(
-        'sync_state',
-        {'key': key, 'value': '0'},
-        conflictAlgorithm: ConflictAlgorithm.ignore,
-      );
+          'sync_state',
+          {
+            'key': key,
+            'value': '0',
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
     }
     final changed = await executor.update(
       'sync_state',
@@ -2202,7 +2541,8 @@ class DbService {
     );
     if (changed != 1) {
       throw StateError(
-          'A delayed sync response lost its cursor compare-and-set.');
+        'A delayed sync response lost its cursor compare-and-set.',
+      );
     }
   }
 
@@ -2219,9 +2559,78 @@ class DbService {
     required Map<String, Map<String, String>> submittedChangeIds,
     required Map<String, String> outcomeStatuses,
     required bool activateProtocol,
+  }) =>
+      _applySyncV2Response(
+        franchiseeId: franchiseeId,
+        requestCursor: requestCursor,
+        responseCursor: responseCursor,
+        requestWarrantyTombstoneCursor: requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor: warrantyTombstoneCursor,
+        records: records,
+        warranties: warranties,
+        proposals: proposals,
+        warrantyTombstones: warrantyTombstones,
+        submittedChangeIds: submittedChangeIds,
+        outcomeStatuses: outcomeStatuses,
+        activateProtocol: activateProtocol,
+      );
+
+  Future<void> applySyncV2ResponseForSession({
+    required String franchiseeId,
+    required String requestCursor,
+    required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _applySyncV2Response(
+        franchiseeId: franchiseeId,
+        requestCursor: requestCursor,
+        responseCursor: responseCursor,
+        requestWarrantyTombstoneCursor: requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor: warrantyTombstoneCursor,
+        records: records,
+        warranties: warranties,
+        proposals: proposals,
+        warrantyTombstones: warrantyTombstones,
+        submittedChangeIds: submittedChangeIds,
+        outcomeStatuses: outcomeStatuses,
+        activateProtocol: activateProtocol,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _applySyncV2Response({
+    required String franchiseeId,
+    required String requestCursor,
+    required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+    bool Function()? isSessionCurrent,
   }) async {
+    void requireCurrent() {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply a sync response.');
+      }
+    }
+
+    requireCurrent();
     final db = await database;
     await db.transaction((transaction) async {
+      requireCurrent();
       await _assertSyncStateCursor(
         transaction,
         _syncV2CursorKey(franchiseeId),
@@ -2233,6 +2642,7 @@ class DbService {
         requestWarrantyTombstoneCursor,
       );
       for (final tombstone in warrantyTombstones) {
+        requireCurrent();
         if (tombstone.franchiseeId != franchiseeId) {
           throw ArgumentError('A tombstone cannot cross the active franchisee');
         }
@@ -2249,6 +2659,7 @@ class DbService {
       }
       for (final collection in _lwwTables) {
         for (final record in records[collection] ?? const []) {
+          requireCurrent();
           await _applyV2Record(
             transaction,
             collection,
@@ -2261,6 +2672,7 @@ class DbService {
         }
       }
       for (final warranty in warranties) {
+        requireCurrent();
         await _applyV2Warranty(
           transaction,
           warranty,
@@ -2268,18 +2680,21 @@ class DbService {
         );
       }
       for (final proposal in proposals) {
+        requireCurrent();
         await _applyV2Proposal(
           transaction,
           proposal,
           franchiseeId: franchiseeId,
         );
       }
+      requireCurrent();
       await _casSyncStateCursor(
         transaction,
         _syncV2CursorKey(franchiseeId),
         requestCursor,
         responseCursor,
       );
+      requireCurrent();
       await _casSyncStateCursor(
         transaction,
         _warrantyTombstoneCursorKey(franchiseeId),
@@ -2287,6 +2702,7 @@ class DbService {
         warrantyTombstoneCursor,
       );
       if (activateProtocol) {
+        requireCurrent();
         await transaction.insert(
             'sync_state',
             {
@@ -2307,6 +2723,16 @@ class DbService {
     return List.generate(maps.length, (i) => Client.fromMap(maps[i]));
   }
 
+  Future<List<Client>> getDirtyClientsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'franchisee_id = ? AND is_dirty = 1',
+      whereArgs: [franchiseeId],
+    );
+    return [for (final map in maps) Client.fromMap(map)];
+  }
+
   Future<List<Item>> getDirtyItems() async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -2316,6 +2742,19 @@ class DbService {
     return List.generate(maps.length, (i) => Item.fromMap(maps[i]));
   }
 
+  Future<List<Item>> getDirtyItemsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ? AND i.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Item.fromMap(map)];
+  }
+
   Future<List<Rectangle>> getDirtyRectangles() async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -2323,6 +2762,22 @@ class DbService {
       where: 'is_dirty = 1',
     );
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
+  }
+
+  Future<List<Rectangle>> getDirtyRectanglesForFranchisee(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.* FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ? AND r.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Rectangle.fromMap(map)];
   }
 
   Future<List<DefaultPrice>> getDirtyDefaultPrices(String franchiseeId) async {
@@ -2358,6 +2813,21 @@ class DbService {
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
   }
 
+  Future<List<Warranty>> getDirtyWarrantiesForFranchisee(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.* FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE c.franchisee_id = ? AND w.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Warranty.fromMap(map)];
+  }
+
   Future<List<Proposal>> getDirtyProposals() async {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(
@@ -2365,6 +2835,21 @@ class DbService {
       where: 'is_dirty = 1',
     );
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
+  }
+
+  Future<List<Proposal>> getDirtyProposalsForFranchisee(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.* FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE c.franchisee_id = ? AND p.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Proposal.fromMap(map)];
   }
 
   Future<int> markAsSynced(

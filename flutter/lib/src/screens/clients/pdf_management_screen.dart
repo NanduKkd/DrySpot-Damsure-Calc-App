@@ -6,6 +6,7 @@ import '../../models/client.dart';
 import '../../models/warranty.dart';
 import '../../models/proposal.dart';
 import '../../providers/client_provider.dart';
+import '../../providers/auth_provider.dart';
 import '../../services/api_service.dart';
 import '../../services/pdf_service.dart';
 import '../../services/warranty_replacement_intent_store.dart';
@@ -54,13 +55,22 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
     try {
       final apiService = context.read<ApiService>();
       final clientProvider = context.read<ClientProvider>();
+      final auth = context.read<AuthProvider>();
+      final session = auth.sessionSnapshot;
+      if (session == null ||
+          widget.client.franchiseeId != session.franchiseeId) {
+        return;
+      }
 
       final file = await _pdfService.generateProposalPdf(widget.client);
 
       // Upload to API
-      final response = await apiService.uploadProposal(file.path, {
-        'client_id': widget.client.remoteId,
-      });
+      final response = await apiService.uploadProposalForSession(
+        file.path,
+        {'client_id': widget.client.remoteId},
+        session,
+      );
+      if (auth.sessionSnapshot?.generation != session.generation) return;
 
       // Save to local DB
       final proposal = Proposal(
@@ -206,12 +216,18 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
       );
 
       if (confirm == true && mounted) {
+        final auth = context.read<AuthProvider>();
+        final session = auth.sessionSnapshot;
+        if (session == null ||
+            widget.client.franchiseeId != session.franchiseeId) {
+          return;
+        }
         if (warranty.remoteId.isEmpty) {
           throw const ApiException(
             'This warranty has no server ID. Sync and try again.',
           );
         }
-        await context.read<ApiService>().deleteWarranty(
+        await context.read<ApiService>().deleteWarrantyForSession(
               id: warranty.remoteId,
               warrantyCardNumber: warranty.warrantyCardNumber,
               warrantyVersion: warranty.version,
@@ -219,7 +235,9 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
                 warranty.warrantyCardNumber,
               ),
               idempotencyKey: const Uuid().v4(),
+              session: session,
             );
+        if (auth.sessionSnapshot?.generation != session.generation) return;
         if (!mounted) return;
         await context
             .read<ClientProvider>()
@@ -258,9 +276,16 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
 
     if (confirm == true && mounted) {
       try {
-        if (proposal.remoteId.isNotEmpty) {
-          await apiService.deleteProposal(proposal.remoteId);
+        final auth = context.read<AuthProvider>();
+        final session = auth.sessionSnapshot;
+        if (session == null ||
+            widget.client.franchiseeId != session.franchiseeId) {
+          return;
         }
+        if (proposal.remoteId.isNotEmpty) {
+          await apiService.deleteProposalForSession(proposal.remoteId, session);
+        }
+        if (auth.sessionSnapshot?.generation != session.generation) return;
         await clientProvider.deleteProposal(
           proposal.localId!,
           widget.client.localId!,

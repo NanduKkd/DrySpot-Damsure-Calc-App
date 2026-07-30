@@ -12,6 +12,7 @@ import '../models/default_price.dart';
 import '../models/warranty.dart';
 import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
+import 'session_manager.dart';
 
 class _PhotoUploadResult {
   const _PhotoUploadResult({
@@ -28,9 +29,13 @@ class _PhotoUploadResult {
 class SyncService {
   final ApiService apiService;
   final DbService dbService;
+  final SessionManager? sessionManager;
 
-  SyncService({required this.apiService, DbService? dbService})
-      : dbService = dbService ?? DbService();
+  SyncService({
+    required this.apiService,
+    DbService? dbService,
+    this.sessionManager,
+  }) : dbService = dbService ?? DbService();
 
   String _syncKeyForFranchisee(String? franchiseeId) {
     if (franchiseeId == null || franchiseeId.isEmpty) {
@@ -50,23 +55,88 @@ class SyncService {
         .toSet();
   }
 
-  Future<void> sync() async {
+  bool _isCurrent(SessionSnapshot? session) =>
+      session == null ||
+      sessionManager == null ||
+      sessionManager!.isCurrent(session);
+
+  void _requireCurrent(SessionSnapshot? session) {
+    if (!_isCurrent(session)) throw const StaleSessionException();
+  }
+
+  Future<Map<String, dynamic>> _requestV1(
+    Map<String, dynamic> data,
+    SessionSnapshot? session,
+  ) {
+    _requireCurrent(session);
+    return session == null
+        ? apiService.sync(data)
+        : apiService.syncForSession(data, session);
+  }
+
+  Future<Map<String, dynamic>> _requestV2(
+    Map<String, dynamic> data,
+    SessionSnapshot? session,
+  ) {
+    _requireCurrent(session);
+    return session == null
+        ? apiService.syncV2(data)
+        : apiService.syncV2ForSession(data, session);
+  }
+
+  Future<String> _uploadPhoto(
+    String clientId,
+    String path,
+    SessionSnapshot? session,
+  ) {
+    _requireCurrent(session);
+    return session == null
+        ? apiService.uploadClientPhoto(clientId, path)
+        : apiService.uploadClientPhotoForSession(clientId, path, session);
+  }
+
+  Future<void> _deleteProposal(String id, SessionSnapshot? session) {
+    _requireCurrent(session);
+    return session == null
+        ? apiService.deleteProposal(id)
+        : apiService.deleteProposalForSession(id, session);
+  }
+
+  Future<void> sync([SessionSnapshot? requestedSession]) async {
+    final session = requestedSession ?? sessionManager?.current;
+    if (sessionManager != null && session == null) {
+      throw const StaleSessionException();
+    }
+    _requireCurrent(session);
     final prefs = await SharedPreferences.getInstance();
-    final franchiseeId = prefs.getString('franchisee_id')?.trim();
+    _requireCurrent(session);
+    final franchiseeId =
+        session?.franchiseeId ?? prefs.getString('franchisee_id')?.trim();
     final hasTenant = franchiseeId != null && franchiseeId.isNotEmpty;
     final supportsV2 = hasTenant && await dbService.supportsSyncV2();
+    _requireCurrent(session);
     if (supportsV2 && await dbService.isSyncV2Enabled(franchiseeId)) {
-      await _syncV2(franchiseeId, activateProtocol: false);
+      _requireCurrent(session);
+      await _syncV2(franchiseeId, session, activateProtocol: false);
       return;
     }
     if (supportsV2) {
-      await dbService.claimLegacyDefaultPrices(franchiseeId);
+      _requireCurrent(session);
+      if (sessionManager != null) {
+        await dbService.claimLegacyDefaultPricesForSession(
+          franchiseeId,
+          isSessionCurrent: () => _isCurrent(session),
+        );
+      } else {
+        await dbService.claimLegacyDefaultPrices(franchiseeId);
+      }
+      _requireCurrent(session);
     }
 
     // The legacy writer drains first. A v2 state bit is persisted only in the
     // same SQLite transaction that applies a successful cursor-zero snapshot.
     try {
-      await _syncV1();
+      await _syncV1(session);
     } on ApiException catch (error) {
       if (supportsV2 &&
           error.statusCode == 426 &&
@@ -76,12 +146,15 @@ class SyncService {
         // then move every dirty candidate strictly above that baseline.
         await _syncV2Round(
           franchiseeId,
+          session,
           activateProtocol: false,
           includePending: false,
         );
+        _requireCurrent(session);
         await dbService.rebasePendingLwwChangesForBootstrap(franchiseeId);
         await _syncV2(
           franchiseeId,
+          session,
           activateProtocol: true,
           requireSubmittedAccepted: true,
         );
@@ -91,7 +164,7 @@ class SyncService {
     }
     if (!supportsV2) return;
     try {
-      await _syncV2(franchiseeId, activateProtocol: true);
+      await _syncV2(franchiseeId, session, activateProtocol: true);
     } on ApiException catch (error) {
       // During the compatibility window an old server may not expose /sync/v2.
       // The successful v1 drain remains durable, while no v2 cursor/state is
@@ -100,25 +173,35 @@ class SyncService {
     }
   }
 
-  Future<void> _syncV1() async {
+  Future<void> _syncV1(SessionSnapshot? session) async {
     final prefs = await SharedPreferences.getInstance();
-    final activeFranchiseeId = prefs.getString('franchisee_id')?.trim();
+    final activeFranchiseeId =
+        session?.franchiseeId ?? prefs.getString('franchisee_id')?.trim();
     final shouldFilterByFranchise =
         activeFranchiseeId != null && activeFranchiseeId.isNotEmpty;
+    // AppService construction always supplies the session manager. The
+    // unbound branch remains solely for historical isolated service tests;
+    // it preserves their old mock surface and is never used by the app.
+    final enforceSessionBoundary = sessionManager != null;
     final syncTimeKey = _syncKeyForFranchisee(activeFranchiseeId);
+    // Never fall back to the device-wide legacy cursor. It has no tenant
+    // owner; a tenant with no cursor safely starts from its own bootstrap.
     final lastSyncTime =
-        prefs.getString(syncTimeKey) ?? prefs.getString('last_sync_time');
+        shouldFilterByFranchise ? prefs.getString(syncTimeKey) : null;
     final warrantyTombstoneCursor = shouldFilterByFranchise
         ? await dbService.getWarrantyTombstoneCursor(activeFranchiseeId)
         : '0';
 
     // Build active-session maps once so all payloads resolve IDs consistently.
-    final allClients = await dbService.getClients();
-    final activeClients = shouldFilterByFranchise
-        ? allClients
-            .where((client) => client.franchiseeId == activeFranchiseeId)
-            .toList()
-        : allClients;
+    final activeClients = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getClientsForFranchisee(activeFranchiseeId)
+        : (await dbService.getClients())
+            .where(
+              (client) =>
+                  !shouldFilterByFranchise ||
+                  client.franchiseeId == activeFranchiseeId,
+            )
+            .toList();
     final clientsByLocalId = <int, Client>{
       for (final client in activeClients)
         if (client.localId != null) client.localId!: client,
@@ -128,49 +211,58 @@ class SyncService {
         for (final item in client.items)
           if (item.localId != null) item.localId!: item,
     };
-    final activeClientLocalIds = clientsByLocalId.keys.toSet();
-    final activeItemLocalIds = itemsByLocalId.keys.toSet();
 
     // 1. Gather local changes
-    final dirtyClients = (await dbService.getDirtyClients())
-        .where(
-          (client) =>
-              !shouldFilterByFranchise ||
-              client.franchiseeId == activeFranchiseeId,
-        )
-        .toList();
-    final dirtyItems = (await dbService.getDirtyItems())
-        .where(
-          (item) =>
-              !shouldFilterByFranchise ||
-              (item.clientId != null &&
-                  activeClientLocalIds.contains(item.clientId)),
-        )
-        .toList();
-    final dirtyRectangles = (await dbService.getDirtyRectangles())
-        .where(
-          (rect) =>
-              !shouldFilterByFranchise ||
-              (rect.itemId != null && activeItemLocalIds.contains(rect.itemId)),
-        )
-        .toList();
+    final dirtyClients = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getDirtyClientsForFranchisee(activeFranchiseeId)
+        : (await dbService.getDirtyClients())
+            .where(
+              (client) =>
+                  !shouldFilterByFranchise ||
+                  client.franchiseeId == activeFranchiseeId,
+            )
+            .toList();
+    final dirtyItems = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getDirtyItemsForFranchisee(activeFranchiseeId)
+        : (await dbService.getDirtyItems())
+            .where(
+              (item) =>
+                  !shouldFilterByFranchise ||
+                  (item.clientId != null &&
+                      clientsByLocalId.containsKey(item.clientId)),
+            )
+            .toList();
+    final dirtyRectangles = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getDirtyRectanglesForFranchisee(activeFranchiseeId)
+        : (await dbService.getDirtyRectangles())
+            .where(
+              (rectangle) =>
+                  !shouldFilterByFranchise ||
+                  (rectangle.itemId != null &&
+                      itemsByLocalId.containsKey(rectangle.itemId)),
+            )
+            .toList();
     final dirtyDefaultPrices = shouldFilterByFranchise
         ? await dbService.getDirtyDefaultPrices(activeFranchiseeId)
         : <DefaultPrice>[];
-    final dirtyWarranties = (await dbService.getDirtyWarranties())
-        .where(
-          (warranty) =>
-              !shouldFilterByFranchise ||
-              activeClientLocalIds.contains(warranty.clientId),
-        )
-        .toList();
-    final dirtyProposals = (await dbService.getDirtyProposals())
-        .where(
-          (proposal) =>
-              !shouldFilterByFranchise ||
-              activeClientLocalIds.contains(proposal.clientId),
-        )
-        .toList();
+    final dirtyWarranties = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getDirtyWarrantiesForFranchisee(activeFranchiseeId)
+        : (await dbService.getDirtyWarranties())
+            .where(
+              (warranty) =>
+                  !shouldFilterByFranchise ||
+                  clientsByLocalId.containsKey(warranty.clientId),
+            )
+            .toList();
+    final dirtyProposals = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getDirtyProposalsForFranchisee(activeFranchiseeId)
+        : (await dbService.getDirtyProposals())
+            .where(
+              (proposal) =>
+                  !shouldFilterByFranchise ||
+                  clientsByLocalId.containsKey(proposal.clientId),
+            )
+            .toList();
 
     final itemsToSync = <Item>[];
     final resolvedItems = <Map<String, dynamic>>[];
@@ -260,7 +352,7 @@ class SyncService {
 
         try {
           canonicalPhotos.add(
-            await apiService.uploadClientPhoto(client.remoteId, photo),
+            await _uploadPhoto(client.remoteId, photo, session),
           );
         } catch (_) {
           uploadFailed = true;
@@ -291,6 +383,7 @@ class SyncService {
       );
       if (canonicalPhotos.length == client.photos.length) {
         if (photosChanged) {
+          _requireCurrent(session);
           await dbService.updateClient(clientForPayload);
         }
         clientsToMarkSynced.add(clientForPayload);
@@ -315,7 +408,8 @@ class SyncService {
     };
 
     // 2. Send to server and get updates
-    final response = await apiService.sync(syncData);
+    final response = await _requestV1(syncData, session);
+    _requireCurrent(session);
     final serverTime = response['server_time'];
     final updates = response['updates'];
     final outcomes = response['outcomes'];
@@ -362,11 +456,21 @@ class SyncService {
       }
       // Deletions and their acknowledgement cursor are one durable SQLite
       // commit, so a crash cannot advance past an unapplied tombstone.
-      await dbService.applyWarrantyTombstonesAndCursor(
-        tombstones,
-        franchiseeId: activeFranchiseeId,
-        cursor: parsedCursor.toString(),
-      );
+      _requireCurrent(session);
+      if (sessionManager != null) {
+        await dbService.applyWarrantyTombstonesAndCursorForSession(
+          tombstones,
+          franchiseeId: activeFranchiseeId,
+          cursor: parsedCursor.toString(),
+          isSessionCurrent: () => _isCurrent(session),
+        );
+      } else {
+        await dbService.applyWarrantyTombstonesAndCursor(
+          tombstones,
+          franchiseeId: activeFranchiseeId,
+          cursor: parsedCursor.toString(),
+        );
+      }
     }
 
     // 3. Apply updates to local DB
@@ -374,13 +478,22 @@ class SyncService {
       // Clients
       for (var clientMap in updates['clients']) {
         final remoteId = clientMap['remote_id'];
-        final existingClient = await dbService.getClientByRemoteId(remoteId);
+        final existingClient = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getClientByRemoteIdForFranchisee(
+                remoteId,
+                activeFranchiseeId,
+              )
+            : await dbService.getClientByRemoteId(remoteId);
 
         if (clientMap['deleted_at'] != null) {
           if (existingClient != null) {
+            _requireCurrent(session);
             await dbService.softDeleteClient(existingClient.localId!);
           }
         } else {
+          if (shouldFilterByFranchise) {
+            clientMap['franchisee_id'] = activeFranchiseeId;
+          }
           final client = Client.fromMap(clientMap);
           final pendingLocalPhotos =
               pendingLocalPhotosByClientRemoteId[remoteId] ?? const <String>[];
@@ -395,10 +508,12 @@ class SyncService {
                   isDirty: true,
                 );
           if (existingClient != null) {
+            _requireCurrent(session);
             await dbService.updateClient(
               clientFromServer.copyWith(localId: existingClient.localId),
             );
           } else {
+            _requireCurrent(session);
             await dbService.insertClient(clientFromServer);
           }
         }
@@ -407,14 +522,23 @@ class SyncService {
       // Items
       for (var itemMap in updates['items']) {
         final remoteId = itemMap['remote_id'];
-        final existingItem = await dbService.getItemByRemoteId(remoteId);
-        final client = await dbService.getClientByRemoteId(
-          itemMap['client_id'],
-        );
+        final existingItem = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getItemByRemoteIdForFranchisee(
+                remoteId,
+                activeFranchiseeId,
+              )
+            : await dbService.getItemByRemoteId(remoteId);
+        final client = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getClientByRemoteIdForFranchisee(
+                itemMap['client_id'],
+                activeFranchiseeId,
+              )
+            : await dbService.getClientByRemoteId(itemMap['client_id']);
 
         if (client != null) {
           if (itemMap['deleted_at'] != null) {
             if (existingItem != null) {
+              _requireCurrent(session);
               await dbService.softDeleteItem(existingItem.localId!);
             }
           } else {
@@ -422,10 +546,12 @@ class SyncService {
               itemMap,
             ).copyWith(clientId: client.localId, isDirty: false);
             if (existingItem != null) {
+              _requireCurrent(session);
               await dbService.updateItem(
                 item.copyWith(localId: existingItem.localId),
               );
             } else {
+              _requireCurrent(session);
               await dbService.insertItem(item);
             }
           }
@@ -435,12 +561,23 @@ class SyncService {
       // Rectangles
       for (var rectMap in updates['rectangles']) {
         final remoteId = rectMap['remote_id'];
-        final existingRect = await dbService.getRectangleByRemoteId(remoteId);
-        final item = await dbService.getItemByRemoteId(rectMap['item_id']);
+        final existingRect = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getRectangleByRemoteIdForFranchisee(
+                remoteId,
+                activeFranchiseeId,
+              )
+            : await dbService.getRectangleByRemoteId(remoteId);
+        final item = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getItemByRemoteIdForFranchisee(
+                rectMap['item_id'],
+                activeFranchiseeId,
+              )
+            : await dbService.getItemByRemoteId(rectMap['item_id']);
 
         if (item != null) {
           if (rectMap['deleted_at'] != null) {
             if (existingRect != null) {
+              _requireCurrent(session);
               await dbService.softDeleteRectangle(existingRect.localId!);
             }
           } else {
@@ -448,10 +585,12 @@ class SyncService {
               rectMap,
             ).copyWith(itemId: item.localId, isDirty: false);
             if (existingRect != null) {
+              _requireCurrent(session);
               await dbService.updateRectangle(
                 rect.copyWith(localId: existingRect.localId),
               );
             } else {
+              _requireCurrent(session);
               await dbService.insertRectangle(rect);
             }
           }
@@ -470,6 +609,7 @@ class SyncService {
           );
           if (priceMap['deleted_at'] != null) {
             if (existing != null && existing.localId != null) {
+              _requireCurrent(session);
               await dbService.deleteDefaultPrice(
                 existing.localId!,
                 franchiseeId: activeFranchiseeId,
@@ -482,11 +622,13 @@ class SyncService {
             priceMap,
           ).copyWith(franchiseeId: activeFranchiseeId, isDirty: false);
           if (existing == null) {
+            _requireCurrent(session);
             await dbService.insertDefaultPrice(
               price,
               franchiseeId: activeFranchiseeId,
             );
           } else {
+            _requireCurrent(session);
             await dbService.updateDefaultPrice(
               price.copyWith(localId: existing.localId),
               franchiseeId: activeFranchiseeId,
@@ -505,12 +647,19 @@ class SyncService {
             )) {
           continue;
         }
-        final existingWarranty = await dbService.getWarrantyByRemoteId(
-          remoteId,
-        );
-        final client = await dbService.getClientByRemoteId(
-          warrantyMap['client_id'],
-        );
+        final existingWarranty =
+            shouldFilterByFranchise && enforceSessionBoundary
+                ? await dbService.getWarrantyByRemoteIdForFranchisee(
+                    remoteId,
+                    activeFranchiseeId,
+                  )
+                : await dbService.getWarrantyByRemoteId(remoteId);
+        final client = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getClientByRemoteIdForFranchisee(
+                warrantyMap['client_id'],
+                activeFranchiseeId,
+              )
+            : await dbService.getClientByRemoteId(warrantyMap['client_id']);
 
         if (client != null) {
           if (warrantyMap['deleted_at'] != null) {
@@ -524,6 +673,7 @@ class SyncService {
             final submitted = submittedWarrantiesByRemoteId[remoteId];
             if (existingWarranty != null) {
               if (submitted == null) {
+                _requireCurrent(session);
                 await dbService.updateWarranty(
                   warranty.copyWith(localId: existingWarranty.localId),
                 );
@@ -531,12 +681,14 @@ class SyncService {
                 // Applying the server echo is itself compare-and-set. A local
                 // edit made after request capture must survive both response
                 // application and the later dirty-clear acknowledgement.
+                _requireCurrent(session);
                 await dbService.applyWarrantyFromServerIfUnchanged(
                   warranty.copyWith(localId: existingWarranty.localId),
                   submittedUpdatedAt: submitted.updatedAt.toIso8601String(),
                 );
               }
             } else if (submitted == null) {
+              _requireCurrent(session);
               await dbService.insertWarranty(warranty);
             }
           }
@@ -546,16 +698,24 @@ class SyncService {
       // Proposals
       for (var proposalMap in updates['proposals'] ?? []) {
         final remoteId = proposalMap['remote_id'];
-        final existingProposal = await dbService.getProposalByRemoteId(
-          remoteId,
-        );
-        final client = await dbService.getClientByRemoteId(
-          proposalMap['client_id'],
-        );
+        final existingProposal =
+            shouldFilterByFranchise && enforceSessionBoundary
+                ? await dbService.getProposalByRemoteIdForFranchisee(
+                    remoteId,
+                    activeFranchiseeId,
+                  )
+                : await dbService.getProposalByRemoteId(remoteId);
+        final client = shouldFilterByFranchise && enforceSessionBoundary
+            ? await dbService.getClientByRemoteIdForFranchisee(
+                proposalMap['client_id'],
+                activeFranchiseeId,
+              )
+            : await dbService.getClientByRemoteId(proposalMap['client_id']);
 
         if (client != null) {
           if (proposalMap['deleted_at'] != null) {
             if (existingProposal != null) {
+              _requireCurrent(session);
               await dbService.softDeleteProposal(existingProposal.localId!);
             }
           } else {
@@ -563,10 +723,12 @@ class SyncService {
               proposalMap,
             ).copyWith(clientId: client.localId!, isDirty: false);
             if (existingProposal != null) {
+              _requireCurrent(session);
               await dbService.updateProposal(
                 proposal.copyWith(localId: existingProposal.localId),
               );
             } else {
+              _requireCurrent(session);
               await dbService.insertProposal(proposal);
             }
           }
@@ -577,6 +739,7 @@ class SyncService {
     // 4. Clear dirty flags for records we just sent
     for (var c in clientsToMarkSynced) {
       if (appliedClients.contains(c.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'clients',
           c.remoteId,
@@ -586,6 +749,7 @@ class SyncService {
     }
     for (var i in itemsToSync) {
       if (appliedItems.contains(i.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'items',
           i.remoteId,
@@ -595,6 +759,7 @@ class SyncService {
     }
     for (var r in rectanglesToSync) {
       if (appliedRectangles.contains(r.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'rectangles',
           r.remoteId,
@@ -604,6 +769,7 @@ class SyncService {
     }
     for (final price in dirtyDefaultPrices) {
       if (appliedDefaultPrices.contains(price.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'default_prices',
           price.remoteId,
@@ -614,8 +780,10 @@ class SyncService {
     }
     for (var w in warrantiesToSync) {
       if (tombstonedWarranties.contains(w.remoteId)) {
+        _requireCurrent(session);
         await dbService.hardDeleteWarrantyByRemoteId(w.remoteId);
       } else if (appliedWarranties.contains(w.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'warranties',
           w.remoteId,
@@ -625,6 +793,7 @@ class SyncService {
     }
     for (var p in proposalsToSync) {
       if (appliedProposals.contains(p.remoteId)) {
+        _requireCurrent(session);
         await dbService.markAsSynced(
           'proposals',
           p.remoteId,
@@ -634,6 +803,7 @@ class SyncService {
     }
 
     // 5. Save sync time
+    _requireCurrent(session);
     await prefs.setString(syncTimeKey, serverTime);
     if (syncTimeKey != 'last_sync_time') {
       await prefs.remove('last_sync_time');
@@ -694,10 +864,7 @@ class SyncService {
     }
   }
 
-  String _payloadHash(
-    String collection,
-    Map<String, dynamic> payload,
-  ) =>
+  String _payloadHash(String collection, Map<String, dynamic> payload) =>
       canonicalLwwMutablePayloadHash(collection, payload);
 
   bool _boundedString(dynamic value, {required int max, bool nullable = true}) {
@@ -1007,19 +1174,23 @@ class SyncService {
 
   Future<_PhotoUploadResult> _uploadPendingV2ClientPhotos(
     String franchiseeId,
+    SessionSnapshot? session,
   ) async {
     var authoritativeChanged = false;
-    for (final pending
-        in await dbService.getPendingClientPhotos(franchiseeId)) {
+    for (final pending in await dbService.getPendingClientPhotos(
+      franchiseeId,
+    )) {
       final remoteId = pending['client_remote_id']!;
       final photo = pending['local_path']!;
       try {
         if (photo.startsWith('/api/photos/client/')) {
-          await dbService.acknowledgeClientPhotoUpload(
+          _requireCurrent(session);
+          await dbService.acknowledgeClientPhotoUploadForSession(
             franchiseeId: franchiseeId,
             remoteId: remoteId,
             localPath: photo,
             canonicalPath: photo,
+            isSessionCurrent: () => _isCurrent(session),
           );
           continue;
         }
@@ -1035,24 +1206,24 @@ class SyncService {
               'Photo acknowledgement is not on the configured server.',
             );
           }
-          await dbService.acknowledgeClientPhotoUpload(
+          await dbService.acknowledgeClientPhotoUploadForSession(
             franchiseeId: franchiseeId,
             remoteId: remoteId,
             localPath: photo,
             canonicalPath: uri.path,
+            isSessionCurrent: () => _isCurrent(session),
           );
           continue;
         }
-        final canonical = await apiService.uploadClientPhoto(
-          remoteId,
-          photo,
-        );
+        final canonical = await _uploadPhoto(remoteId, photo, session);
+        _requireCurrent(session);
         authoritativeChanged = true;
-        await dbService.acknowledgeClientPhotoUpload(
+        await dbService.acknowledgeClientPhotoUploadForSession(
           franchiseeId: franchiseeId,
           remoteId: remoteId,
           localPath: photo,
           canonicalPath: canonical,
+          isSessionCurrent: () => _isCurrent(session),
         );
       } on Object catch (error, stackTrace) {
         return _PhotoUploadResult(
@@ -1062,45 +1233,55 @@ class SyncService {
         );
       }
     }
-    return _PhotoUploadResult(
-      authoritativeChanged: authoritativeChanged,
-    );
+    return _PhotoUploadResult(authoritativeChanged: authoritativeChanged);
   }
 
-  Future<bool> _deletePendingV2Proposals(String franchiseeId) async {
-    final activeClientIds = (await dbService.getClients())
-        .where((client) => client.franchiseeId == franchiseeId)
+  Future<bool> _deletePendingV2Proposals(
+    String franchiseeId,
+    SessionSnapshot? session,
+  ) async {
+    final activeClientIds = (await dbService.getClientsForFranchisee(
+      franchiseeId,
+    ))
         .map((client) => client.localId)
         .whereType<int>()
         .toSet();
     var deleted = false;
-    for (final proposal in await dbService.getDirtyProposals()) {
+    for (final proposal in await dbService.getDirtyProposalsForFranchisee(
+      franchiseeId,
+    )) {
       if (proposal.deletedAt == null ||
           !activeClientIds.contains(proposal.clientId)) {
         continue;
       }
-      await apiService.deleteProposal(proposal.remoteId);
+      await _deleteProposal(proposal.remoteId, session);
+      _requireCurrent(session);
       deleted = true;
     }
     return deleted;
   }
 
   Future<void> _syncV2(
-    String franchiseeId, {
+    String franchiseeId,
+    SessionSnapshot? session, {
     required bool activateProtocol,
     bool requireSubmittedAccepted = false,
   }) async {
     await _syncV2Round(
       franchiseeId,
+      session,
       activateProtocol: activateProtocol,
       requireSubmittedAccepted: requireSubmittedAccepted,
     );
-    final photoResult = await _uploadPendingV2ClientPhotos(franchiseeId);
+    final photoResult = await _uploadPendingV2ClientPhotos(
+      franchiseeId,
+      session,
+    );
     Object? proposalError;
     StackTrace? proposalStackTrace;
     var proposalChanged = false;
     try {
-      proposalChanged = await _deletePendingV2Proposals(franchiseeId);
+      proposalChanged = await _deletePendingV2Proposals(franchiseeId, session);
     } on Object catch (error, stackTrace) {
       proposalError = error;
       proposalStackTrace = stackTrace;
@@ -1108,13 +1289,10 @@ class SyncService {
     if (photoResult.authoritativeChanged || proposalChanged) {
       // The dedicated endpoints advance/stamp the tenant cursor. Pull once
       // more so exact authoritative media/PDF state and cursor land atomically.
-      await _syncV2Round(franchiseeId, activateProtocol: false);
+      await _syncV2Round(franchiseeId, session, activateProtocol: false);
     }
     if (photoResult.error != null) {
-      Error.throwWithStackTrace(
-        photoResult.error!,
-        photoResult.stackTrace!,
-      );
+      Error.throwWithStackTrace(photoResult.error!, photoResult.stackTrace!);
     }
     if (proposalError != null) {
       Error.throwWithStackTrace(proposalError, proposalStackTrace!);
@@ -1122,7 +1300,8 @@ class SyncService {
   }
 
   Future<void> _syncV2Round(
-    String franchiseeId, {
+    String franchiseeId,
+    SessionSnapshot? session, {
     required bool activateProtocol,
     bool includePending = true,
     bool requireSubmittedAccepted = false,
@@ -1156,7 +1335,7 @@ class SyncService {
             'operation': change['operation'].toString(),
           },
     };
-    final response = await apiService.syncV2({
+    final response = await _requestV2({
       'protocol_version': 2,
       'request_id': requestId,
       'request_cursor': requestCursor,
@@ -1165,7 +1344,8 @@ class SyncService {
         for (final collection in _v2Collections)
           collection: changes[collection] ?? const [],
       },
-    });
+    }, session);
+    _requireCurrent(session);
 
     _exactKeys(
       response,
@@ -1228,8 +1408,10 @@ class SyncService {
           (warning['reason'] != 'invalid' && warning['reason'] != 'future')) {
         throw _protocolError('warning is invalid.');
       }
-      final warningChangeId =
-          _v2Uuid(warning['change_id'], 'warning.change_id');
+      final warningChangeId = _v2Uuid(
+        warning['change_id'],
+        'warning.change_id',
+      );
       if (!submittedByChangeId.containsKey(warningChangeId) ||
           !warningChangeIds.add(warningChangeId)) {
         throw _protocolError('warning references an unrelated change.');
@@ -1364,18 +1546,8 @@ class SyncService {
     final updates = _v2Object(response['updates'], 'updates');
     _exactKeys(
       updates,
-      {
-        ..._v2Collections,
-        'warranties',
-        'proposals',
-        'warranty_tombstones',
-      },
-      {
-        ..._v2Collections,
-        'warranties',
-        'proposals',
-        'warranty_tombstones',
-      },
+      {..._v2Collections, 'warranties', 'proposals', 'warranty_tombstones'},
+      {..._v2Collections, 'warranties', 'proposals', 'warranty_tombstones'},
       'updates',
     );
     final records = <String, List<Map<String, dynamic>>>{
@@ -1480,7 +1652,8 @@ class SyncService {
       );
     }
 
-    await dbService.applySyncV2Response(
+    _requireCurrent(session);
+    await dbService.applySyncV2ResponseForSession(
       franchiseeId: franchiseeId,
       requestCursor: requestCursor,
       responseCursor: responseCursor.toString(),
@@ -1493,6 +1666,7 @@ class SyncService {
       submittedChangeIds: submittedChangeIds,
       outcomeStatuses: outcomeStatuses,
       activateProtocol: activateProtocol,
+      isSessionCurrent: () => _isCurrent(session),
     );
   }
 }

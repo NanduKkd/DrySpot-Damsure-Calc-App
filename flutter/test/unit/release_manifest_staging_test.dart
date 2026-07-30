@@ -5,6 +5,8 @@ import 'package:app_client/src/updates/release_manifest.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  const isStaging = String.fromEnvironment('FLUTTER_APP_FLAVOR') == 'staging';
+
   test('staging flavor binds only its compile-time release origin', () {
     const origin = 'https://staging.example.test';
     expect(releaseManifestEndpoint, '$origin/releases/manifest.json');
@@ -36,5 +38,5 @@ void main() {
       validateManifestHighWater(disabledResult, previous: highWater).isAccepted,
       isTrue,
     );
-  });
+  }, skip: !isStaging ? 'Requires staging compile-time defines.' : false);
 }
