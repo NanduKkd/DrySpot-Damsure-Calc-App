@@ -66,13 +66,12 @@ This test plan outlines the testing strategy for the Warranty and Proposal PDF u
 
 ## 6. Current reconciliation (2026-07)
 
-Automated acceptance evidence now exceeds the original plan: backend verification has 13 suites / 52 tests plus a passing build, and Flutter has 98 passing tests with `flutter analyze` exiting 0 without issues. Backend lint exits 0 with 82 warnings, which remain cleanup work rather than a passing-with-zero-warnings claim.
+Automated acceptance evidence now exceeds the original plan: backend verification has 14 suites / 59 tests plus a passing build, and Flutter has 99 passing tests with `flutter analyze` exiting 0 without issues. Backend lint exits 0 with 84 warnings, which remain cleanup work rather than a passing-with-zero-warnings claim. The production dependency audit has no high or critical advisories; 2 moderate advisories remain through Sequelize's `uuid` dependency.
 
 Current coverage also includes tenant sync isolation, JWT inactive/revoked-user rejection, disabled public registration, default-price sync, server-managed PDF metadata and file lifecycle, one-active-warranty conflict/replacement, portable photo transport, forged URL filtering, and cross-tenant/traversal access rejection.
 
 The following exit criteria remain unproven and are release gates rather than automated-test failures:
 
-- PostgreSQL staging migration and sync verification (current migration evidence is SQLite-simulated only).
 - Real-device pilot, including offline recovery, HTTPS, photo/PDF lifecycle, and upgrade behavior.
-- A complete backed-up Android signing key and `key.properties`; release packaging correctly fails without them, and no APK/AAB has been published.
+- Approved encrypted off-device backup of the permanent Android signing key and restoration credentials; no APK/AAB has been published.
 - Durable reconciliation for best-effort post-commit file cleanup.

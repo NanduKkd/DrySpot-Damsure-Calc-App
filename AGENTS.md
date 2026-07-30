@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Project Documentation
+
+- Notion project index: [Damsure App](https://app.notion.com/p/Damsure-App-3a8b39f7c3cd8058bc1ae3d7c9933fb5)
+
 ## Server Deployment
 
 - SSH host: `root@damsure.nandakrishnan.in`
