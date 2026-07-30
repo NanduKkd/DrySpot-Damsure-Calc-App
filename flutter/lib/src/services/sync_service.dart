@@ -182,12 +182,19 @@ class SyncService {
         }
       }
 
+      // A partial canonical list is not an authoritative photo replacement.
+      // Omitting the client mutation keeps every server photo intact while the
+      // local client remains dirty and retries its pending uploads later.
+      if (uploadFailed) {
+        continue;
+      }
+
       final clientForPayload = client.copyWith(
         photos: canonicalPhotos,
         isDirty: true,
         updatedAt: DateTime.now(),
       );
-      if (!uploadFailed && canonicalPhotos.length == client.photos.length) {
+      if (canonicalPhotos.length == client.photos.length) {
         if (canonicalPhotos.join('|') != client.photos.join('|')) {
           await dbService.updateClient(clientForPayload);
         }

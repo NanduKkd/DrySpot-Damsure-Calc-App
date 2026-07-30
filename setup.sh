@@ -489,7 +489,9 @@ EOF
 }
 EOF
 
-	cat > "$BACKEND_DIR/.env" << 'EOF'
+	local jwt_secret
+	jwt_secret=$(openssl rand -hex 32)
+	cat > "$BACKEND_DIR/.env" << EOF
 PORT=3000
 NODE_ENV=development
 
@@ -501,7 +503,7 @@ DB_PASSWORD=secret
 DB_POOL_MIN=2
 DB_POOL_MAX=10
 
-JWT_SECRET=your-super-secret-jwt-key-change-in-production
+JWT_SECRET=$jwt_secret
 JWT_EXPIRES_IN=7d
 EOF
 

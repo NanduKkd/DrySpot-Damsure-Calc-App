@@ -32,11 +32,12 @@ class DbService {
       path,
       version: 8,
       onCreate: _onCreate,
-      onUpgrade: _onUpgrade,
+      onUpgrade: migrateSchema,
     );
   }
 
-  Future _onUpgrade(Database db, int oldVersion, int newVersion) async {
+  static Future<void> migrateSchema(
+      Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
       await _createDefaultPricesTable(db);
     }
@@ -118,7 +119,7 @@ class DbService {
     await _createProposalsTable(db);
   }
 
-  Future _createDefaultPricesTable(Database db) async {
+  static Future<void> _createDefaultPricesTable(Database db) async {
     await db.execute('''
       CREATE TABLE default_prices (
         local_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +134,7 @@ class DbService {
     ''');
   }
 
-  Future _createWarrantiesTable(Database db) async {
+  static Future<void> _createWarrantiesTable(Database db) async {
     await db.execute('''
       CREATE TABLE warranties (
         local_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +152,7 @@ class DbService {
     ''');
   }
 
-  Future _createProposalsTable(Database db) async {
+  static Future<void> _createProposalsTable(Database db) async {
     await db.execute('''
       CREATE TABLE proposals (
         local_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,6 +314,19 @@ class DbService {
   }
 
   // DefaultPrice CRUD
+  Future<int> claimLegacyDefaultPrices(String franchiseeId) async {
+    final normalizedFranchiseeId = franchiseeId.trim();
+    if (normalizedFranchiseeId.isEmpty) {
+      throw ArgumentError('A franchisee is required to claim legacy prices');
+    }
+    final db = await database;
+    return db.update(
+      'default_prices',
+      {'franchisee_id': normalizedFranchiseeId, 'is_dirty': 1},
+      where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''",
+    );
+  }
+
   Future<int> insertDefaultPrice(DefaultPrice defaultPrice,
       {required String franchiseeId}) async {
     if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {

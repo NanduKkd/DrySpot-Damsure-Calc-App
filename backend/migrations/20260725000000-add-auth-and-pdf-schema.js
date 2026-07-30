@@ -26,6 +26,11 @@ const hasActiveWarrantyIndex = async (queryInterface) => {
   );
 };
 
+const hasLegacyCompatibleWarrantyIndex = async (queryInterface) => {
+  const indexes = await queryInterface.showIndex('warranties');
+  return indexes.some((index) => index.name === 'warranties_one_active_per_client_unique');
+};
+
 module.exports = {
   async up(queryInterface, Sequelize) {
     await Promise.all(['users', 'warranties', 'proposals'].map((table) => requireTable(queryInterface, table)));
@@ -87,6 +92,16 @@ module.exports = {
         unique: true,
       });
     }
+    // This partial guard is also respected by the pre-migration application,
+    // which does not populate active_client_id. It closes the deploy window in
+    // which an old process could otherwise create another active warranty.
+    if (!(await hasLegacyCompatibleWarrantyIndex(queryInterface))) {
+      await queryInterface.addIndex('warranties', ['client_id'], {
+        name: 'warranties_one_active_per_client_unique',
+        unique: true,
+        where: { deleted_at: null },
+      });
+    }
   },
 
   async down(queryInterface) {
@@ -94,6 +109,9 @@ module.exports = {
     // destructive after deployment; only remove the reversible uniqueness guard.
     if (await hasActiveWarrantyIndex(queryInterface)) {
       await queryInterface.removeIndex('warranties', 'warranties_active_client_id_unique');
+    }
+    if (await hasLegacyCompatibleWarrantyIndex(queryInterface)) {
+      await queryInterface.removeIndex('warranties', 'warranties_one_active_per_client_unique');
     }
   },
 };

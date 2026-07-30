@@ -48,6 +48,12 @@ class SettingsProvider with ChangeNotifier {
   }
 
   Future<void> _loadForFranchisee(String? franchiseeId) async {
+    if (franchiseeId != null) {
+      // Version 7 and earlier stored one device-wide price table. The first
+      // authenticated tenant after upgrade claims those otherwise orphaned
+      // rows; subsequent tenants cannot see or reclaim them.
+      await _dbService.claimLegacyDefaultPrices(franchiseeId);
+    }
     final prices = franchiseeId == null
         ? <DefaultPrice>[]
         : await _dbService.getDefaultPrices(franchiseeId);

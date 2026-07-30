@@ -131,7 +131,8 @@ void main() {
     verify(mockDb.markAsSynced('clients', 'client-remote-id')).called(1);
   });
 
-  test('failed photo upload survives the server client update and stays dirty',
+  test(
+      'failed photo upload omits the client mutation and preserves server photos',
       () async {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
@@ -142,7 +143,11 @@ void main() {
       remoteId: 'client-remote-id',
       franchiseeId: 'tenant-a',
       name: 'Acme',
-      photos: const ['/documents/client_photos/offline.jpg'],
+      photos: const [
+        '/api/photos/client/client-remote-id/before.jpg',
+        '/documents/client_photos/offline.jpg',
+        '/api/photos/client/client-remote-id/after.jpg',
+      ],
       updatedAt: DateTime.parse(now),
     );
     when(mockDb.getClients()).thenAnswer((_) async => [client]);
@@ -157,30 +162,38 @@ void main() {
     when(mockDb.getClientByRemoteId('client-remote-id'))
         .thenAnswer((_) async => client);
     when(mockDb.updateClient(any)).thenAnswer((_) async => 1);
-    when(mockApi.sync(any)).thenAnswer((_) async => {
-          'server_time': now,
-          'updates': {
-            'clients': [
-              {
-                'remote_id': 'client-remote-id',
-                'franchisee_id': 'tenant-a',
-                'name': 'Acme from server',
-                'photos': '["/api/photos/client/client-remote-id/server.jpg"]',
-                'updated_at': now,
-                'deleted_at': null,
-              },
-            ],
-            'items': [],
-            'rectangles': [],
-          },
-        });
+    Map<String, dynamic>? syncPayload;
+    when(mockApi.sync(any)).thenAnswer((invocation) async {
+      syncPayload =
+          invocation.positionalArguments.single as Map<String, dynamic>;
+      return {
+        'server_time': now,
+        'updates': {
+          'clients': [
+            {
+              'remote_id': 'client-remote-id',
+              'franchisee_id': 'tenant-a',
+              'name': 'Acme from server',
+              'photos':
+                  '["/api/photos/client/client-remote-id/before.jpg","/api/photos/client/client-remote-id/after.jpg"]',
+              'updated_at': now,
+              'deleted_at': null,
+            },
+          ],
+          'items': [],
+          'rectangles': [],
+        },
+      };
+    });
 
     await SyncService(apiService: mockApi, dbService: mockDb).sync();
 
+    expect(syncPayload!['changes']['clients'], isEmpty);
     verify(mockDb.updateClient(argThat(isA<Client>()
         .having((updated) => updated.isDirty, 'isDirty', isTrue)
         .having((updated) => updated.photos, 'photos', [
-      '/api/photos/client/client-remote-id/server.jpg',
+      '/api/photos/client/client-remote-id/before.jpg',
+      '/api/photos/client/client-remote-id/after.jpg',
       '/documents/client_photos/offline.jpg',
     ])))).called(1);
     verifyNever(mockDb.markAsSynced('clients', 'client-remote-id'));

@@ -12,7 +12,8 @@ class ActiveWarrantyConflictError extends Error {}
 const assertOwnedClient = async (id: string, franchiseeId: string, transaction: any) => {
 	const client = await Client.findByPk(id, { paranoid: false, transaction });
 	if (!client) throw new ParentNotFoundError('Client not found');
-	if (client.franchiseeId !== franchiseeId) throw new OwnershipError('Client belongs to another franchisee');
+	if (client.franchiseeId !== franchiseeId)
+		throw new OwnershipError('Client belongs to another franchisee');
 	return client;
 };
 
@@ -51,23 +52,36 @@ const enforceActiveWarranty = async (
 const managedPdfUrl = (resource: 'warranty' | 'proposal', id: string) =>
 	`/api/${resource}/${id}/download`;
 
-const photoUrlPattern = (clientId: string) => new RegExp(
-	`^/api/photos/client/${clientId}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(?:jpg|png|webp)$`,
-	'i',
-);
-const photoUrlPatternForAnyClient = /^\/api\/photos\/client\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.(?:jpg|png|webp)$/i;
+const photoUrlPattern = (clientId: string) =>
+	new RegExp(
+		`^/api/photos/client/${clientId}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(?:jpg|png|webp)$`,
+		'i',
+	);
+const photoUrlPatternForAnyClient =
+	/^\/api\/photos\/client\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.(?:jpg|png|webp)$/i;
 
 const canonicalPhotoUrls = (photos: unknown, clientId: string): string[] => {
 	let values: unknown = photos;
 	if (typeof photos === 'string') {
-		try { values = JSON.parse(photos); } catch { values = []; }
+		try {
+			values = JSON.parse(photos);
+		} catch {
+			values = [];
+		}
 	}
 	if (!Array.isArray(values)) return [];
 	const pattern = photoUrlPattern(clientId);
-	return [...new Set(values.filter((value): value is string => typeof value === 'string' && pattern.test(value)))];
+	return [
+		...new Set(
+			values.filter(
+				(value): value is string => typeof value === 'string' && pattern.test(value),
+			),
+		),
+	];
 };
 
-const canonicalPhotos = (photos: unknown, clientId: string) => JSON.stringify(canonicalPhotoUrls(photos, clientId));
+const canonicalPhotos = (photos: unknown, clientId: string) =>
+	JSON.stringify(canonicalPhotoUrls(photos, clientId));
 
 export const sync = async (req: AuthRequest, res: Response) => {
 	const { last_sync_time, changes } = req.body;
@@ -103,9 +117,19 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			// to a different franchisee.
 			if (changes.clients && changes.clients.length > 0) {
 				for (const clientData of changes.clients) {
-					const { remote_id, deleted_at, discounted_price, site_address, siteAddress: camelSiteAddress, photos, ...rest } =
-						clientData;
-					const existing = await Client.findByPk(remote_id, { paranoid: false, transaction });
+					const {
+						remote_id,
+						deleted_at,
+						discounted_price,
+						site_address,
+						siteAddress: camelSiteAddress,
+						photos,
+						...rest
+					} = clientData;
+					const existing = await Client.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
 					if (existing && existing.franchiseeId !== franchiseeId) {
 						throw new OwnershipError('Client belongs to another franchisee');
 					}
@@ -115,7 +139,9 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							// A client tombstone makes its managed assets unreachable. Remove
 							// their metadata in the same transaction, then clean files only
 							// after the tombstone commits.
-							canonicalPhotoUrls(existing.photos, existing.id).forEach(queueStoredPhotoRemoval);
+							canonicalPhotoUrls(existing.photos, existing.id).forEach(
+								queueStoredPhotoRemoval,
+							);
 							const warranties = await Warranty.findAll({
 								where: { clientId: existing.id },
 								transaction,
@@ -138,19 +164,31 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							await existing.destroy({ transaction });
 						}
 					} else {
-						const existingPhotos = existing ? canonicalPhotoUrls(existing.photos, remote_id) : [];
-						const syncedPhotos = photos === undefined
-							? undefined
-							: existing
-								? canonicalPhotoUrls(photos, remote_id).filter((photo) => existingPhotos.includes(photo))
-								: [];
+						const existingPhotos = existing
+							? canonicalPhotoUrls(existing.photos, remote_id)
+							: [];
+						const syncedPhotos =
+							photos === undefined
+								? undefined
+								: existing
+									? canonicalPhotoUrls(photos, remote_id).filter((photo) =>
+											existingPhotos.includes(photo),
+										)
+									: [];
 						if (syncedPhotos) {
-							existingPhotos.filter((photo) => !syncedPhotos.includes(photo)).forEach(queueStoredPhotoRemoval);
+							existingPhotos
+								.filter((photo) => !syncedPhotos.includes(photo))
+								.forEach(queueStoredPhotoRemoval);
 						}
 						const values = {
-							...rest, id: remote_id, franchiseeId, discountedPrice: discounted_price,
+							...rest,
+							id: remote_id,
+							franchiseeId,
+							discountedPrice: discounted_price,
 							siteAddress: site_address ?? camelSiteAddress,
-							...(syncedPhotos === undefined ? {} : { photos: JSON.stringify(syncedPhotos) }),
+							...(syncedPhotos === undefined
+								? {}
+								: { photos: JSON.stringify(syncedPhotos) }),
 						};
 						if (existing) await existing.update(values, { transaction });
 						else await Client.create(values, { transaction });
@@ -162,8 +200,12 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			if (changes.items && changes.items.length > 0) {
 				for (const itemData of changes.items) {
 					const { remote_id, client_id, deleted_at, ...rest } = itemData;
-					const existing = await Item.findByPk(remote_id, { paranoid: false, transaction });
-					if (existing) await assertOwnedClient(existing.clientId, franchiseeId, transaction);
+					const existing = await Item.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
+					if (existing)
+						await assertOwnedClient(existing.clientId, franchiseeId, transaction);
 
 					if (deleted_at) {
 						if (existing) await existing.destroy({ transaction });
@@ -180,14 +222,22 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			if (changes.rectangles && changes.rectangles.length > 0) {
 				for (const rectData of changes.rectangles) {
 					const { remote_id, item_id, deleted_at, image_data, ...rest } = rectData;
-					const existing = await Rectangle.findByPk(remote_id, { paranoid: false, transaction });
+					const existing = await Rectangle.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
 					if (existing) await assertOwnedItem(existing.itemId, franchiseeId, transaction);
 
 					if (deleted_at) {
 						if (existing) await existing.destroy({ transaction });
 					} else {
 						await assertOwnedItem(item_id, franchiseeId, transaction);
-						const values = { ...rest, id: remote_id, itemId: item_id, imageData: image_data };
+						const values = {
+							...rest,
+							id: remote_id,
+							itemId: item_id,
+							imageData: image_data,
+						};
 						if (existing) await existing.update(values, { transaction });
 						else await Rectangle.create(values, { transaction });
 					}
@@ -198,7 +248,10 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			if (changes.default_prices && changes.default_prices.length > 0) {
 				for (const dpData of changes.default_prices) {
 					const { remote_id, deleted_at, ...rest } = dpData;
-					const existing = await DefaultPrice.findByPk(remote_id, { paranoid: false, transaction });
+					const existing = await DefaultPrice.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
 					if (existing && existing.franchiseeId !== franchiseeId) {
 						throw new OwnershipError('Default price belongs to another franchisee');
 					}
@@ -227,6 +280,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						// clients must not be able to point a tenant-owned record at another
 						// tenant's file or fabricate a download path.
 						pdf_url: _pdfUrl,
+						pdfUrl: _camelPdfUrl,
 						pdf_file_name: _pdfFileName,
 						pdfFileName: _camelPdfFileName,
 						active_client_id: _activeClientId,
@@ -234,8 +288,12 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						replace_existing,
 						...rest
 					} = wData;
-					const existing = await Warranty.findByPk(remote_id, { paranoid: false, transaction });
-					if (existing) await assertOwnedClient(existing.clientId, franchiseeId, transaction);
+					const existing = await Warranty.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
+					if (existing)
+						await assertOwnedClient(existing.clientId, franchiseeId, transaction);
 
 					if (deleted_at) {
 						if (existing) {
@@ -245,7 +303,12 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						}
 					} else {
 						await assertActiveOwnedClient(client_id, franchiseeId, transaction);
-						const replaced = await enforceActiveWarranty(remote_id, client_id, replace_existing === true, transaction);
+						const replaced = await enforceActiveWarranty(
+							remote_id,
+							client_id,
+							replace_existing === true,
+							transaction,
+						);
 						replaced.forEach((current) => queueStoredPdfRemoval(current.pdfFileName));
 						const values = {
 							...rest,
@@ -255,7 +318,12 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							startDate: start_date,
 							durationYears: duration_years,
 							warrantyCardNumber: warranty_card_number,
-								...(existing ? {} : { pdfUrl: managedPdfUrl('warranty', remote_id), pdfFileName: null }),
+							...(existing
+								? {}
+								: {
+										pdfUrl: managedPdfUrl('warranty', remote_id),
+										pdfFileName: null,
+									}),
 						};
 						if (existing) await existing.update(values, { transaction });
 						else await Warranty.create(values, { transaction });
@@ -267,12 +335,21 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			if (changes.proposals && changes.proposals.length > 0) {
 				for (const pData of changes.proposals) {
 					const {
-						remote_id, client_id, deleted_at,
-						pdf_url: _pdfUrl, pdf_file_name: _pdfFileName, pdfFileName: _camelPdfFileName,
+						remote_id,
+						client_id,
+						deleted_at,
+						pdf_url: _pdfUrl,
+						pdfUrl: _camelPdfUrl,
+						pdf_file_name: _pdfFileName,
+						pdfFileName: _camelPdfFileName,
 						...rest
 					} = pData;
-					const existing = await Proposal.findByPk(remote_id, { paranoid: false, transaction });
-					if (existing) await assertOwnedClient(existing.clientId, franchiseeId, transaction);
+					const existing = await Proposal.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+					});
+					if (existing)
+						await assertOwnedClient(existing.clientId, franchiseeId, transaction);
 
 					if (deleted_at) {
 						if (existing) {
@@ -282,8 +359,15 @@ export const sync = async (req: AuthRequest, res: Response) => {
 					} else {
 						await assertActiveOwnedClient(client_id, franchiseeId, transaction);
 						const values = {
-							...rest, id: remote_id, clientId: client_id,
-								...(existing ? {} : { pdfUrl: managedPdfUrl('proposal', remote_id), pdfFileName: null }),
+							...rest,
+							id: remote_id,
+							clientId: client_id,
+							...(existing
+								? {}
+								: {
+										pdfUrl: managedPdfUrl('proposal', remote_id),
+										pdfFileName: null,
+									}),
 						};
 						if (existing) await existing.update(values, { transaction });
 						else await Proposal.create(values, { transaction });
@@ -363,18 +447,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			paranoid: false,
 		});
 
-			return res.json({
-				server_time: serverTime,
-				updates: {
-					clients: updatedClients.map((c) => ({
-						remote_id: c.id,
-						franchisee_id: c.franchiseeId,
-						name: c.name,
-						address: c.address,
-						email: c.email,
-						phone: c.phone,
-						latitude: c.latitude,
-						longitude: c.longitude,
+		return res.json({
+			server_time: serverTime,
+			updates: {
+				clients: updatedClients.map((c) => ({
+					remote_id: c.id,
+					franchisee_id: c.franchiseeId,
+					name: c.name,
+					address: c.address,
+					email: c.email,
+					phone: c.phone,
+					latitude: c.latitude,
+					longitude: c.longitude,
 					photos: canonicalPhotos(c.photos, c.id),
 					discounted_price: c.discountedPrice,
 					site_address: (c as any).siteAddress,
@@ -431,10 +515,16 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			return res.status(403).json({ error: 'Cross-franchisee sync mutation is forbidden' });
 		}
 		if (error instanceof ParentNotFoundError) {
-			return res.status(400).json({ error: 'Sync mutation references a missing parent record' });
+			return res
+				.status(400)
+				.json({ error: 'Sync mutation references a missing parent record' });
 		}
 		if (error instanceof ActiveWarrantyConflictError) {
-			return res.status(409).json({ error: 'An active warranty already exists. Set replace_existing to true to replace it.' });
+			return res
+				.status(409)
+				.json({
+					error: 'An active warranty already exists. Set replace_existing to true to replace it.',
+				});
 		}
 		console.error('Sync error:', error);
 		return res.status(500).json({ error: 'An error occurred during sync' });

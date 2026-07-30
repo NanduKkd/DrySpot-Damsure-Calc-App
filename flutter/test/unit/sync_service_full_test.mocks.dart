@@ -119,6 +119,13 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
       ) as String);
 
   @override
+  String? resolveProtectedClientPhotoUrl(String? photoUrl) =>
+      (super.noSuchMethod(Invocation.method(
+        #resolveProtectedClientPhotoUrl,
+        [photoUrl],
+      )) as String?);
+
+  @override
   _i5.Future<Map<String, dynamic>> login(
     String? email,
     String? password,
@@ -390,6 +397,16 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
         Invocation.method(
           #softDeleteRectangle,
           [localId],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<int> claimLegacyDefaultPrices(String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #claimLegacyDefaultPrices,
+          [franchiseeId],
         ),
         returnValue: _i5.Future<int>.value(0),
       ) as _i5.Future<int>);

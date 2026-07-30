@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:app_client/src/models/default_price.dart';
 import 'package:app_client/src/providers/settings_provider.dart';
 import 'package:app_client/src/services/db_service.dart';
@@ -78,15 +80,61 @@ void main() {
     final provider = SettingsProvider(dbService: dbService);
 
     provider.updateSession(isAuthenticated: true, franchiseeId: 'tenant-a');
-    await Future<void>.delayed(const Duration(milliseconds: 10));
+    await provider.loadSettings();
     expect(provider.defaultPrices.single.remoteId, 'a-price');
 
     provider.updateSession(isAuthenticated: true, franchiseeId: 'tenant-b');
     expect(provider.defaultPrices, isEmpty);
-    await Future<void>.delayed(const Duration(milliseconds: 10));
+    await provider.loadSettings();
     expect(provider.defaultPrices.single.remoteId, 'b-price');
 
     provider.updateSession(isAuthenticated: false);
     expect(provider.defaultPrices, isEmpty);
+  });
+
+  test('v7 prices are claimed once by the first authenticated tenant',
+      () async {
+    final directory = await Directory.systemTemp.createTemp('damsure-v7-');
+    final path = '${directory.path}/legacy.db';
+    final legacyDb = await openDatabase(
+      path,
+      version: 7,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE default_prices (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_id TEXT UNIQUE,
+            price REAL NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            is_dirty INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT
+          )
+        ''');
+        await db.insert('default_prices', {
+          'remote_id': 'legacy-price',
+          'price': 42.0,
+          'updated_at': DateTime.utc(2026).toIso8601String(),
+        });
+      },
+    );
+    await legacyDb.close();
+
+    final migratedDb = await openDatabase(
+      path,
+      version: 8,
+      onUpgrade: DbService.migrateSchema,
+    );
+    final migratedService = DbService(database: migratedDb);
+
+    expect(await migratedService.getDefaultPrices('tenant-a'), isEmpty);
+    expect(await migratedService.claimLegacyDefaultPrices('tenant-a'), 1);
+    expect((await migratedService.getDefaultPrices('tenant-a')).single.price,
+        42.0);
+    expect(await migratedService.claimLegacyDefaultPrices('tenant-b'), 0);
+    expect(await migratedService.getDefaultPrices('tenant-b'), isEmpty);
+
+    await migratedDb.close();
+    await directory.delete(recursive: true);
   });
 }
