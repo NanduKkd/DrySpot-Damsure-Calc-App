@@ -11,10 +11,32 @@ import 'api_service.dart';
 import '../utils/warranty_date_utils.dart';
 
 class PdfService {
+  static const _latinFontAsset = 'assets/fonts/NotoSans-Regular.ttf';
+  static const _malayalamFontAsset =
+      'assets/fonts/NotoSansMalayalam-Regular.ttf';
+
   PdfService({ApiService? apiService})
       : _apiService = apiService ?? ApiService();
 
   final ApiService _apiService;
+
+  Future<pw.ThemeData> _loadPdfTheme() async {
+    final latinFontData = await rootBundle.load(_latinFontAsset);
+    final malayalamFontData = await rootBundle.load(_malayalamFontAsset);
+    final latinFont = pw.Font.ttf(latinFontData);
+    final malayalamFont = pw.Font.ttf(malayalamFontData);
+
+    // Noto Sans provides stable Latin/rupee metrics while Noto Sans Malayalam
+    // supplies the script-specific glyphs. Both are embedded in the PDF.
+    return pw.ThemeData.withFont(
+      base: latinFont,
+      bold: latinFont,
+      italic: latinFont,
+      boldItalic: latinFont,
+      fontFallback: [malayalamFont],
+    );
+  }
+
   Future<File> generateWarrantyPdf({
     required Client client,
     required String customerName,
@@ -51,7 +73,7 @@ class PdfService {
         .load('assets/pdf-images/franchiseeManagerNameAndSign.jpg');
     final sign = pw.MemoryImage(signData.buffer.asUint8List());
 
-    final pdf = pw.Document();
+    final pdf = pw.Document(theme: await _loadPdfTheme());
 
     final pageFormat = PdfPageFormat.a4.landscape;
 
@@ -136,52 +158,52 @@ class PdfService {
                                       pw.Padding(
                                           padding:
                                               const pw.EdgeInsets.symmetric(
-                                                  horizontal: 4, vertical: 10),
+                                                  horizontal: 4, vertical: 6),
                                           child: pw.Text(
                                               'Polybound\nMagnofix\nPoliflex\nMesh\nCement',
                                               style: const pw.TextStyle(
-                                                  fontSize: 12))),
+                                                  fontSize: 11))),
                                       pw.Padding(
                                           padding:
                                               const pw.EdgeInsets.symmetric(
-                                                  horizontal: 4, vertical: 10),
+                                                  horizontal: 4, vertical: 6),
                                           child: pw.Text('',
                                               style: const pw.TextStyle(
-                                                  fontSize: 12))),
+                                                  fontSize: 11))),
                                       pw.Padding(
                                           padding:
                                               const pw.EdgeInsets.symmetric(
-                                                  horizontal: 4, vertical: 10),
+                                                  horizontal: 4, vertical: 6),
                                           child: pw.Text(areaOfApplication,
                                               style: const pw.TextStyle(
-                                                  fontSize: 12))),
+                                                  fontSize: 11))),
                                       pw.Padding(
                                           padding:
                                               const pw.EdgeInsets.symmetric(
-                                                  horizontal: 4, vertical: 10),
+                                                  horizontal: 4, vertical: 6),
                                           child: pw.Text('$durationYears Years',
                                               style: const pw.TextStyle(
-                                                  fontSize: 12))),
+                                                  fontSize: 11))),
                                     ]),
                                   ]),
                               pw.SizedBox(height: 10),
-                              pw.Image(sign, width: 300),
-                              pw.SizedBox(height: 15),
+                              pw.Image(sign, width: 250),
+                              pw.SizedBox(height: 8),
                               pw.Container(
-                                padding: const pw.EdgeInsets.all(5),
+                                padding: const pw.EdgeInsets.all(4),
                                 color: blueColor,
                                 child: pw.Text(
                                     'Standard Product & Service Warranty Statement',
                                     style: pw.TextStyle(
                                         color: PdfColors.white,
-                                        fontSize: 14,
+                                        fontSize: 12,
                                         fontWeight: pw.FontWeight.bold)),
                               ),
-                              pw.SizedBox(height: 5),
+                              pw.SizedBox(height: 4),
                               pw.Text(
                                 'Subject to the terms and conditions here with Authorized Franchisee of Damsure Expert Buildcare warrants that the project executed by Damsure against the following, when prepared and applied in accordance with the TDS/MOA will achieve the properties and characteristics set out in the TDS, and will retain these properties for the duration of the above listed Warranty Period.\n\nDamsure Authorized Franchisee here and after called as service warrantor offers the warranty for applying the materials accordance with the parameters defined in TDS & MOA.',
                                 style:
-                                    pw.TextStyle(fontSize: 10.5, color: ink700),
+                                    pw.TextStyle(fontSize: 9.5, color: ink700),
                                 textAlign: pw.TextAlign.justify,
                               ),
                             ])))),
@@ -271,7 +293,7 @@ class PdfService {
                                       fontWeight: pw.FontWeight.bold)),
                               pw.Text('Warranty applies only to:',
                                   style: pw.TextStyle(
-                                      fontSize: 10.5,
+                                      fontSize: 9.5,
                                       fontWeight: pw.FontWeight.bold)),
                               _buildListItem('1. ',
                                   'If the product is purchased directly from the company or Authorized Franchisee.',
@@ -461,65 +483,50 @@ class PdfService {
                                 decoration: pw.BoxDecoration(
                                   color: PdfColor.fromHex('#ffffff'),
                                 ),
-                                child: pw.Stack(
+                                child: pw.Column(
+                                  crossAxisAlignment:
+                                      pw.CrossAxisAlignment.start,
                                   children: [
-                                    pw.Column(
-                                      crossAxisAlignment:
-                                          pw.CrossAxisAlignment.start,
-                                      children: [
-                                        pw.Container(
-                                          padding:
-                                              const pw.EdgeInsets.symmetric(
-                                                  horizontal: 8, vertical: 2),
-                                          decoration: pw.BoxDecoration(
-                                            color: blueColor,
-                                            borderRadius:
-                                                const pw.BorderRadius.all(
-                                                    pw.Radius.circular(10)),
+                                    pw.Container(
+                                      padding: const pw.EdgeInsets.symmetric(
+                                          horizontal: 8, vertical: 2),
+                                      decoration: pw.BoxDecoration(
+                                        color: blueColor,
+                                        borderRadius: const pw.BorderRadius.all(
+                                            pw.Radius.circular(10)),
+                                      ),
+                                      child: pw.Text('Customer Details:',
+                                          style: pw.TextStyle(
+                                              color: PdfColors.white,
+                                              fontSize: 12,
+                                              fontWeight: pw.FontWeight.bold)),
+                                    ),
+                                    pw.SizedBox(height: 10),
+                                    _buildCoverDetail(
+                                        'CUSTOMER NAME:', customerName),
+                                    _buildCoverDetail(
+                                        'CUSTOMER ADDRESS:', customerAddress),
+                                    _buildCoverDetail(
+                                        'SITE ADDRESS:', siteAddress),
+                                    _buildCoverDetail(
+                                        'MOBILE NUMBER:', mobileNumber),
+                                    _buildCoverDetail('WARRANTY CARD NUMBER:',
+                                        warrantyCardNumber),
+                                    _buildCoverDetail(
+                                        'WARRANTY PROVIDER:', franchiseeName),
+                                    _buildCoverDetail(
+                                        'WARRANTY COMMENCEMENT DATE:',
+                                        formatWarrantyDate(startDate)),
+                                    _buildCoverDetail(
+                                        'VALID TILL:',
+                                        formatWarrantyDate(
+                                          addWarrantyYears(
+                                            startDate,
+                                            durationYears,
                                           ),
-                                          child: pw.Text('Customer Details:',
-                                              style: pw.TextStyle(
-                                                  color: PdfColors.white,
-                                                  fontSize: 12,
-                                                  fontWeight:
-                                                      pw.FontWeight.bold)),
-                                        ),
-                                        pw.SizedBox(height: 10),
-                                        _buildCoverDetail(
-                                            'CUSTOMER NAME:', customerName),
-                                        _buildCoverDetail('CUSTOMER ADDRESS:',
-                                            customerAddress),
-                                        _buildCoverDetail(
-                                            'SITE ADDRESS:', siteAddress),
-                                        _buildCoverDetail(
-                                            'MOBILE NUMBER:', mobileNumber),
-                                        _buildCoverDetail(
-                                            'WARRANTY CARD NUMBER:',
-                                            warrantyCardNumber),
-                                        _buildCoverDetail('WARRANTY PROVIDER:',
-                                            franchiseeName),
-                                        _buildCoverDetail(
-                                            'WARRANTY COMMENCEMENT DATE:',
-                                            formatWarrantyDate(startDate)),
-                                        _buildCoverDetail(
-                                            'VALID TILL:',
-                                            formatWarrantyDate(
-                                              addWarrantyYears(
-                                                startDate,
-                                                durationYears,
-                                              ),
-                                            )),
-                                        _buildCoverDetail('TOTAL AREA:',
-                                            '${client.totalArea.toStringAsFixed(2)} sqft'),
-                                        pw.Spacer(),
-                                        _buildCoverDetail('SEAL:', ''),
-                                      ],
-                                    ),
-                                    pw.Positioned(
-                                      left: 170,
-                                      bottom: -10,
-                                      child: pw.Image(seal, width: 80),
-                                    ),
+                                        )),
+                                    _buildCoverDetail('TOTAL AREA:',
+                                        '${client.totalArea.toStringAsFixed(2)} sqft'),
                                   ],
                                 ),
                               ),
@@ -549,6 +556,11 @@ class PdfService {
                                                     color: PdfColors.white,
                                                     fontSize: 10)),
                                           ]),
+                                      pw.Container(
+                                        color: PdfColors.white,
+                                        padding: const pw.EdgeInsets.all(2),
+                                        child: pw.Image(seal, width: 60),
+                                      ),
                                       pw.Row(children: [
                                         pw.Text('PH:',
                                             style: pw.TextStyle(
@@ -578,37 +590,42 @@ class PdfService {
 
   pw.Widget _buildCoverDetail(String label, String value) {
     return pw.Padding(
-      padding: const pw.EdgeInsets.only(bottom: 2),
+      padding: const pw.EdgeInsets.only(bottom: 1),
       child: pw.Container(
-          padding: const pw.EdgeInsets.symmetric(horizontal: 0, vertical: 2),
+          padding: const pw.EdgeInsets.symmetric(horizontal: 0, vertical: 1),
           decoration: const pw.BoxDecoration(
               border: pw.Border(
                   bottom: pw.BorderSide(
                       color: PdfColors.black,
                       width: 1,
                       style: pw.BorderStyle(pattern: [2, 2])))),
-          child: pw
-              .Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-            pw.SizedBox(
-                width: 160,
-                child: pw.Text(label, style: const pw.TextStyle(fontSize: 10))),
-            pw.SizedBox(width: 10),
-            pw.Expanded(
-                child: pw.Text(value,
-                    style: pw.TextStyle(
-                        fontSize: 10, fontWeight: pw.FontWeight.bold))),
-          ])),
+          child: pw.Row(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.SizedBox(
+                    width: 145,
+                    child:
+                        pw.Text(label, style: const pw.TextStyle(fontSize: 9))),
+                pw.SizedBox(width: 6),
+                pw.Expanded(
+                    child: pw.Text(value,
+                        style: pw.TextStyle(
+                            fontSize: 9, fontWeight: pw.FontWeight.bold))),
+              ])),
     );
   }
 
   pw.Widget _buildListItem(String index, String text, {pw.TextStyle? style}) {
+    final compactStyle =
+        style?.fontSize == 10.5 ? style!.copyWith(fontSize: 9.5) : style;
+
     return pw.Row(
       crossAxisAlignment: pw.CrossAxisAlignment.start,
       children: [
-        pw.SizedBox(width: 20, child: pw.Text(index, style: style)),
+        pw.SizedBox(width: 20, child: pw.Text(index, style: compactStyle)),
         pw.Expanded(
-            child:
-                pw.Text(text, style: style, textAlign: pw.TextAlign.justify)),
+            child: pw.Text(text,
+                style: compactStyle, textAlign: pw.TextAlign.justify)),
       ],
     );
   }
@@ -715,7 +732,7 @@ class PdfService {
   }
 
   Future<File> generateProposalPdf(Client client) async {
-    final pdf = pw.Document();
+    final pdf = pw.Document(theme: await _loadPdfTheme());
     final grandTotal = client.originalTotalPrice;
 
     pdf.addPage(
@@ -781,7 +798,7 @@ class PdfService {
                           fontSize: 16, fontWeight: pw.FontWeight.bold),
                     ),
                     pw.Text(
-                      'Rs. ${grandTotal.toStringAsFixed(1)}',
+                      '₹${grandTotal.toStringAsFixed(1)}',
                       style: const pw.TextStyle(fontSize: 16),
                     ),
                   ],
@@ -798,7 +815,7 @@ class PdfService {
                             fontSize: 16, color: PdfColors.green),
                       ),
                       pw.Text(
-                        'Rs. ${(grandTotal - client.discountedPrice!).toStringAsFixed(1)}',
+                        '₹${(grandTotal - client.discountedPrice!).toStringAsFixed(1)}',
                         style: const pw.TextStyle(
                             fontSize: 16, color: PdfColors.green),
                       ),
@@ -816,7 +833,7 @@ class PdfService {
                             fontSize: 20, fontWeight: pw.FontWeight.bold),
                       ),
                       pw.Text(
-                        'Rs. ${client.discountedPrice!.toStringAsFixed(1)}',
+                        '₹${client.discountedPrice!.toStringAsFixed(1)}',
                         style: pw.TextStyle(
                             fontSize: 20, fontWeight: pw.FontWeight.bold),
                       ),
@@ -835,7 +852,7 @@ class PdfService {
                             fontSize: 20, fontWeight: pw.FontWeight.bold),
                       ),
                       pw.Text(
-                        'Rs. ${grandTotal.toStringAsFixed(1)}',
+                        '₹${grandTotal.toStringAsFixed(1)}',
                         style: pw.TextStyle(
                             fontSize: 20, fontWeight: pw.FontWeight.bold),
                       ),
