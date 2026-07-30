@@ -49,6 +49,15 @@ Last reconciled: 30 July 2026
 - Creation, deactivation, reactivation, password reset, and token revocation are transactional, idempotent, tenant-scoped, and append an immutable audit event.
 - Initial/reset credentials are generated securely or read from a no-echo TTY/stdin path, displayed once on `/dev/tty`, and never placed in arguments, logs, JSON, or audit data.
 
+### PD-010 — Shared-device data is retained and tenant-hidden
+
+- APP-106 retains each account’s SQLite rows, dirty work, local photos/PDFs, and tenant cursor on logout. Encryption and local wipe are excluded.
+- Logout invalidates the in-memory session generation, clears credentials and every visible/provider cache, and returns to Login.
+- Every database read, dirty query, sync request, cursor, default-price operation, and asynchronous result is scoped to the immutable active-session tenant and generation.
+- A response from a session invalidated by logout cannot mutate SQLite, clear dirty state, advance a cursor, or repopulate UI.
+- The legacy global sync cursor is discarded rather than attributed to a later account. APP-111 owns the tenant cursor store and atomic pull/cursor migration.
+- This policy prevents cross-account app access; it does not claim protection against a rooted, stolen, or forensically inspected device.
+
 ### PD-001 — Warranty deletion is permanent and user-confirmed
 
 - Replacing or deleting a warranty must require an explicit confirmation that names the warranty and explains that the warranty record and stored PDF cannot be recovered.
@@ -92,4 +101,4 @@ Roadmap assumption: retain one active login at a time. A separate task will hard
 
 ## Decisions still required
 
-1. Shared-device policy: retain hidden tenant data, encrypt it, or offer a local wipe on logout.
+No product decision currently blocks the ready contracts. Physical-device, signing-backup, named-operator, and tenant-allow-list inputs remain release or rollout evidence rather than product choices.

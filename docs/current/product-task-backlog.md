@@ -5,11 +5,11 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | ID | Weight | Priority | Risk | Status | Task | Dependencies |
 | :--- | ---: | :--- | :--- | :--- | :--- | :--- |
 | APP-101 | 2 | P1 | T1 | Integrated locally | Visible measurement validation | None |
-| APP-102 | 2 | P1 | T1 | In progress | Measurement deletion safety | PD-007 |
+| APP-102 | 2 | P1 | T1 | Integrated locally | Measurement deletion safety | PD-007 |
 | APP-103 | 3 | P1 | T2 | Integrated; device proof required | Android permission minimization | None |
 | APP-104 | 3 | P0 | T2 | Contract frozen | Update manifest and enforcement contract | PD-003; PD-005 |
 | APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
-| APP-106 | 4 | P0 | T2 | Draft | Shared-device session hardening | Shared-device policy |
+| APP-106 | 4 | P0 | T2 | Contract frozen; queued | Shared-device session hardening | PD-010; APP-111 |
 | APP-107 | 5 | P0 | T2 | Blocked | Update publishing and hosting workflow | APP-104; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Contract frozen; queued | User provisioning and lifecycle MVP | PD-009; APP-110 integration |
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
@@ -102,6 +102,15 @@ Acceptance:
 
 Gates: provider/database tests and a real-device two-account scenario.
 
+Frozen contract summary:
+
+- Retain each tenant’s hidden local/offline data; do not add encryption or a wipe flow.
+- Logout invalidates a session generation, clears credentials/API auth and all provider/UI state, but preserves tenant rows, dirty work, files, and tenant cursor.
+- Sync uses an immutable session snapshot and rechecks it before requests and before applying responses. A stale session response changes nothing locally.
+- Tenant scoping moves to database/data-access queries for clients, descendants, default prices, dirty work, photos, and cursor state.
+- APP-111 owns the tenant-scoped cursor schema. APP-106 discards the legacy global cursor and must not create a competing cursor store.
+- Real-device acceptance uses two real accounts and proves A’s offline work is invisible and unsent under B, then restored unchanged when A returns.
+
 ### APP-107 — Update publishing and hosting workflow
 
 Objective: publish immutable, verifiable APK releases without manual metadata drift.
@@ -185,8 +194,9 @@ Frozen contract summary:
 | APP-110 design | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen |
 | APP-110 implementation | Portfolio manager | `019fb3c0-7c30-72e3-aab7-945028c25c35` | Isolated T3 backend/Flutter worktree |
 | APP-111 | Portfolio manager | `019fb3b0-1b41-7971-8506-627611c50f1e` | Read-only T3 contract frozen |
-| APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Isolated Flutter worktree |
+| APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Integrated as `7575cc7`; 8 focused tests and analyze pass |
 | APP-108 | Portfolio manager | `019fb3bd-1ebf-7130-8fc2-1458f6351c36` | Read-only T3 contract frozen; implementation serialized behind APP-110 |
+| APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
 
 Integrated evidence at `7319450`:
 
