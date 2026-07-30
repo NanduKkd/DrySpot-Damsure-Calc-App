@@ -10,7 +10,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-104 | 3 | P0 | T2 | Integrated and verified locally | Update manifest and enforcement contract | PD-003; PD-005 |
 | APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
 | APP-106 | 4 | P0 | T2 | Contract frozen; queued | Shared-device session hardening | PD-010; APP-111 |
-| APP-107 | 5 | P0 | T2 | Blocked | Update publishing and hosting workflow | APP-104; signing backup; pilot |
+| APP-107 | 5 | P0 | T2 | Contract frozen; externally blocked | Update publishing and hosting workflow | APP-104; staging host; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Contract frozen; queued | User provisioning and lifecycle MVP | PD-009; APP-110 integration |
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
 | APP-110 | 8 | P0 | T3 | In progress | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
@@ -124,6 +124,15 @@ Acceptance:
 
 Gates: staging-host integration, downloaded checksum proof, Nginx negative tests, and runbook recovery.
 
+Frozen contract summary:
+
+- Production remains on the exact legacy-disabled response until an approved transition to strict disabled v1 revision 1. The first available production policy uses revision 2 or greater.
+- Android version code 1 is permanently reserved; the first publishable production APK uses a new code of at least 2 and an immutable `damsure-<versionCode>.apk` name.
+- Staging and production use separate Android flavors, application IDs, signing identities, origins, Nginx roots, credentials, and monotonic ledgers. CI rejects a production APK containing the staging hostname or package ID.
+- Publishing builds twice from a clean pinned commit, verifies reproducibility plus APK size/hash/package/version/certificate, uploads the immutable artifact first with no-clobber semantics, independently downloads and re-verifies it, then atomically replaces only `manifest.json`.
+- Manifest revisions and maximum version codes never decrease. Emergency disable or rollback is a newer strict disabled/available policy; legacy metadata, older revisions, lower codes, and same-revision changed payloads are never restored.
+- Dry-run and staging modes cannot write production. Production activation requires named approval, signing-backup restoration proof, the complete dependency set, and a production-signed physical-device pilot.
+
 ### APP-108 — User provisioning and lifecycle MVP
 
 Objective: remove direct database manipulation from routine account management.
@@ -200,6 +209,7 @@ Frozen contract summary:
 | APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
 | APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
 | APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
+| APP-107 | Portfolio manager | `019fb3ee-3c42-79d2-b3d4-1b6a718ec025` | Read-only T2 publication/staging contract frozen; production activation remains externally blocked |
 
 Integrated evidence at `7319450`:
 
