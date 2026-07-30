@@ -12,6 +12,7 @@ import {
 	tombstoneClientWarranties,
 	warrantyTombstonesAfter,
 } from '../services/warrantyLifecycle';
+import { stampLegacySyncChanges } from '../services/lwwSync';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
@@ -106,6 +107,13 @@ export const sync = async (req: AuthRequest, res: Response) => {
 	if (!franchiseeId) {
 		return res.status(401).json({ error: 'Franchisee ID not found in token' });
 	}
+	if (process.env.SYNC_MIN_PROTOCOL_VERSION === '2') {
+		return res.status(426).json({
+			error: 'This server requires sync protocol v2.',
+			code: 'sync_protocol_upgrade_required',
+			min_protocol_version: 2,
+		});
+	}
 	if (!/^\d+$/.test(requestedTombstoneCursor)) {
 		return res
 			.status(400)
@@ -139,6 +147,15 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		warranties: [],
 		proposals: [],
 	};
+	const legacyLwwAppliedIds: Record<
+		'clients' | 'items' | 'rectangles' | 'default_prices',
+		string[]
+	> = {
+		clients: [],
+		items: [],
+		rectangles: [],
+		default_prices: [],
+	};
 	const recordOutcome = (
 		collection: string,
 		remoteId: unknown,
@@ -150,6 +167,15 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			status,
 			...(code ? { code } : {}),
 		});
+		if (
+			status === 'applied' &&
+			collection in legacyLwwAppliedIds &&
+			typeof remoteId === 'string'
+		) {
+			legacyLwwAppliedIds[
+				collection as keyof typeof legacyLwwAppliedIds
+			].push(remoteId);
+		}
 	};
 	const queueStoredPdfRemoval = (pdfFileName?: string | null) => {
 		// Only a server-generated basename may select a file for deletion. Synced
@@ -514,6 +540,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 				transaction,
 			})),
 		);
+		await stampLegacySyncChanges(franchiseeId, legacyLwwAppliedIds, transaction);
 		await transaction.commit();
 		committed = true;
 		void reconcileManagedFileCleanupByStorageKeys([

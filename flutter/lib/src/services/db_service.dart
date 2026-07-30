@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'package:uuid/uuid.dart';
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/rectangle.dart';
@@ -31,14 +32,17 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 10,
+      version: 11,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
   }
 
   static Future<void> migrateSchema(
-      Database db, int oldVersion, int newVersion) async {
+    Database db,
+    int oldVersion,
+    int newVersion,
+  ) async {
     if (oldVersion < 2) {
       await _createDefaultPricesTable(db);
     }
@@ -59,14 +63,17 @@ class DbService {
       await db.execute('ALTER TABLE rectangles ADD COLUMN image_data TEXT');
     }
     if (oldVersion < 8) {
-      await db
-          .execute('ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT');
+      await db.execute(
+        'ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT',
+      );
     }
     if (oldVersion < 9 && newVersion >= 9) {
-      final warrantyColumns =
-          await db.rawQuery('PRAGMA table_info(warranties)');
-      if (!warrantyColumns
-          .any((column) => column['name'] == 'server_version')) {
+      final warrantyColumns = await db.rawQuery(
+        'PRAGMA table_info(warranties)',
+      );
+      if (!warrantyColumns.any(
+        (column) => column['name'] == 'server_version',
+      )) {
         await db.execute(
           'ALTER TABLE warranties ADD COLUMN server_version INTEGER NOT NULL DEFAULT 1',
         );
@@ -78,6 +85,10 @@ class DbService {
       await db.delete('warranties', where: 'deleted_at IS NOT NULL');
     }
     if (oldVersion < 10 && newVersion >= 10) {
+      await _createSyncStateTable(db);
+    }
+    if (oldVersion < 11 && newVersion >= 11) {
+      await _addLwwSyncColumns(db);
       await _createSyncStateTable(db);
     }
   }
@@ -99,7 +110,19 @@ class DbService {
         discounted_price REAL,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
-        deleted_at TEXT
+        deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT
       )
     ''');
 
@@ -114,6 +137,18 @@ class DbService {
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
         FOREIGN KEY (client_id) REFERENCES clients (local_id) ON DELETE CASCADE
       )
     ''');
@@ -129,6 +164,18 @@ class DbService {
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
         FOREIGN KEY (item_id) REFERENCES items (local_id) ON DELETE CASCADE
       )
     ''');
@@ -150,9 +197,71 @@ class DbService {
         enabled INTEGER DEFAULT 1,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
-        deleted_at TEXT
+        deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT
       )
     ''');
+  }
+
+  static const _lwwTables = <String>[
+    'clients',
+    'items',
+    'rectangles',
+    'default_prices',
+  ];
+
+  static const _lwwColumnDefinitions = <String, String>{
+    'server_generation': "TEXT NOT NULL DEFAULT '0'",
+    'server_branch_seq': 'INTEGER NOT NULL DEFAULT 0',
+    'server_operation_rank': 'INTEGER NOT NULL DEFAULT 0',
+    'server_writer_id': 'TEXT',
+    'server_change_id': 'TEXT',
+    'server_payload_hash': 'TEXT',
+    'server_cursor': "TEXT NOT NULL DEFAULT '0'",
+    'pending_base_generation': 'TEXT',
+    'pending_generation': 'TEXT',
+    'pending_branch_seq': 'INTEGER',
+    'pending_writer_id': 'TEXT',
+    'pending_change_id': 'TEXT',
+  };
+
+  static Future<void> _addLwwSyncColumns(Database db) async {
+    await db.transaction((transaction) async {
+      for (final table in _lwwTables) {
+        final tableExists = (await transaction.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          [table],
+        ))
+            .isNotEmpty;
+        if (!tableExists) {
+          throw StateError('APP-111 requires the existing $table table.');
+        }
+        final columns = await transaction.rawQuery('PRAGMA table_info($table)');
+        final names = columns.map((column) => column['name']).toSet();
+        for (final definition in _lwwColumnDefinitions.entries) {
+          if (!names.contains(definition.key)) {
+            await transaction.execute(
+              'ALTER TABLE $table ADD COLUMN ${definition.key} ${definition.value}',
+            );
+          }
+        }
+        await transaction.execute(
+          'CREATE INDEX IF NOT EXISTS ${table}_pending_lww '
+          'ON $table (is_dirty, pending_change_id)',
+        );
+      }
+    });
   }
 
   static Future<void> _createWarrantiesTable(Database db) async {
@@ -175,7 +284,8 @@ class DbService {
   }
 
   static Future<void> _createWarrantyDeletionTombstonesTable(
-      Database db) async {
+    Database db,
+  ) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS warranty_deletion_tombstones (
         warranty_id TEXT NOT NULL,
@@ -215,16 +325,118 @@ class DbService {
     ''');
   }
 
+  Future<bool> _supportsLww(DatabaseExecutor executor, String table) async {
+    final columns = await executor.rawQuery('PRAGMA table_info($table)');
+    return columns.any((column) => column['name'] == 'pending_change_id');
+  }
+
+  Future<String> _installationWriterId(DatabaseExecutor executor) async {
+    const key = 'lww_installation_writer_id';
+    final rows = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isNotEmpty) return rows.first['value'] as String;
+    final writerId = const Uuid().v4();
+    await executor.insert(
+        'sync_state',
+        {
+          'key': key,
+          'value': writerId,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    final stored = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    return stored.first['value'] as String;
+  }
+
+  Future<void> _markLocalLwwMutation(
+    DatabaseExecutor executor,
+    String table,
+    int localId,
+  ) async {
+    if (!await _supportsLww(executor, table)) return;
+    final rows = await executor.query(
+      table,
+      columns: [
+        'server_generation',
+        'pending_base_generation',
+        'pending_generation',
+        'pending_branch_seq',
+      ],
+      where: 'local_id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return;
+    final row = rows.first;
+    final hasPending = row['pending_generation'] != null;
+    final base = BigInt.parse(
+      (hasPending
+              ? row['pending_base_generation']
+              : row['server_generation'] ?? '0')
+          .toString(),
+    );
+    final generation = hasPending
+        ? BigInt.parse(row['pending_generation'].toString())
+        : base + BigInt.one;
+    if (generation > BigInt.parse('9223372036854775807')) {
+      throw StateError('The local logical generation is exhausted.');
+    }
+    final branch =
+        hasPending ? (row['pending_branch_seq'] as int? ?? 0) + 1 : 1;
+    if (branch > 1000000) {
+      throw StateError('The local logical branch sequence is exhausted.');
+    }
+    await executor.update(
+      table,
+      {
+        'is_dirty': 1,
+        'pending_base_generation': base.toString(),
+        'pending_generation': generation.toString(),
+        'pending_branch_seq': branch,
+        'pending_writer_id': await _installationWriterId(executor),
+        'pending_change_id': const Uuid().v4(),
+      },
+      where: 'local_id = ?',
+      whereArgs: [localId],
+    );
+  }
+
+  static const _clearPendingLww = <String, Object?>{
+    'pending_base_generation': null,
+    'pending_generation': null,
+    'pending_branch_seq': null,
+    'pending_writer_id': null,
+    'pending_change_id': null,
+  };
+
   // Client CRUD
   Future<int> insertClient(Client client) async {
     final db = await database;
-    return await db.insert('clients', client.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('clients', client.toMap());
+      if (client.isDirty) {
+        await _markLocalLwwMutation(transaction, 'clients', id);
+      }
+      return id;
+    });
   }
 
   Future<List<Client>> getClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('clients', where: 'deleted_at IS NULL');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'deleted_at IS NULL',
+    );
 
     List<Client> clients = [];
     for (var map in maps) {
@@ -236,8 +448,11 @@ class DbService {
 
   Future<Client?> getClientByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('clients', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     final items = await getItemsByClientId(maps.first['local_id']);
     return Client.fromMap(maps.first, items: items);
@@ -245,34 +460,53 @@ class DbService {
 
   Future<int> updateClient(Client client) async {
     final db = await database;
-    return await db.update(
-      'clients',
-      client.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [client.localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'clients',
+        client.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [client.localId],
+      );
+      if (changed == 1 && client.isDirty && client.localId != null) {
+        await _markLocalLwwMutation(transaction, 'clients', client.localId!);
+      }
+      return changed;
+    });
   }
 
   Future<int> softDeleteClient(int localId) async {
     final db = await database;
-    return await db.update(
-      'clients',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'clients',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'clients', localId);
+      }
+      return changed;
+    });
   }
 
   // Item CRUD
   Future<int> insertItem(Item item) async {
     final db = await database;
-    return await db.insert('items', item.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('items', item.toMap());
+      if (item.isDirty) await _markLocalLwwMutation(transaction, 'items', id);
+      return id;
+    });
   }
 
   Future<List<Item>> getItemsByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('items',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
 
     List<Item> items = [];
     for (var map in maps) {
@@ -284,8 +518,11 @@ class DbService {
 
   Future<Item?> getItemByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(maps.first['local_id']);
     return Item.fromMap(maps.first, rectangles: rectangles);
@@ -293,8 +530,11 @@ class DbService {
 
   Future<Item?> getItemByLocalId(int localId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'local_id = ?', whereArgs: [localId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'local_id = ?',
+      whereArgs: [localId],
+    );
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(localId);
     return Item.fromMap(maps.first, rectangles: rectangles);
@@ -302,63 +542,103 @@ class DbService {
 
   Future<int> updateItem(Item item) async {
     final db = await database;
-    return await db.update(
-      'items',
-      item.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [item.localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'items',
+        item.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [item.localId],
+      );
+      if (changed == 1 && item.isDirty && item.localId != null) {
+        await _markLocalLwwMutation(transaction, 'items', item.localId!);
+      }
+      return changed;
+    });
   }
 
   Future<int> softDeleteItem(int localId) async {
     final db = await database;
-    return await db.update(
-      'items',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'items',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'items', localId);
+      }
+      return changed;
+    });
   }
 
   // Rectangle CRUD
   Future<int> insertRectangle(Rectangle rectangle) async {
     final db = await database;
-    return await db.insert('rectangles', rectangle.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('rectangles', rectangle.toMap());
+      if (rectangle.isDirty) {
+        await _markLocalLwwMutation(transaction, 'rectangles', id);
+      }
+      return id;
+    });
   }
 
   Future<List<Rectangle>> getRectanglesByItemId(int itemId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('rectangles',
-        where: 'item_id = ? AND deleted_at IS NULL', whereArgs: [itemId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'item_id = ? AND deleted_at IS NULL',
+      whereArgs: [itemId],
+    );
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
   Future<Rectangle?> getRectangleByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('rectangles', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Rectangle.fromMap(maps.first);
   }
 
   Future<int> updateRectangle(Rectangle rectangle) async {
     final db = await database;
-    return await db.update(
-      'rectangles',
-      rectangle.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [rectangle.localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'rectangles',
+        rectangle.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [rectangle.localId],
+      );
+      if (changed == 1 && rectangle.isDirty && rectangle.localId != null) {
+        await _markLocalLwwMutation(
+          transaction,
+          'rectangles',
+          rectangle.localId!,
+        );
+      }
+      return changed;
+    });
   }
 
   Future<int> softDeleteRectangle(int localId) async {
     final db = await database;
-    return await db.update(
-      'rectangles',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ? AND deleted_at IS NULL',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'rectangles',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ? AND deleted_at IS NULL',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'rectangles', localId);
+      }
+      return changed;
+    });
   }
 
   // DefaultPrice CRUD
@@ -369,20 +649,34 @@ class DbService {
     }
     final db = await database;
     return db.update(
-      'default_prices',
-      {'franchisee_id': normalizedFranchiseeId, 'is_dirty': 1},
-      where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''",
-    );
+        'default_prices',
+        {
+          'franchisee_id': normalizedFranchiseeId,
+          'is_dirty': 1,
+        },
+        where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''");
   }
 
-  Future<int> insertDefaultPrice(DefaultPrice defaultPrice,
-      {required String franchiseeId}) async {
+  Future<int> insertDefaultPrice(
+    DefaultPrice defaultPrice, {
+    required String franchiseeId,
+  }) async {
     if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
       throw ArgumentError(
-          'Default prices must belong to the active franchisee');
+        'Default prices must belong to the active franchisee',
+      );
     }
     final db = await database;
-    return await db.insert('default_prices', defaultPrice.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert(
+        'default_prices',
+        defaultPrice.toMap(),
+      );
+      if (defaultPrice.isDirty) {
+        await _markLocalLwwMutation(transaction, 'default_prices', id);
+      }
+      return id;
+    });
   }
 
   Future<List<DefaultPrice>> getDefaultPrices(String franchiseeId) async {
@@ -396,30 +690,53 @@ class DbService {
     return List.generate(maps.length, (i) => DefaultPrice.fromMap(maps[i]));
   }
 
-  Future<int> updateDefaultPrice(DefaultPrice defaultPrice,
-      {required String franchiseeId}) async {
+  Future<int> updateDefaultPrice(
+    DefaultPrice defaultPrice, {
+    required String franchiseeId,
+  }) async {
     if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
       throw ArgumentError(
-          'Default prices must belong to the active franchisee');
+        'Default prices must belong to the active franchisee',
+      );
     }
     final db = await database;
-    return await db.update(
-      'default_prices',
-      defaultPrice.toMap(),
-      where: 'local_id = ? AND franchisee_id = ?',
-      whereArgs: [defaultPrice.localId, franchiseeId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'default_prices',
+        defaultPrice.toMap(),
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [defaultPrice.localId, franchiseeId],
+      );
+      if (changed == 1 &&
+          defaultPrice.isDirty &&
+          defaultPrice.localId != null) {
+        await _markLocalLwwMutation(
+          transaction,
+          'default_prices',
+          defaultPrice.localId!,
+        );
+      }
+      return changed;
+    });
   }
 
-  Future<int> deleteDefaultPrice(int localId,
-      {required String franchiseeId}) async {
+  Future<int> deleteDefaultPrice(
+    int localId, {
+    required String franchiseeId,
+  }) async {
     final db = await database;
-    return await db.update(
-      'default_prices',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ? AND franchisee_id = ?',
-      whereArgs: [localId, franchiseeId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'default_prices',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [localId, franchiseeId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'default_prices', localId);
+      }
+      return changed;
+    });
   }
 
   // Warranty CRUD
@@ -430,15 +747,21 @@ class DbService {
 
   Future<List<Warranty>> getWarrantiesByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('warranties',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
   }
 
   Future<Warranty?> getWarrantyByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('warranties', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Warranty.fromMap(maps.first);
   }
@@ -455,11 +778,7 @@ class DbService {
 
   Future<int> hardDeleteWarranty(int localId) async {
     final db = await database;
-    return db.delete(
-      'warranties',
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.delete('warranties', where: 'local_id = ?', whereArgs: [localId]);
   }
 
   Future<int> hardDeleteWarrantyByRemoteId(String remoteId) async {
@@ -568,13 +887,12 @@ class DbService {
         );
       }
       await transaction.insert(
-        'sync_state',
-        {
-          'key': _warrantyTombstoneCursorKey(franchiseeId),
-          'value': cursor,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+          'sync_state',
+          {
+            'key': _warrantyTombstoneCursorKey(franchiseeId),
+            'value': cursor,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
     });
   }
 
@@ -601,15 +919,21 @@ class DbService {
 
   Future<List<Proposal>> getProposalsByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('proposals',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
   Future<Proposal?> getProposalByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('proposals', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Proposal.fromMap(maps.first);
   }
@@ -635,24 +959,429 @@ class DbService {
   }
 
   // Sync helpers
+  String _syncV2CursorKey(String franchiseeId) =>
+      'sync_v2_cursor:$franchiseeId';
+  String _syncV2EnabledKey(String franchiseeId) =>
+      'sync_v2_enabled:$franchiseeId';
+
+  Future<bool> isSyncV2Enabled(String franchiseeId) async {
+    final db = await database;
+    if (!await _supportsLww(db, 'clients')) return false;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV2EnabledKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isNotEmpty && rows.first['value'] == '1';
+  }
+
+  Future<bool> supportsSyncV2() async {
+    final db = await database;
+    return _supportsLww(db, 'clients');
+  }
+
+  Future<String> getSyncV2Cursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV2CursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? '0' : rows.first['value'] as String;
+  }
+
+  Map<String, dynamic> _pendingEnvelopeRecord(
+    String collection,
+    Map<String, Object?> row,
+  ) {
+    final operation = row['deleted_at'] == null ? 'upsert' : 'delete';
+    final payload = <String, dynamic>{};
+    if (operation == 'upsert') {
+      switch (collection) {
+        case 'clients':
+          payload.addAll({
+            'name': row['name'],
+            'address': row['address'],
+            'site_address': row['site_address'],
+            'email': row['email'],
+            'phone': row['phone'],
+            'latitude': row['latitude'],
+            'longitude': row['longitude'],
+            'discounted_price': row['discounted_price'],
+          });
+        case 'items':
+          payload.addAll({
+            'name': row['name'],
+            'price': double.parse(row['price'].toString()),
+            'enabled': row['enabled'] == 1 || row['enabled'] == true,
+          });
+        case 'rectangles':
+          payload.addAll({
+            'length': double.parse(row['length'].toString()),
+            'width': double.parse(row['width'].toString()),
+          });
+        case 'default_prices':
+          payload.addAll({
+            'price': double.parse(row['price'].toString()),
+            'enabled': row['enabled'] == 1 || row['enabled'] == true,
+          });
+      }
+    }
+    return {
+      'remote_id': row['remote_id'],
+      'operation': operation,
+      'base_generation': row['pending_base_generation'].toString(),
+      'generation': row['pending_generation'].toString(),
+      'branch_seq': row['pending_branch_seq'],
+      'writer_id': row['pending_writer_id'],
+      'change_id': row['pending_change_id'],
+      if (row['parent_remote_id'] != null) 'parent_id': row['parent_remote_id'],
+      'payload': payload,
+      'device_timestamp': row['updated_at'],
+    };
+  }
+
+  Future<Map<String, List<Map<String, dynamic>>>> getPendingLwwChanges(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsLww(db, 'clients')) {
+      return {for (final table in _lwwTables) table: <Map<String, dynamic>>[]};
+    }
+    final clients = await db.rawQuery(
+      '''
+      SELECT c.*
+      FROM clients c
+      WHERE c.franchisee_id = ?
+        AND c.is_dirty = 1
+        AND c.pending_change_id IS NOT NULL
+      ORDER BY c.local_id
+      ''',
+      [franchiseeId],
+    );
+    final items = await db.rawQuery(
+      '''
+      SELECT i.*, c.remote_id AS parent_remote_id
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ?
+        AND i.is_dirty = 1
+        AND i.pending_change_id IS NOT NULL
+      ORDER BY i.local_id
+      ''',
+      [franchiseeId],
+    );
+    final rectangles = await db.rawQuery(
+      '''
+      SELECT r.*, i.remote_id AS parent_remote_id
+      FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ?
+        AND r.is_dirty = 1
+        AND r.pending_change_id IS NOT NULL
+      ORDER BY r.local_id
+      ''',
+      [franchiseeId],
+    );
+    final defaultPrices = await db.rawQuery(
+      '''
+      SELECT d.*
+      FROM default_prices d
+      WHERE d.franchisee_id = ?
+        AND d.is_dirty = 1
+        AND d.pending_change_id IS NOT NULL
+      ORDER BY d.local_id
+      ''',
+      [franchiseeId],
+    );
+    return {
+      'clients':
+          clients.map((row) => _pendingEnvelopeRecord('clients', row)).toList(),
+      'items':
+          items.map((row) => _pendingEnvelopeRecord('items', row)).toList(),
+      'rectangles': rectangles
+          .map((row) => _pendingEnvelopeRecord('rectangles', row))
+          .toList(),
+      'default_prices': defaultPrices
+          .map((row) => _pendingEnvelopeRecord('default_prices', row))
+          .toList(),
+    };
+  }
+
+  Map<String, Object?> _serverMetadata(Map<String, dynamic> record) => {
+        'server_generation': record['generation'].toString(),
+        'server_branch_seq': record['branch_seq'],
+        'server_operation_rank': record['operation'] == 'delete' ? 1 : 0,
+        'server_writer_id': record['writer_id'],
+        'server_change_id': record['change_id'],
+        'server_payload_hash': record['payload_hash'],
+        'server_cursor': record['row_cursor'].toString(),
+      };
+
+  Future<Map<String, Object?>?> _existingRemoteRow(
+    DatabaseExecutor executor,
+    String table,
+    String remoteId,
+  ) async {
+    final rows = await executor.query(
+      table,
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  Future<int> _ownedParentLocalId(
+    DatabaseExecutor executor,
+    String collection,
+    String parentRemoteId,
+    String franchiseeId,
+  ) async {
+    if (collection == 'items') {
+      final parents = await executor.query(
+        'clients',
+        columns: ['local_id'],
+        where: 'remote_id = ? AND franchisee_id = ?',
+        whereArgs: [parentRemoteId, franchiseeId],
+        limit: 1,
+      );
+      if (parents.isEmpty) {
+        throw const FormatException('V2 item parent is unavailable.');
+      }
+      return parents.first['local_id'] as int;
+    }
+    final parents = await executor.rawQuery(
+      '''
+      SELECT i.local_id
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [parentRemoteId, franchiseeId],
+    );
+    if (parents.isEmpty) {
+      throw const FormatException('V2 rectangle parent is unavailable.');
+    }
+    return parents.first['local_id'] as int;
+  }
+
+  Future<void> _applyV2Record(
+    DatabaseExecutor executor,
+    String collection,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+    required Map<String, String> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+  }) async {
+    final table = collection;
+    final remoteId = record['remote_id'] as String;
+    final existing = await _existingRemoteRow(executor, table, remoteId);
+    final submittedChangeId = submittedChangeIds[remoteId];
+    final localPendingChangeId = existing?['pending_change_id']?.toString();
+    final exactSubmitted =
+        submittedChangeId != null && submittedChangeId == localPendingChangeId;
+    const terminalStatuses = {
+      'applied',
+      'already_applied',
+      'superseded',
+      'permanently_deleted',
+    };
+    final terminal = submittedChangeId != null &&
+        terminalStatuses.contains(outcomeStatuses[submittedChangeId]);
+    final localDirty = existing?['is_dirty'] == 1;
+    final replaceMutable =
+        existing == null || !localDirty || (exactSubmitted && terminal);
+    final incomingGeneration = BigInt.parse(record['generation'].toString());
+    final currentGeneration =
+        BigInt.tryParse(existing?['server_generation']?.toString() ?? '0') ??
+            BigInt.zero;
+    if (existing != null && incomingGeneration < currentGeneration) return;
+
+    int? parentLocalId;
+    if (collection == 'items' || collection == 'rectangles') {
+      parentLocalId = await _ownedParentLocalId(
+        executor,
+        collection,
+        record['parent_id'] as String,
+        franchiseeId,
+      );
+      final existingParentColumn =
+          collection == 'items' ? 'client_id' : 'item_id';
+      if (existing != null && existing[existingParentColumn] != parentLocalId) {
+        throw const FormatException('V2 response changed an immutable parent.');
+      }
+    }
+    if ((collection == 'clients' || collection == 'default_prices') &&
+        record['franchisee_id'] != franchiseeId) {
+      throw const FormatException('V2 response crossed tenant ownership.');
+    }
+
+    final metadata = _serverMetadata(record);
+    if (!replaceMutable) {
+      await executor.update(
+        table,
+        metadata,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+      return;
+    }
+
+    final payload = Map<String, dynamic>.from(
+      record['payload'] as Map<dynamic, dynamic>,
+    );
+    final values = <String, Object?>{
+      'remote_id': remoteId,
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': record['deleted_at'],
+      ...metadata,
+      ..._clearPendingLww,
+    };
+    switch (collection) {
+      case 'clients':
+        values.addAll({
+          'franchisee_id': franchiseeId,
+          'name': payload['name'] ?? '',
+          'address': payload['address'],
+          'site_address': payload['site_address'],
+          'email': payload['email'],
+          'phone': payload['phone'],
+          'latitude': payload['latitude'],
+          'longitude': payload['longitude'],
+          'discounted_price': payload['discounted_price'],
+          if (existing == null) 'photos': '[]',
+        });
+      case 'items':
+        values.addAll({
+          'client_id': parentLocalId,
+          'name': payload['name'] ?? '',
+          'price': payload['price'] ?? 0,
+          'enabled': payload['enabled'] == true ? 1 : 0,
+        });
+      case 'rectangles':
+        values.addAll({
+          'item_id': parentLocalId,
+          'length': payload['length'] ?? 1,
+          'width': payload['width'] ?? 1,
+          if (existing == null) 'image_data': null,
+        });
+      case 'default_prices':
+        values.addAll({
+          'franchisee_id': franchiseeId,
+          'price': payload['price'] ?? 0,
+          'enabled': payload['enabled'] == true ? 1 : 0,
+        });
+    }
+    if (existing == null) {
+      await executor.insert(table, values);
+    } else {
+      await executor.update(
+        table,
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> applySyncV2Response({
+    required String franchiseeId,
+    required String responseCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+  }) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      for (final collection in _lwwTables) {
+        for (final record in records[collection] ?? const []) {
+          await _applyV2Record(
+            transaction,
+            collection,
+            record,
+            franchiseeId: franchiseeId,
+            submittedChangeIds:
+                submittedChangeIds[collection] ?? const <String, String>{},
+            outcomeStatuses: outcomeStatuses,
+          );
+        }
+      }
+      for (final tombstone in warrantyTombstones) {
+        if (tombstone.franchiseeId != franchiseeId) {
+          throw ArgumentError('A tombstone cannot cross the active franchisee');
+        }
+        await transaction.insert(
+          'warranty_deletion_tombstones',
+          tombstone.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await transaction.delete(
+          'warranties',
+          where: 'remote_id = ?',
+          whereArgs: [tombstone.warrantyId],
+        );
+      }
+      await transaction.insert(
+          'sync_state',
+          {
+            'key': _syncV2CursorKey(franchiseeId),
+            'value': responseCursor,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      await transaction.insert(
+          'sync_state',
+          {
+            'key': _warrantyTombstoneCursorKey(franchiseeId),
+            'value': warrantyTombstoneCursor,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      if (activateProtocol) {
+        await transaction.insert(
+            'sync_state',
+            {
+              'key': _syncV2EnabledKey(franchiseeId),
+              'value': '1',
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
   Future<List<Client>> getDirtyClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('clients', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Client.fromMap(maps[i]));
   }
 
   Future<List<Item>> getDirtyItems() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Item.fromMap(maps[i]));
   }
 
   Future<List<Rectangle>> getDirtyRectangles() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('rectangles', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
   }
 
@@ -667,7 +1396,9 @@ class DbService {
   }
 
   Future<DefaultPrice?> getDefaultPriceByRemoteId(
-      String remoteId, String franchiseeId) async {
+    String remoteId,
+    String franchiseeId,
+  ) async {
     final db = await database;
     final maps = await db.query(
       'default_prices',
@@ -680,15 +1411,19 @@ class DbService {
 
   Future<List<Warranty>> getDirtyWarranties() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('warranties', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
   }
 
   Future<List<Proposal>> getDirtyProposals() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('proposals', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
@@ -703,9 +1438,13 @@ class DbService {
     if (tenantScoped && (franchiseeId == null || franchiseeId.isEmpty)) {
       throw ArgumentError('A franchisee is required for default-price sync');
     }
+    final values = <String, Object?>{'is_dirty': 0};
+    if (await _supportsLww(db, table)) {
+      values.addAll(_clearPendingLww);
+    }
     return db.update(
       table,
-      {'is_dirty': 0},
+      values,
       where: tenantScoped
           ? 'remote_id = ? AND franchisee_id = ? AND updated_at = ? AND is_dirty = 1'
           : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',

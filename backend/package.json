@@ -22,7 +22,8 @@
     "managed-cleanup:reconcile": "ts-node src/scripts/reconcileManagedFileCleanup.ts",
     "proof:app110:postgres": "node scripts/prove-app110-postgres.js",
     "proof:app108:postgres": "node scripts/prove-app108-postgres.js",
-    "proof:app108:cli": "node scripts/prove-app108-cli.js"
+    "proof:app108:cli": "node scripts/prove-app108-cli.js",
+    "proof:app111:postgres": "node scripts/prove-app111-postgres.js"
   },
   "dependencies": {
     "@types/multer": "^2.1.0",

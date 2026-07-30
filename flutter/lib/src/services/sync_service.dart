@@ -1,4 +1,5 @@
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import 'api_service.dart';
 import 'db_service.dart';
 import '../models/client.dart';
@@ -23,11 +24,7 @@ class SyncService {
     return 'last_sync_time_$franchiseeId';
   }
 
-  Set<String> _outcomeIds(
-    dynamic outcomes,
-    String collection,
-    String status,
-  ) {
+  Set<String> _outcomeIds(dynamic outcomes, String collection, String status) {
     final values = outcomes is Map ? outcomes[collection] : null;
     if (values is! List) return {};
     return values
@@ -39,6 +36,32 @@ class SyncService {
   }
 
   Future<void> sync() async {
+    final prefs = await SharedPreferences.getInstance();
+    final franchiseeId = prefs.getString('franchisee_id')?.trim();
+    final hasTenant = franchiseeId != null && franchiseeId.isNotEmpty;
+    final supportsV2 = hasTenant && await dbService.supportsSyncV2();
+    if (supportsV2 && await dbService.isSyncV2Enabled(franchiseeId)) {
+      await _syncV2(franchiseeId, activateProtocol: false);
+      return;
+    }
+    if (supportsV2) {
+      await dbService.claimLegacyDefaultPrices(franchiseeId);
+    }
+
+    // The legacy writer drains first. A v2 state bit is persisted only in the
+    // same SQLite transaction that applies a successful cursor-zero snapshot.
+    await _syncV1();
+    if (!supportsV2) return;
+    try {
+      await _syncV2(franchiseeId, activateProtocol: true);
+    } catch (_) {
+      // During the compatibility window an old server may not expose /sync/v2.
+      // The successful v1 drain remains durable, while no v2 cursor/state is
+      // persisted and the next explicit sync retries the bootstrap safely.
+    }
+  }
+
+  Future<void> _syncV1() async {
     final prefs = await SharedPreferences.getInstance();
     final activeFranchiseeId = prefs.getString('franchisee_id')?.trim();
     final shouldFilterByFranchise =
@@ -71,33 +94,43 @@ class SyncService {
 
     // 1. Gather local changes
     final dirtyClients = (await dbService.getDirtyClients())
-        .where((client) =>
-            !shouldFilterByFranchise ||
-            client.franchiseeId == activeFranchiseeId)
+        .where(
+          (client) =>
+              !shouldFilterByFranchise ||
+              client.franchiseeId == activeFranchiseeId,
+        )
         .toList();
     final dirtyItems = (await dbService.getDirtyItems())
-        .where((item) =>
-            !shouldFilterByFranchise ||
-            (item.clientId != null &&
-                activeClientLocalIds.contains(item.clientId)))
+        .where(
+          (item) =>
+              !shouldFilterByFranchise ||
+              (item.clientId != null &&
+                  activeClientLocalIds.contains(item.clientId)),
+        )
         .toList();
     final dirtyRectangles = (await dbService.getDirtyRectangles())
-        .where((rect) =>
-            !shouldFilterByFranchise ||
-            (rect.itemId != null && activeItemLocalIds.contains(rect.itemId)))
+        .where(
+          (rect) =>
+              !shouldFilterByFranchise ||
+              (rect.itemId != null && activeItemLocalIds.contains(rect.itemId)),
+        )
         .toList();
     final dirtyDefaultPrices = shouldFilterByFranchise
         ? await dbService.getDirtyDefaultPrices(activeFranchiseeId)
         : <DefaultPrice>[];
     final dirtyWarranties = (await dbService.getDirtyWarranties())
-        .where((warranty) =>
-            !shouldFilterByFranchise ||
-            activeClientLocalIds.contains(warranty.clientId))
+        .where(
+          (warranty) =>
+              !shouldFilterByFranchise ||
+              activeClientLocalIds.contains(warranty.clientId),
+        )
         .toList();
     final dirtyProposals = (await dbService.getDirtyProposals())
-        .where((proposal) =>
-            !shouldFilterByFranchise ||
-            activeClientLocalIds.contains(proposal.clientId))
+        .where(
+          (proposal) =>
+              !shouldFilterByFranchise ||
+              activeClientLocalIds.contains(proposal.clientId),
+        )
         .toList();
 
     final itemsToSync = <Item>[];
@@ -239,7 +272,7 @@ class SyncService {
             dirtyDefaultPrices.map((price) => price.toJson()).toList(),
         'warranties': resolvedWarranties,
         'proposals': resolvedProposals,
-      }
+      },
     };
 
     // 2. Send to server and get updates
@@ -250,11 +283,17 @@ class SyncService {
     final appliedClients = _outcomeIds(outcomes, 'clients', 'applied');
     final appliedItems = _outcomeIds(outcomes, 'items', 'applied');
     final appliedRectangles = _outcomeIds(outcomes, 'rectangles', 'applied');
-    final appliedDefaultPrices =
-        _outcomeIds(outcomes, 'default_prices', 'applied');
+    final appliedDefaultPrices = _outcomeIds(
+      outcomes,
+      'default_prices',
+      'applied',
+    );
     final appliedWarranties = _outcomeIds(outcomes, 'warranties', 'applied');
-    final tombstonedWarranties =
-        _outcomeIds(outcomes, 'warranties', 'tombstoned');
+    final tombstonedWarranties = _outcomeIds(
+      outcomes,
+      'warranties',
+      'tombstoned',
+    );
     final appliedProposals = _outcomeIds(outcomes, 'proposals', 'applied');
     final submittedWarrantiesByRemoteId = {
       for (final warranty in warrantiesToSync) warranty.remoteId: warranty,
@@ -330,8 +369,9 @@ class SyncService {
       for (var itemMap in updates['items']) {
         final remoteId = itemMap['remote_id'];
         final existingItem = await dbService.getItemByRemoteId(remoteId);
-        final client =
-            await dbService.getClientByRemoteId(itemMap['client_id']);
+        final client = await dbService.getClientByRemoteId(
+          itemMap['client_id'],
+        );
 
         if (client != null) {
           if (itemMap['deleted_at'] != null) {
@@ -339,11 +379,13 @@ class SyncService {
               await dbService.softDeleteItem(existingItem.localId!);
             }
           } else {
-            final item = Item.fromMap(itemMap)
-                .copyWith(clientId: client.localId, isDirty: false);
+            final item = Item.fromMap(
+              itemMap,
+            ).copyWith(clientId: client.localId, isDirty: false);
             if (existingItem != null) {
-              await dbService
-                  .updateItem(item.copyWith(localId: existingItem.localId));
+              await dbService.updateItem(
+                item.copyWith(localId: existingItem.localId),
+              );
             } else {
               await dbService.insertItem(item);
             }
@@ -363,11 +405,13 @@ class SyncService {
               await dbService.softDeleteRectangle(existingRect.localId!);
             }
           } else {
-            final rect = Rectangle.fromMap(rectMap)
-                .copyWith(itemId: item.localId, isDirty: false);
+            final rect = Rectangle.fromMap(
+              rectMap,
+            ).copyWith(itemId: item.localId, isDirty: false);
             if (existingRect != null) {
               await dbService.updateRectangle(
-                  rect.copyWith(localId: existingRect.localId));
+                rect.copyWith(localId: existingRect.localId),
+              );
             } else {
               await dbService.insertRectangle(rect);
             }
@@ -395,10 +439,9 @@ class SyncService {
             continue;
           }
 
-          final price = DefaultPrice.fromJson(priceMap).copyWith(
-            franchiseeId: activeFranchiseeId,
-            isDirty: false,
-          );
+          final price = DefaultPrice.fromJson(
+            priceMap,
+          ).copyWith(franchiseeId: activeFranchiseeId, isDirty: false);
           if (existing == null) {
             await dbService.insertDefaultPrice(
               price,
@@ -423,10 +466,12 @@ class SyncService {
             )) {
           continue;
         }
-        final existingWarranty =
-            await dbService.getWarrantyByRemoteId(remoteId);
-        final client =
-            await dbService.getClientByRemoteId(warrantyMap['client_id']);
+        final existingWarranty = await dbService.getWarrantyByRemoteId(
+          remoteId,
+        );
+        final client = await dbService.getClientByRemoteId(
+          warrantyMap['client_id'],
+        );
 
         if (client != null) {
           if (warrantyMap['deleted_at'] != null) {
@@ -434,8 +479,9 @@ class SyncService {
             // deletion. Only the sequenced tombstone stream can remove it.
             continue;
           } else {
-            final warranty = Warranty.fromMap(warrantyMap)
-                .copyWith(clientId: client.localId!, isDirty: false);
+            final warranty = Warranty.fromMap(
+              warrantyMap,
+            ).copyWith(clientId: client.localId!, isDirty: false);
             final submitted = submittedWarrantiesByRemoteId[remoteId];
             if (existingWarranty != null) {
               if (submitted == null) {
@@ -461,10 +507,12 @@ class SyncService {
       // Proposals
       for (var proposalMap in updates['proposals'] ?? []) {
         final remoteId = proposalMap['remote_id'];
-        final existingProposal =
-            await dbService.getProposalByRemoteId(remoteId);
-        final client =
-            await dbService.getClientByRemoteId(proposalMap['client_id']);
+        final existingProposal = await dbService.getProposalByRemoteId(
+          remoteId,
+        );
+        final client = await dbService.getClientByRemoteId(
+          proposalMap['client_id'],
+        );
 
         if (client != null) {
           if (proposalMap['deleted_at'] != null) {
@@ -472,11 +520,13 @@ class SyncService {
               await dbService.softDeleteProposal(existingProposal.localId!);
             }
           } else {
-            final proposal = Proposal.fromMap(proposalMap)
-                .copyWith(clientId: client.localId!, isDirty: false);
+            final proposal = Proposal.fromMap(
+              proposalMap,
+            ).copyWith(clientId: client.localId!, isDirty: false);
             if (existingProposal != null) {
               await dbService.updateProposal(
-                  proposal.copyWith(localId: existingProposal.localId));
+                proposal.copyWith(localId: existingProposal.localId),
+              );
             } else {
               await dbService.insertProposal(proposal);
             }
@@ -549,5 +599,546 @@ class SyncService {
     if (syncTimeKey != 'last_sync_time') {
       await prefs.remove('last_sync_time');
     }
+  }
+
+  static const _v2Collections = <String>[
+    'clients',
+    'items',
+    'rectangles',
+    'default_prices',
+  ];
+  static final _uuidV4 = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  );
+
+  ApiException _protocolError(String message) =>
+      ApiException('Sync protocol error: $message');
+
+  Map<String, dynamic> _v2Object(dynamic value, String label) {
+    if (value is! Map) throw _protocolError('$label must be an object.');
+    return Map<String, dynamic>.from(value);
+  }
+
+  BigInt _v2Decimal(dynamic value, String label, {bool allowZero = true}) {
+    if (value is! String || !RegExp(r'^(0|[1-9]\d*)$').hasMatch(value)) {
+      throw _protocolError('$label is not a canonical decimal string.');
+    }
+    final parsed = BigInt.parse(value);
+    if ((!allowZero && parsed == BigInt.zero) ||
+        parsed > BigInt.parse('9223372036854775807')) {
+      throw _protocolError('$label is outside the supported range.');
+    }
+    return parsed;
+  }
+
+  String _v2Uuid(dynamic value, String label) {
+    if (value is! String || !_uuidV4.hasMatch(value)) {
+      throw _protocolError('$label is not a UUIDv4.');
+    }
+    return value.toLowerCase();
+  }
+
+  void _exactKeys(
+    Map<String, dynamic> value,
+    Set<String> allowed,
+    Set<String> required,
+    String label,
+  ) {
+    if (value.keys.any((key) => !allowed.contains(key)) ||
+        required.any((key) => !value.containsKey(key))) {
+      throw _protocolError('$label has an unexpected shape.');
+    }
+  }
+
+  Map<String, dynamic> _validateV2Record(
+    dynamic raw,
+    String collection, {
+    required BigInt responseCursor,
+    required BigInt requestCursor,
+    required String franchiseeId,
+    required bool snapshot,
+  }) {
+    final record = _v2Object(raw, '$collection record');
+    final common = <String>{
+      'remote_id',
+      'generation',
+      'branch_seq',
+      'operation',
+      'writer_id',
+      'change_id',
+      'payload_hash',
+      'row_cursor',
+      'server_timestamp',
+      'deleted_at',
+      'payload',
+    };
+    final extra = collection == 'items' || collection == 'rectangles'
+        ? {'parent_id'}
+        : {'franchisee_id'};
+    _exactKeys(
+      record,
+      {...common, ...extra},
+      {...common, ...extra},
+      '$collection record',
+    );
+    _v2Uuid(record['remote_id'], '$collection.remote_id');
+    _v2Decimal(
+      record['generation'],
+      '$collection.generation',
+      allowZero: false,
+    );
+    final branch = record['branch_seq'];
+    if (branch is! int || branch < 1 || branch > 1000000) {
+      throw _protocolError('$collection.branch_seq is invalid.');
+    }
+    if (record['operation'] != 'upsert' && record['operation'] != 'delete') {
+      throw _protocolError('$collection.operation is invalid.');
+    }
+    _v2Uuid(record['writer_id'], '$collection.writer_id');
+    _v2Uuid(record['change_id'], '$collection.change_id');
+    if (record['payload_hash'] is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(record['payload_hash'])) {
+      throw _protocolError('$collection.payload_hash is invalid.');
+    }
+    final rowCursor = _v2Decimal(
+      record['row_cursor'],
+      '$collection.row_cursor',
+      allowZero: false,
+    );
+    if (rowCursor > responseCursor ||
+        (snapshot && rowCursor <= requestCursor)) {
+      throw _protocolError('$collection.row_cursor is outside the snapshot.');
+    }
+    if (DateTime.tryParse(record['server_timestamp'].toString()) == null) {
+      throw _protocolError('$collection.server_timestamp is invalid.');
+    }
+    final deletedAt = record['deleted_at'];
+    if (deletedAt != null && DateTime.tryParse(deletedAt.toString()) == null) {
+      throw _protocolError('$collection.deleted_at is invalid.');
+    }
+    if ((record['operation'] == 'delete') != (deletedAt != null)) {
+      throw _protocolError('$collection deletion state is inconsistent.');
+    }
+    if (record['payload'] is! Map) {
+      throw _protocolError('$collection.payload is invalid.');
+    }
+    final payload = Map<String, dynamic>.from(record['payload'] as Map);
+    bool finiteNumber(dynamic value) => value is num && value.isFinite;
+    switch (collection) {
+      case 'clients':
+        _exactKeys(
+          payload,
+          {
+            'name',
+            'address',
+            'site_address',
+            'email',
+            'phone',
+            'latitude',
+            'longitude',
+            'discounted_price',
+          },
+          {
+            'name',
+            'address',
+            'site_address',
+            'email',
+            'phone',
+            'latitude',
+            'longitude',
+            'discounted_price',
+          },
+          'clients.payload',
+        );
+        if (payload['name'] is! String ||
+            (record['operation'] == 'upsert' &&
+                (payload['name'] as String).trim().isEmpty) ||
+            [
+              payload['address'],
+              payload['site_address'],
+              payload['email'],
+              payload['phone']
+            ].any((value) => value != null && value is! String) ||
+            [
+              payload['latitude'],
+              payload['longitude'],
+              payload['discounted_price']
+            ].any((value) => value != null && !finiteNumber(value))) {
+          throw _protocolError('clients.payload contains invalid values.');
+        }
+      case 'items':
+        _exactKeys(
+          payload,
+          {'name', 'price', 'enabled'},
+          {'name', 'price', 'enabled'},
+          'items.payload',
+        );
+        if (payload['name'] is! String ||
+            !finiteNumber(payload['price']) ||
+            payload['enabled'] is! bool) {
+          throw _protocolError('items.payload contains invalid values.');
+        }
+      case 'rectangles':
+        _exactKeys(
+          payload,
+          {'length', 'width'},
+          {'length', 'width'},
+          'rectangles.payload',
+        );
+        if (!finiteNumber(payload['length']) ||
+            !finiteNumber(payload['width'])) {
+          throw _protocolError('rectangles.payload contains invalid values.');
+        }
+      case 'default_prices':
+        _exactKeys(
+          payload,
+          {'price', 'enabled'},
+          {'price', 'enabled'},
+          'default_prices.payload',
+        );
+        if (!finiteNumber(payload['price']) || payload['enabled'] is! bool) {
+          throw _protocolError(
+              'default_prices.payload contains invalid values.');
+        }
+    }
+    if (collection == 'items' || collection == 'rectangles') {
+      _v2Uuid(record['parent_id'], '$collection.parent_id');
+    } else if (record['franchisee_id'] != franchiseeId) {
+      throw _protocolError('$collection crossed tenant ownership.');
+    }
+    return record;
+  }
+
+  Future<Set<String>> _prepareV2ClientPhotos(String franchiseeId) async {
+    final blocked = <String>{};
+    final clients = (await dbService.getDirtyClients())
+        .where((client) =>
+            client.franchiseeId == franchiseeId && client.deletedAt == null)
+        .toList();
+    for (final client in clients) {
+      final canonical = <String>[];
+      var failed = false;
+      for (final photo in client.photos) {
+        if (photo.startsWith('/api/photos/client/')) {
+          canonical.add(photo);
+          continue;
+        }
+        final uri = Uri.tryParse(photo);
+        if (uri != null &&
+            (uri.scheme == 'http' || uri.scheme == 'https') &&
+            uri.path.startsWith('/api/photos/client/')) {
+          canonical.add(uri.path);
+          continue;
+        }
+        try {
+          canonical.add(
+            await apiService.uploadClientPhoto(client.remoteId, photo),
+          );
+        } catch (_) {
+          failed = true;
+          blocked.add(client.remoteId);
+          break;
+        }
+      }
+      if (!failed &&
+          canonical.length == client.photos.length &&
+          canonical.join('|') != client.photos.join('|')) {
+        // Photos stay outside the LWW payload. Canonicalizing the local paths
+        // creates a new exact pending change so an older in-flight outcome
+        // cannot clear this row.
+        await dbService.updateClient(
+          client.copyWith(
+            photos: canonical,
+            isDirty: true,
+            updatedAt: DateTime.now(),
+          ),
+        );
+      }
+    }
+    return blocked;
+  }
+
+  Future<void> _syncV2(
+    String franchiseeId, {
+    required bool activateProtocol,
+  }) async {
+    final requestCursor = await dbService.getSyncV2Cursor(franchiseeId);
+    final parsedRequestCursor = _v2Decimal(requestCursor, 'request_cursor');
+    final warrantyCursor = await dbService.getWarrantyTombstoneCursor(
+      franchiseeId,
+    );
+    _v2Decimal(warrantyCursor, 'warranty_tombstone_cursor');
+    final blockedPhotoClients = await _prepareV2ClientPhotos(franchiseeId);
+    final changes = await dbService.getPendingLwwChanges(franchiseeId);
+    changes['clients']?.removeWhere(
+      (change) => blockedPhotoClients.contains(change['remote_id']),
+    );
+    final requestId = const Uuid().v4();
+    final submittedChangeIds = <String, Map<String, String>>{
+      for (final collection in _v2Collections)
+        collection: {
+          for (final change in changes[collection] ?? const [])
+            change['remote_id'].toString(): change['change_id'].toString(),
+        },
+    };
+    final submittedByChangeId = <String, Map<String, dynamic>>{
+      for (final collection in _v2Collections)
+        for (final change in changes[collection] ?? const [])
+          change['change_id'].toString(): {
+            'collection': collection,
+            'remote_id': change['remote_id'].toString(),
+          },
+    };
+    final response = await apiService.syncV2({
+      'protocol_version': 2,
+      'request_id': requestId,
+      'request_cursor': requestCursor,
+      'warranty_tombstone_cursor': warrantyCursor,
+      'changes': {
+        for (final collection in _v2Collections)
+          collection: changes[collection] ?? const [],
+      },
+    });
+
+    _exactKeys(
+      response,
+      {
+        'protocol_version',
+        'request_id',
+        'response_cursor',
+        'warranty_tombstone_cursor',
+        'outcomes',
+        'warnings',
+        'updates',
+      },
+      {
+        'protocol_version',
+        'request_id',
+        'response_cursor',
+        'warranty_tombstone_cursor',
+        'outcomes',
+        'warnings',
+        'updates',
+      },
+      'response',
+    );
+    if (response['protocol_version'] != 2 ||
+        response['request_id'] != requestId) {
+      throw _protocolError('response identity does not match the request.');
+    }
+    final responseCursor = _v2Decimal(
+      response['response_cursor'],
+      'response_cursor',
+    );
+    if (responseCursor < parsedRequestCursor) {
+      throw _protocolError('response_cursor moved backwards.');
+    }
+    final parsedWarrantyCursor = _v2Decimal(
+      response['warranty_tombstone_cursor'],
+      'warranty_tombstone_cursor',
+    );
+    final outcomes = _v2Object(response['outcomes'], 'outcomes');
+    _exactKeys(
+      outcomes,
+      _v2Collections.toSet(),
+      _v2Collections.toSet(),
+      'outcomes',
+    );
+    if (response['warnings'] is! List) {
+      throw _protocolError('warnings must be a list.');
+    }
+    for (final rawWarning in response['warnings'] as List) {
+      final warning = _v2Object(rawWarning, 'warning');
+      _exactKeys(
+        warning,
+        {'code', 'change_id', 'reason'},
+        {'code', 'change_id', 'reason'},
+        'warning',
+      );
+      if (warning['code'] != 'device_timestamp_discarded' ||
+          (warning['reason'] != 'invalid' && warning['reason'] != 'future')) {
+        throw _protocolError('warning is invalid.');
+      }
+      final warningChangeId =
+          _v2Uuid(warning['change_id'], 'warning.change_id');
+      if (!submittedByChangeId.containsKey(warningChangeId)) {
+        throw _protocolError('warning references an unrelated change.');
+      }
+    }
+    final outcomeStatuses = <String, String>{};
+    final authoritative = <String, List<Map<String, dynamic>>>{
+      for (final collection in _v2Collections) collection: [],
+    };
+    final seenOutcomes = <String>{};
+    const statuses = {
+      'applied',
+      'already_applied',
+      'superseded',
+      'rejected',
+      'permanently_deleted',
+      'unauthorized',
+    };
+    const reasonCodes = {
+      'upsert_applied',
+      'delete_applied',
+      'already_applied',
+      'delete_wins',
+      'version_superseded',
+      'future_base_version',
+      'change_id_reused',
+      'parent_required',
+      'parent_unavailable',
+      'immutable_parent',
+      'invalid_payload',
+      'server_field_forbidden',
+      'unknown_field',
+      'not_authorized',
+    };
+    for (final collection in _v2Collections) {
+      final collectionOutcomes = outcomes[collection];
+      if (collectionOutcomes is! List) {
+        throw _protocolError('$collection outcomes must be a list.');
+      }
+      for (final rawOutcome in collectionOutcomes) {
+        final result = _v2Object(rawOutcome, '$collection outcome');
+        _exactKeys(
+          result,
+          {'change_id', 'remote_id', 'status', 'reason_code', 'authoritative'},
+          {'change_id', 'remote_id', 'status', 'reason_code'},
+          '$collection outcome',
+        );
+        final changeId = _v2Uuid(
+          result['change_id'],
+          '$collection outcome change_id',
+        );
+        final remoteId = _v2Uuid(
+          result['remote_id'],
+          '$collection outcome remote_id',
+        );
+        final submitted = submittedByChangeId[changeId];
+        if (submitted == null ||
+            submitted['collection'] != collection ||
+            submitted['remote_id'] != remoteId ||
+            !seenOutcomes.add(changeId)) {
+          throw _protocolError('$collection returned an unrelated outcome.');
+        }
+        if (!statuses.contains(result['status']) ||
+            result['reason_code'] is! String ||
+            !reasonCodes.contains(result['reason_code'])) {
+          throw _protocolError('$collection outcome status is invalid.');
+        }
+        if ({
+              'applied',
+              'already_applied',
+              'superseded',
+            }.contains(result['status']) &&
+            result['authoritative'] == null) {
+          throw _protocolError('$collection omitted authoritative state.');
+        }
+        outcomeStatuses[changeId] = result['status'] as String;
+        if (result['authoritative'] != null) {
+          authoritative[collection]!.add(
+            _validateV2Record(
+              result['authoritative'],
+              collection,
+              responseCursor: responseCursor,
+              requestCursor: parsedRequestCursor,
+              franchiseeId: franchiseeId,
+              snapshot: false,
+            ),
+          );
+        }
+      }
+    }
+    if (seenOutcomes.length != submittedByChangeId.length) {
+      throw _protocolError('the server omitted one or more change outcomes.');
+    }
+
+    final updates = _v2Object(response['updates'], 'updates');
+    _exactKeys(
+      updates,
+      {..._v2Collections, 'warranty_tombstones'},
+      {..._v2Collections, 'warranty_tombstones'},
+      'updates',
+    );
+    final records = <String, List<Map<String, dynamic>>>{
+      for (final collection in _v2Collections) collection: [],
+    };
+    for (final collection in _v2Collections) {
+      final rawRecords = updates[collection];
+      if (rawRecords is! List) {
+        throw _protocolError('$collection updates must be a list.');
+      }
+      final byRemoteId = <String, Map<String, dynamic>>{};
+      for (final rawRecord in rawRecords) {
+        final record = _validateV2Record(
+          rawRecord,
+          collection,
+          responseCursor: responseCursor,
+          requestCursor: parsedRequestCursor,
+          franchiseeId: franchiseeId,
+          snapshot: true,
+        );
+        final remoteId = record['remote_id'] as String;
+        if (byRemoteId.containsKey(remoteId)) {
+          throw _protocolError('$collection contains a duplicate update.');
+        }
+        byRemoteId[remoteId] = record;
+      }
+      // A superseded or already-applied change may reference an authoritative
+      // row older than the pull interval. Use it only when the interval did not
+      // already contain the final record.
+      for (final record in authoritative[collection]!) {
+        byRemoteId.putIfAbsent(record['remote_id'] as String, () => record);
+      }
+      records[collection] = byRemoteId.values.toList();
+    }
+
+    final rawTombstones = updates['warranty_tombstones'];
+    if (rawTombstones is! List) {
+      throw _protocolError('warranty_tombstones must be a list.');
+    }
+    final warrantyTombstones = <WarrantyDeletionTombstone>[];
+    var lastWarrantySequence = _v2Decimal(
+      warrantyCursor,
+      'warranty_tombstone_cursor',
+    );
+    for (final raw in rawTombstones) {
+      final map = _v2Object(raw, 'warranty tombstone');
+      _exactKeys(
+        map,
+        {'warranty_id', 'deletion_sequence', 'deleted_at'},
+        {'warranty_id', 'deletion_sequence', 'deleted_at'},
+        'warranty tombstone',
+      );
+      _v2Uuid(map['warranty_id'], 'warranty_id');
+      final sequence = _v2Decimal(
+        map['deletion_sequence'],
+        'deletion_sequence',
+        allowZero: false,
+      );
+      if (sequence <= lastWarrantySequence || sequence > parsedWarrantyCursor) {
+        throw _protocolError('warranty tombstone ordering is invalid.');
+      }
+      lastWarrantySequence = sequence;
+      warrantyTombstones.add(
+        WarrantyDeletionTombstone.fromServer(map, franchiseeId: franchiseeId),
+      );
+    }
+    if (lastWarrantySequence != parsedWarrantyCursor) {
+      throw _protocolError('warranty tombstone cursor is inconsistent.');
+    }
+
+    await dbService.applySyncV2Response(
+      franchiseeId: franchiseeId,
+      responseCursor: responseCursor.toString(),
+      warrantyTombstoneCursor: parsedWarrantyCursor.toString(),
+      records: records,
+      warrantyTombstones: warrantyTombstones,
+      submittedChangeIds: submittedChangeIds,
+      outcomeStatuses: outcomeStatuses,
+      activateProtocol: activateProtocol,
+    );
   }
 }

@@ -108,5 +108,116 @@ void main() {
         isNotEmpty,
       );
     });
+
+    test(
+        'v11 adds tenant cursor and LWW state without rewriting legacy dirty data',
+        () async {
+      final database = await openDatabase(
+        inMemoryDatabasePath,
+        version: 1,
+        onCreate: (db, _) async {
+          await db.execute('''
+            CREATE TABLE clients (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              name TEXT NOT NULL,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE items (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              client_id INTEGER,
+              name TEXT NOT NULL,
+              price REAL,
+              enabled INTEGER,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE rectangles (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              item_id INTEGER,
+              length REAL,
+              width REAL,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE default_prices (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              price REAL,
+              enabled INTEGER,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT
+            )
+          ''');
+          await db.insert('clients', {
+            'remote_id': 'legacy-dirty',
+            'franchisee_id': 'tenant-a',
+            'name': 'Unsynced',
+            'is_dirty': 1,
+            'updated_at': '2026-07-30T00:00:00.000Z',
+          });
+        },
+      );
+      addTearDown(database.close);
+
+      await DbService.migrateSchema(database, 10, 11);
+      await DbService.migrateSchema(database, 10, 11);
+
+      for (final table in [
+        'clients',
+        'items',
+        'rectangles',
+        'default_prices',
+      ]) {
+        final columns = await database.rawQuery('PRAGMA table_info($table)');
+        final names = columns.map((column) => column['name']).toSet();
+        expect(
+          names,
+          containsAll([
+            'server_generation',
+            'server_cursor',
+            'pending_base_generation',
+            'pending_generation',
+            'pending_branch_seq',
+            'pending_writer_id',
+            'pending_change_id',
+          ]),
+        );
+      }
+      expect(
+        (await database.query('clients')).single,
+        containsPair('name', 'Unsynced'),
+      );
+      expect(
+        (await database.query('clients')).single,
+        containsPair('is_dirty', 1),
+      );
+      expect(
+        (await database.query('clients')).single['pending_change_id'],
+        isNull,
+        reason: 'legacy v1 dirty work must drain before v2 bootstrap',
+      );
+      expect(
+        await database.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_state'",
+        ),
+        isNotEmpty,
+      );
+    });
   });
 }

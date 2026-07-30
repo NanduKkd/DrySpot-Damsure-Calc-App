@@ -708,7 +708,12 @@ export const tombstoneClientWarranties = async ({
 	return storageKeys;
 };
 
-export const warrantyTombstonesAfter = async (franchiseeId: string, cursor: string, limit = 1000) =>
+export const warrantyTombstonesAfter = async (
+	franchiseeId: string,
+	cursor: string,
+	transaction?: Transaction,
+	limit = 1000,
+) =>
 	WarrantyDeletionTombstone.findAll({
 		where: {
 			franchiseeId,
@@ -716,6 +721,7 @@ export const warrantyTombstonesAfter = async (franchiseeId: string, cursor: stri
 		},
 		order: [['deletionSequence', 'ASC']],
 		limit,
+		transaction,
 	});
 
 /**

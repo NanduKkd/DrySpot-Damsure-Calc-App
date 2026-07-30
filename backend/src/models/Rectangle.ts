@@ -7,6 +7,13 @@ export class Rectangle extends Model {
 	public length!: number;
 	public width!: number;
 	public imageData!: string | null;
+	public lwwGeneration!: string;
+	public lwwBranchSeq!: number;
+	public lwwOperationRank!: number;
+	public lwwWriterId!: string;
+	public lwwChangeId!: string;
+	public lwwPayloadHash!: string;
+	public syncCursor!: string;
 	public readonly updatedAt!: Date;
 	public readonly deletedAt!: Date;
 }
@@ -33,6 +40,41 @@ Rectangle.init(
 		imageData: {
 			type: DataTypes.TEXT,
 			allowNull: true,
+		},
+		lwwGeneration: {
+			type: DataTypes.BIGINT,
+			allowNull: false,
+			defaultValue: '1',
+		},
+		lwwBranchSeq: {
+			type: DataTypes.INTEGER,
+			allowNull: false,
+			defaultValue: 1,
+		},
+		lwwOperationRank: {
+			type: DataTypes.SMALLINT,
+			allowNull: false,
+			defaultValue: 0,
+		},
+		lwwWriterId: {
+			type: DataTypes.UUID,
+			allowNull: false,
+			defaultValue: DataTypes.UUIDV4,
+		},
+		lwwChangeId: {
+			type: DataTypes.UUID,
+			allowNull: false,
+			defaultValue: DataTypes.UUIDV4,
+		},
+		lwwPayloadHash: {
+			type: DataTypes.STRING(64),
+			allowNull: false,
+			defaultValue: '0'.repeat(64),
+		},
+		syncCursor: {
+			type: DataTypes.BIGINT,
+			allowNull: false,
+			defaultValue: '1',
 		},
 		deletedAt: {
 			type: DataTypes.DATE,

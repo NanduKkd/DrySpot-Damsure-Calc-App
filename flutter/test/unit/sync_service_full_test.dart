@@ -20,6 +20,7 @@ void main() {
   test('sync service with mock server response', () async {
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
 
     when(mockDb.getDirtyClients()).thenAnswer((_) async => []);
     when(mockDb.getDirtyItems()).thenAnswer((_) async => []);
@@ -84,6 +85,7 @@ void main() {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
     final now = DateTime.utc(2026, 7, 25).toIso8601String();
     final client = Client(
       localId: 1,
@@ -159,6 +161,7 @@ void main() {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
     final now = DateTime.utc(2026, 7, 25).toIso8601String();
     final client = Client(
       localId: 1,
@@ -240,6 +243,7 @@ void main() {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
     final now = DateTime.utc(2026, 7, 25).toIso8601String();
     final pushed = DefaultPrice(
       franchiseeId: 'tenant-a',
@@ -348,6 +352,7 @@ void main() {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
     final now = DateTime.utc(2026, 7, 30).toIso8601String();
     final client = Client(
       localId: 1,
@@ -445,6 +450,7 @@ void main() {
     SharedPreferences.setMockInitialValues({'franchisee_id': 'tenant-a'});
     final mockApi = MockApiService();
     final mockDb = MockDbService();
+    when(mockDb.supportsSyncV2()).thenAnswer((_) async => false);
     final now = DateTime.utc(2026, 7, 30).toIso8601String();
     final client = Client(
       localId: 1,

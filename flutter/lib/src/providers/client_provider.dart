@@ -25,13 +25,12 @@ class ClientProvider extends ChangeNotifier {
   List<Warranty> get currentClientWarranties => _currentClientWarranties;
   List<Proposal> get currentClientProposals => _currentClientProposals;
 
-  void updateSession({
-    required bool isAuthenticated,
-    String? franchiseeId,
-  }) {
-    final normalizedFranchiseeId =
-        franchiseeId?.trim().isNotEmpty == true ? franchiseeId!.trim() : null;
-    final hasChanged = !_sessionBound ||
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {
+    final normalizedFranchiseeId = franchiseeId?.trim().isNotEmpty == true
+        ? franchiseeId!.trim()
+        : null;
+    final hasChanged =
+        !_sessionBound ||
         _isAuthenticated != isAuthenticated ||
         _activeFranchiseeId != normalizedFranchiseeId;
 
@@ -80,7 +79,9 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> updateClient(Client client) async {
-    await _dbService.updateClient(client);
+    await _dbService.updateClient(
+      client.copyWith(isDirty: true, updatedAt: DateTime.now()),
+    );
     await loadClients();
   }
 
@@ -100,7 +101,9 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> updateItem(Item item) async {
-    await _dbService.updateItem(item);
+    await _dbService.updateItem(
+      item.copyWith(isDirty: true, updatedAt: DateTime.now()),
+    );
     await loadClients();
   }
 
@@ -115,7 +118,9 @@ class ClientProvider extends ChangeNotifier {
   }
 
   Future<void> updateRectangle(Rectangle rectangle) async {
-    await _dbService.updateRectangle(rectangle);
+    await _dbService.updateRectangle(
+      rectangle.copyWith(isDirty: true, updatedAt: DateTime.now()),
+    );
     await loadClients();
   }
 
@@ -127,21 +132,24 @@ class ClientProvider extends ChangeNotifier {
   Future<void> applyBulkPrice(int clientLocalId, double price) async {
     final client = _clients.firstWhere((c) => c.localId == clientLocalId);
     for (var item in client.items) {
-      await _dbService
-          .updateItem(item.copyWith(price: price, updatedAt: DateTime.now()));
+      await _dbService.updateItem(
+        item.copyWith(price: price, updatedAt: DateTime.now()),
+      );
     }
     await loadClients();
   }
 
   Future<void> loadWarranties(int clientLocalId) async {
-    _currentClientWarranties =
-        await _dbService.getWarrantiesByClientId(clientLocalId);
+    _currentClientWarranties = await _dbService.getWarrantiesByClientId(
+      clientLocalId,
+    );
     notifyListeners();
   }
 
   Future<void> loadProposals(int clientLocalId) async {
-    _currentClientProposals =
-        await _dbService.getProposalsByClientId(clientLocalId);
+    _currentClientProposals = await _dbService.getProposalsByClientId(
+      clientLocalId,
+    );
     notifyListeners();
   }
 

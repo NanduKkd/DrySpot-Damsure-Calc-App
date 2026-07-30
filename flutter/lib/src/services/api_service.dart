@@ -19,9 +19,7 @@ class ApiService {
   static const _serverUrlKey = 'server_url';
 
   ApiService({String? serverUrl})
-      : _serverUrl = normalizeServerUrl(
-          serverUrl ?? AppConfig.defaultServerUrl,
-        );
+    : _serverUrl = normalizeServerUrl(serverUrl ?? AppConfig.defaultServerUrl);
 
   String _serverUrl;
   String? _token;
@@ -71,8 +69,9 @@ class ApiService {
       );
     }
 
-    final segments =
-        uri.pathSegments.where((segment) => segment.isNotEmpty).toList();
+    final segments = uri.pathSegments
+        .where((segment) => segment.isNotEmpty)
+        .toList();
     if (segments.isNotEmpty && segments.last == 'api') {
       segments.removeLast();
     }
@@ -80,23 +79,19 @@ class ApiService {
     final normalizedPath = segments.isEmpty ? '' : '/${segments.join('/')}';
 
     return uri
-        .replace(
-          path: normalizedPath,
-          query: null,
-          fragment: null,
-        )
+        .replace(path: normalizedPath, query: null, fragment: null)
         .toString()
         .replaceFirst(RegExp(r'/$'), '');
   }
 
   Map<String, String> get _headers => {
-        'Content-Type': 'application/json',
-        if (_hasToken) 'Authorization': 'Bearer $_token',
-      };
+    'Content-Type': 'application/json',
+    if (_hasToken) 'Authorization': 'Bearer $_token',
+  };
 
   Map<String, String> get authenticatedHeaders => {
-        if (_hasToken) 'Authorization': 'Bearer $_token',
-      };
+    if (_hasToken) 'Authorization': 'Bearer $_token',
+  };
 
   String resolveUrl(String pathOrUrl) {
     final uri = Uri.tryParse(pathOrUrl);
@@ -200,22 +195,43 @@ class ApiService {
     }
   }
 
+  Future<Map<String, dynamic>> syncV2(Map<String, dynamic> data) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/sync/v2'),
+      headers: _headers,
+      body: jsonEncode(data),
+    );
+
+    if (response.statusCode == 200) {
+      return _decodeObjectBody(
+        response.body,
+        fallbackMessage:
+            'Sync v2 succeeded but the server response was invalid.',
+      );
+    }
+    throw ApiException(_extractErrorMessage(response, 'Failed to sync'));
+  }
+
   Future<Map<String, dynamic>> uploadWarranty(
     String filePath,
     Map<String, String> fields, {
     String? idempotencyKey,
   }) async {
-    final request =
-        http.MultipartRequest('POST', Uri.parse('$baseUrl/warranty/upload'));
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$baseUrl/warranty/upload'),
+    );
     request.headers.addAll({
       if (_hasToken) 'Authorization': 'Bearer $_token',
       if (idempotencyKey != null) 'Idempotency-Key': idempotencyKey,
     });
-    request.files.add(await http.MultipartFile.fromPath(
-      'file',
-      filePath,
-      contentType: MediaType('application', 'pdf'),
-    ));
+    request.files.add(
+      await http.MultipartFile.fromPath(
+        'file',
+        filePath,
+        contentType: MediaType('application', 'pdf'),
+      ),
+    );
     request.fields.addAll(fields);
 
     final streamedResponse = await request.send();
@@ -243,10 +259,7 @@ class ApiService {
   }) async {
     final response = await http.delete(
       Uri.parse('$baseUrl/warranty/$id'),
-      headers: {
-        ..._headers,
-        'Idempotency-Key': idempotencyKey,
-      },
+      headers: {..._headers, 'Idempotency-Key': idempotencyKey},
       body: jsonEncode({
         'confirmed_warranty_id': id,
         'confirmed_warranty_card_number': warrantyCardNumber,
@@ -274,17 +287,21 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> uploadProposal(
-      String filePath, Map<String, String> fields) async {
-    final request =
-        http.MultipartRequest('POST', Uri.parse('$baseUrl/proposal/upload'));
-    request.headers.addAll({
-      if (_hasToken) 'Authorization': 'Bearer $_token',
-    });
-    request.files.add(await http.MultipartFile.fromPath(
-      'file',
-      filePath,
-      contentType: MediaType('application', 'pdf'),
-    ));
+    String filePath,
+    Map<String, String> fields,
+  ) async {
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$baseUrl/proposal/upload'),
+    );
+    request.headers.addAll({if (_hasToken) 'Authorization': 'Bearer $_token'});
+    request.files.add(
+      await http.MultipartFile.fromPath(
+        'file',
+        filePath,
+        contentType: MediaType('application', 'pdf'),
+      ),
+    );
     request.fields.addAll(fields);
 
     final streamedResponse = await request.send();
@@ -327,7 +344,8 @@ class ApiService {
     final response = await http.Response.fromStream(await request.send());
     if (response.statusCode != 201) {
       throw ApiException(
-          _extractErrorMessage(response, 'Failed to upload photo'));
+        _extractErrorMessage(response, 'Failed to upload photo'),
+      );
     }
     final payload = _decodeObjectBody(
       response.body,
@@ -352,7 +370,8 @@ class ApiService {
     );
     if (response.statusCode != 204) {
       throw ApiException(
-          _extractErrorMessage(response, 'Failed to delete photo'));
+        _extractErrorMessage(response, 'Failed to delete photo'),
+      );
     }
   }
 }

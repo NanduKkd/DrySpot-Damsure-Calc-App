@@ -155,6 +155,17 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
       ) as _i5.Future<Map<String, dynamic>>);
 
   @override
+  _i5.Future<Map<String, dynamic>> syncV2(Map<String, dynamic>? data) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #syncV2,
+          [data],
+        ),
+        returnValue:
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
+
+  @override
   _i5.Future<Map<String, dynamic>> uploadWarranty(
     String? filePath,
     Map<String, String>? fields, {
@@ -562,6 +573,20 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<void>);
 
   @override
+  _i5.Future<int> applyWarrantyFromServerIfUnchanged(
+    _i11.Warranty? warranty, {
+    required String? submittedUpdatedAt,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #applyWarrantyFromServerIfUnchanged,
+          [warranty],
+          {#submittedUpdatedAt: submittedUpdatedAt},
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
   _i5.Future<void> applyWarrantyTombstone(
           _i12.WarrantyDeletionTombstone? tombstone) =>
       (super.noSuchMethod(
@@ -670,6 +695,82 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
         ),
         returnValue: _i5.Future<int>.value(0),
       ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<bool> isSyncV2Enabled(String? franchiseeId) => (super.noSuchMethod(
+        Invocation.method(
+          #isSyncV2Enabled,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<bool>.value(false),
+      ) as _i5.Future<bool>);
+
+  @override
+  _i5.Future<bool> supportsSyncV2() => (super.noSuchMethod(
+        Invocation.method(
+          #supportsSyncV2,
+          [],
+        ),
+        returnValue: _i5.Future<bool>.value(false),
+      ) as _i5.Future<bool>);
+
+  @override
+  _i5.Future<String> getSyncV2Cursor(String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getSyncV2Cursor,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<String>.value(_i4.dummyValue<String>(
+          this,
+          Invocation.method(
+            #getSyncV2Cursor,
+            [franchiseeId],
+          ),
+        )),
+      ) as _i5.Future<String>);
+
+  @override
+  _i5.Future<Map<String, List<Map<String, dynamic>>>> getPendingLwwChanges(
+          String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getPendingLwwChanges,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<Map<String, List<Map<String, dynamic>>>>.value(
+            <String, List<Map<String, dynamic>>>{}),
+      ) as _i5.Future<Map<String, List<Map<String, dynamic>>>>);
+
+  @override
+  _i5.Future<void> applySyncV2Response({
+    required String? franchiseeId,
+    required String? responseCursor,
+    required String? warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>>? records,
+    required List<_i12.WarrantyDeletionTombstone>? warrantyTombstones,
+    required Map<String, Map<String, String>>? submittedChangeIds,
+    required Map<String, String>? outcomeStatuses,
+    required bool? activateProtocol,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #applySyncV2Response,
+          [],
+          {
+            #franchiseeId: franchiseeId,
+            #responseCursor: responseCursor,
+            #warrantyTombstoneCursor: warrantyTombstoneCursor,
+            #records: records,
+            #warrantyTombstones: warrantyTombstones,
+            #submittedChangeIds: submittedChangeIds,
+            #outcomeStatuses: outcomeStatuses,
+            #activateProtocol: activateProtocol,
+          },
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
 
   @override
   _i5.Future<List<_i7.Client>> getDirtyClients() => (super.noSuchMethod(
