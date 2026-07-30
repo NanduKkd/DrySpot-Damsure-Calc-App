@@ -7,6 +7,7 @@ const warrantyDeletionMigration = require('../migrations/20260730010000-add-warr
 const userAdminMigration = require('../migrations/20260730020000-add-user-admin-lifecycle.js');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const userAdminAuditSequenceMigration = require('../migrations/20260730021000-add-user-admin-audit-sequence.js');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const lwwSyncMigration = require('../migrations/20260730020000-add-lww-sync-v2.js');
 
 // Deliberately explicit: production code rejects missing/default JWT secrets.
