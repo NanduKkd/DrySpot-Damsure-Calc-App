@@ -36,8 +36,12 @@ const enforceActiveWarranty = async (
 	replaceExisting: boolean,
 	transaction: any,
 ) => {
+	// During a rolling deploy, the pre-migration process can legitimately
+	// replace a warranty without populating active_client_id. Any non-deleted
+	// warranty for the client is therefore active, regardless of which
+	// application version created it.
 	const active = await Warranty.findAll({
-		where: { activeClientId: clientId, id: { [Op.ne]: warrantyId } },
+		where: { clientId, id: { [Op.ne]: warrantyId } },
 		transaction,
 		lock: transaction.LOCK.UPDATE,
 	});
@@ -520,11 +524,9 @@ export const sync = async (req: AuthRequest, res: Response) => {
 				.json({ error: 'Sync mutation references a missing parent record' });
 		}
 		if (error instanceof ActiveWarrantyConflictError) {
-			return res
-				.status(409)
-				.json({
-					error: 'An active warranty already exists. Set replace_existing to true to replace it.',
-				});
+			return res.status(409).json({
+				error: 'An active warranty already exists. Set replace_existing to true to replace it.',
+			});
 		}
 		console.error('Sync error:', error);
 		return res.status(500).json({ error: 'An error occurred during sync' });

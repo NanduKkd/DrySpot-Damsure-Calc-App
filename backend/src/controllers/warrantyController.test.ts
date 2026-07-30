@@ -80,8 +80,9 @@ describe('warrantyController', () => {
 			expect(warranty).toBeDefined();
 			expect((warranty as any).warrantyCardNumber).toBe('WARR-001');
 
-			const unauthorizedDownload = await request(app)
-				.get(`/api/warranty/${response.body.id}/download`);
+			const unauthorizedDownload = await request(app).get(
+				`/api/warranty/${response.body.id}/download`,
+			);
 			expect(unauthorizedDownload.status).toBe(401);
 		});
 
@@ -94,7 +95,10 @@ describe('warrantyController', () => {
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-DOWNLOAD')
 				.field('replace_existing', 'true')
-				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
+					contentType: 'application/octet-stream',
+				});
 
 			expect(upload.status).toBe(201);
 			const ownedDownload = await request(app)
@@ -118,7 +122,10 @@ describe('warrantyController', () => {
 				.field('start_date', new Date().toISOString())
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-REPLACE')
-				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
+					contentType: 'application/octet-stream',
+				});
 
 			expect(response.status).toBe(409);
 
@@ -130,9 +137,50 @@ describe('warrantyController', () => {
 				.field('duration_years', '5')
 				.field('warranty_card_number', 'WARR-REPLACE')
 				.field('replace_existing', 'true')
-				.attach('file', samplePdf, { filename: 'warranty.pdf', contentType: 'application/octet-stream' });
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
+					contentType: 'application/octet-stream',
+				});
 			expect(replacement.status).toBe(201);
 			expect(await Warranty.count({ where: { activeClientId: client.id } })).toBe(1);
+		});
+
+		it('replaces a rollout-window warranty with no active_client_id', async () => {
+			const rolloutClient = await Client.create({
+				id: 'c-rollout-id',
+				name: 'Rolling deploy client',
+				franchiseeId: franchisee.id,
+			});
+			const rolloutWarranty = await Warranty.create({
+				id: 'w-rollout-id',
+				clientId: rolloutClient.id,
+				activeClientId: null,
+				warrantyCardNumber: 'OLD-PROCESS-WARRANTY',
+				startDate: new Date(),
+				durationYears: 5,
+				pdfUrl: '/api/warranty/w-rollout-id/download',
+			});
+
+			const replacement = await request(app)
+				.post('/api/warranty/upload')
+				.set('Authorization', `Bearer ${token}`)
+				.field('client_id', rolloutClient.id)
+				.field('start_date', new Date().toISOString())
+				.field('duration_years', '5')
+				.field('warranty_card_number', 'NEW-PROCESS-WARRANTY')
+				.field('replace_existing', 'true')
+				.attach('file', samplePdf, {
+					filename: 'warranty.pdf',
+					contentType: 'application/octet-stream',
+				});
+
+			expect(replacement.status).toBe(201);
+			expect(await Warranty.findByPk(rolloutWarranty.id)).toBeNull();
+			expect(
+				await Warranty.count({
+					where: { clientId: rolloutClient.id, activeClientId: rolloutClient.id },
+				}),
+			).toBe(1);
 		});
 
 		it('returns 400 when client_id is missing', async () => {
@@ -189,4 +237,4 @@ describe('warrantyController', () => {
 			);
 		});
 	});
-	});
+});

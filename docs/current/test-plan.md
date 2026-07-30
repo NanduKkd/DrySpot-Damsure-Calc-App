@@ -66,7 +66,7 @@ This test plan outlines the testing strategy for the Warranty and Proposal PDF u
 
 ## 6. Current reconciliation (2026-07)
 
-Automated acceptance evidence now exceeds the original plan: backend verification has 14 suites / 59 tests plus a passing build, and Flutter has 99 passing tests with `flutter analyze` exiting 0 without issues. Backend lint exits 0 with 84 warnings, which remain cleanup work rather than a passing-with-zero-warnings claim. The production dependency audit has no high or critical advisories; 2 moderate advisories remain through Sequelize's `uuid` dependency.
+Automated acceptance evidence now exceeds the original plan: backend verification has 14 suites / 61 tests plus a passing build, and Flutter has 99 passing tests with `flutter analyze` exiting 0 without issues. Backend lint exits 0 with 84 warnings, which remain cleanup work rather than a passing-with-zero-warnings claim. The production dependency audit has no high or critical advisories; 2 moderate advisories remain through Sequelize's `uuid` dependency.
 
 Current coverage also includes tenant sync isolation, JWT inactive/revoked-user rejection, disabled public registration, default-price sync, server-managed PDF metadata and file lifecycle, one-active-warranty conflict/replacement, portable photo transport, forged URL filtering, and cross-tenant/traversal access rejection.
 

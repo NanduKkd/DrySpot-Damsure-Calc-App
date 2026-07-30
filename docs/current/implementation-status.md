@@ -13,7 +13,7 @@ The integrated backend and Flutter implementation has passed automated and produ
 
 | Area | Result |
 | :--- | :--- |
-| Backend verification | `npm run verify`: build and 14 Jest suites / 59 tests pass; lint exits successfully with 84 warnings. `npm audit --omit=dev --audit-level=high` passes with no high or critical production advisories (2 moderate advisories remain through Sequelize's `uuid` dependency). |
+| Backend verification | `npm run verify`: build and 14 Jest suites / 61 tests pass; lint exits successfully with 84 warnings. `npm audit --omit=dev --audit-level=high` passes with no high or critical production advisories (2 moderate advisories remain through Sequelize's `uuid` dependency). |
 | Flutter verification | 99 tests pass; `flutter analyze` exits 0 with no issues. Coverage includes one-time ownership assignment for SQLite v7 default-price rows and safe behavior when a photo upload only partially succeeds. |
 | Android signing verification | `flutter build apk --release` passes. The resulting APK passed `apksigner` v2 verification with an RSA-4096 certificate; its SHA-256 is recorded in test results. It was not published. |
 | Migration confidence | PASS against a disposable PostgreSQL database restored from the production backup: forward migration, both active-warranty uniqueness guards, old-process duplicate-write rejection, non-destructive undo, reapply, and idempotent rerun were verified. The disposable database was removed; the root-only production backup was retained. |

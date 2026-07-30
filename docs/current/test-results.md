@@ -4,7 +4,7 @@
 
 | Test Area | Status | Evidence / limitation |
 | :--- | :--- | :--- |
-| Backend verification | PASS | `npm run verify`: build passes; 14 Jest suites / 59 tests pass. Lint exits 0 with 84 warnings. Production dependency audit passes at the high threshold with 2 moderate Sequelize/`uuid` advisories remaining. |
+| Backend verification | PASS | `npm run verify`: build passes; 14 Jest suites / 61 tests pass. Lint exits 0 with 84 warnings. Production dependency audit passes at the high threshold with 2 moderate Sequelize/`uuid` advisories remaining. |
 | Flutter verification | PASS | 99 tests pass; `flutter analyze` exits 0 with no issues. |
 | Android release packaging and signing | PASS | `flutter build apk --release` passed. `app-release.apk` SHA-256: `b0b77a82deaeec29c0d37fbb7a5521956a082afd9ed191c94d8885e8c8bdbcc4`; `apksigner` verified v2 signing with an RSA-4096 certificate (SHA-256 `09:9D:60:6D:05:CC:99:3C:D4:04:C0:2A:31:4D:7F:01:A0:F7:B8:02:43:DF:FA:79:F5:52:A7:B1:72:51:0A:EF`) and minSdk 24. The APK was not published. |
 | PostgreSQL migration | PASS (production-copy rehearsal) | A root-only compressed backup of production was restored into a disposable database. Forward migration verified the added columns, `SequelizeMeta`, newest non-deleted warranty backfill, both unique guards, and rejection of an old-process duplicate active-warranty insert. Undo removed both indexes/meta while retaining columns/data; reapply restored both guards and a second forward run was a no-op. The disposable database was dropped and its absence verified; production was not mutated. |

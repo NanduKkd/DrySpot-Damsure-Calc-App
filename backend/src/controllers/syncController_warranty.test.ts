@@ -18,6 +18,9 @@ describe('syncController warranty and PDF server invariants', () => {
 	const fileClientId = '00000000-0000-0000-0000-000000000307';
 	const fileWarrantyId = '00000000-0000-0000-0000-000000000308';
 	const fileProposalId = '00000000-0000-0000-0000-000000000309';
+	const rolloutClientId = '00000000-0000-0000-0000-000000000320';
+	const rolloutWarrantyId = '00000000-0000-0000-0000-000000000321';
+	const rolloutReplacementId = '00000000-0000-0000-0000-000000000322';
 	let token: string;
 
 	beforeAll(async () => {
@@ -85,6 +88,38 @@ describe('syncController warranty and PDF server invariants', () => {
 			(await Warranty.findByPk(firstWarrantyId, { paranoid: false }))?.activeClientId,
 		).toBeNull();
 		expect((await Warranty.findByPk(replacementWarrantyId))?.activeClientId).toBe(clientId);
+	});
+
+	it('replaces a rollout-window warranty with no active_client_id', async () => {
+		await Client.create({
+			id: rolloutClientId,
+			franchiseeId,
+			name: 'Rolling deploy client',
+		});
+		await Warranty.create({
+			id: rolloutWarrantyId,
+			clientId: rolloutClientId,
+			activeClientId: null,
+			warrantyCardNumber: 'old-process-replacement',
+			startDate: new Date('2026-01-01T00:00:00.000Z'),
+			durationYears: 1,
+			pdfUrl: `/api/warranty/${rolloutWarrantyId}/download`,
+		});
+
+		const response = await sync({
+			warranties: [
+				warranty(rolloutReplacementId, {
+					client_id: rolloutClientId,
+					replace_existing: true,
+				}),
+			],
+		});
+
+		expect(response.status).toBe(200);
+		expect(await Warranty.findByPk(rolloutWarrantyId)).toBeNull();
+		expect((await Warranty.findByPk(rolloutReplacementId))?.activeClientId).toBe(
+			rolloutClientId,
+		);
 	});
 
 	it('does not allow camelCase PDF metadata to mutate an existing warranty', async () => {
