@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
@@ -25,6 +27,19 @@ class MockClientProvider extends ClientProvider {
   Future<void> updateItem(Item item) async {}
   @override
   Future<void> loadClients() async {}
+}
+
+class DeletionClientProvider extends MockClientProvider {
+  DeletionClientProvider(super.item);
+
+  int deleteCount = 0;
+  Completer<void>? deletionCompleter;
+
+  @override
+  Future<void> deleteRectangle(int localId) async {
+    deleteCount++;
+    await deletionCompleter?.future;
+  }
 }
 
 class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
@@ -163,5 +178,99 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Image attached'), findsOneWidget);
+  });
+
+  testWidgets('measurement deletion confirms dimensions and is single-flight',
+      (WidgetTester tester) async {
+    final item = Item(
+      name: 'Test Item',
+      price: 10.0,
+      localId: 1,
+      rectangles: [
+        Rectangle(
+          localId: 7,
+          itemId: 1,
+          length: 12,
+          width: 8,
+          imageData: 'data:image/png;base64,ZmFrZQ==',
+        ),
+      ],
+    );
+    final mockProvider = DeletionClientProvider(item)
+      ..deletionCompleter = Completer<void>();
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: mockProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: MockSettingsProvider()),
+        ],
+        child: const MaterialApp(
+          home: ItemDetailScreen(itemLocalId: 1),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Delete Measurement'));
+    await tester.pumpAndSettle();
+    expect(find.text('Delete 12 ft × 8 ft measurement?'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    expect(find.text('Confirm'), findsOneWidget);
+
+    await tester.tap(find.text('Confirm'));
+    await tester.pump();
+    expect(mockProvider.deleteCount, 1);
+
+    await tester.tap(find.byTooltip('Delete Measurement'));
+    await tester.pump();
+    expect(mockProvider.deleteCount, 1);
+
+    mockProvider.deletionCompleter!.complete();
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('measurement deletion Cancel preserves the measurement',
+      (WidgetTester tester) async {
+    final item = Item(
+      name: 'Test Item',
+      price: 10.0,
+      localId: 1,
+      rectangles: [
+        Rectangle(
+          localId: 7,
+          itemId: 1,
+          length: 12,
+          width: 8,
+          imageData: 'data:image/png;base64,ZmFrZQ==',
+        ),
+      ],
+    );
+    final mockProvider = DeletionClientProvider(item);
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: mockProvider),
+          ChangeNotifierProvider<SettingsProvider>.value(
+              value: MockSettingsProvider()),
+        ],
+        child: const MaterialApp(
+          home: ItemDetailScreen(itemLocalId: 1),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Delete Measurement'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(mockProvider.deleteCount, 0);
+    expect(find.text('96.0 sqft'), findsOneWidget);
+    expect(find.text('Image attached'), findsOneWidget);
+    expect(find.byTooltip('Delete Measurement'), findsOneWidget);
   });
 }

@@ -40,6 +40,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
   bool _isLoading = true;
   bool _didAutofocusNewLength = false;
   bool _isProcessingImage = false;
+  bool _isDeletingMeasurement = false;
   double? _selectedPrice;
   bool _isCustomPrice = false;
   String? _pendingRectangleImageData;
@@ -193,8 +194,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
   Future<void> _submitNewRectangle() async {
     if (_item == null) return;
 
-    final lengthError =
-        _measurementError(_newLengthController.text, 'Length');
+    final lengthError = _measurementError(_newLengthController.text, 'Length');
     final widthError = _measurementError(_newWidthController.text, 'Width');
 
     if (lengthError != null || widthError != null) {
@@ -463,6 +463,44 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     return true;
   }
 
+  Future<void> _confirmAndDeleteMeasurement(Rectangle rect) async {
+    if (_isDeletingMeasurement || rect.localId == null) return;
+    _isDeletingMeasurement = true;
+
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Delete Measurement?'),
+          content: Text(
+            'Delete ${_formatMeasurement(rect.length)} ft × '
+            '${_formatMeasurement(rect.width)} ft measurement?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              style: TextButton.styleFrom(
+                foregroundColor: Theme.of(dialogContext).colorScheme.error,
+              ),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Confirm'),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmed != true || !mounted) return;
+
+      await context.read<ClientProvider>().deleteRectangle(rect.localId!);
+      if (mounted) await _loadItem();
+    } finally {
+      _isDeletingMeasurement = false;
+    }
+  }
+
   void _focusNextAfterRectangle(int index) {
     final rectangles = _item?.rectangles ?? [];
     if (index + 1 < rectangles.length) {
@@ -549,14 +587,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                 color: Colors.red,
                 onPressed: rect.localId == null
                     ? null
-                    : () async {
-                        await context
-                            .read<ClientProvider>()
-                            .deleteRectangle(rect.localId!);
-                        if (mounted) {
-                          await _loadItem();
-                        }
-                      },
+                    : () => _confirmAndDeleteMeasurement(rect),
               ),
             ],
           ),

@@ -141,5 +141,42 @@ void main() {
         'data:image/png;base64,ZmFrZQ==',
       );
     });
+
+    test('Rectangle deletion is idempotent for image-bearing measurements',
+        () async {
+      final clientId = await dbService.insertClient(Client(
+        remoteId: 'c2',
+        name: 'Jane Doe',
+        updatedAt: DateTime.now(),
+      ));
+      final itemId = await dbService.insertItem(Item(
+        remoteId: 'i2',
+        clientId: clientId,
+        name: 'Wall',
+        price: 10,
+        updatedAt: DateTime.now(),
+      ));
+      final rectangleId = await dbService.insertRectangle(Rectangle(
+        remoteId: 'r2',
+        itemId: itemId,
+        length: 12,
+        width: 8,
+        imageData: 'data:image/png;base64,ZmFrZQ==',
+        isDirty: false,
+        updatedAt: DateTime.now(),
+      ));
+
+      expect(await dbService.softDeleteRectangle(rectangleId), 1);
+      expect(await dbService.softDeleteRectangle(rectangleId), 0);
+
+      final deleted = await database.query(
+        'rectangles',
+        where: 'local_id = ?',
+        whereArgs: [rectangleId],
+      );
+      expect(deleted.single['deleted_at'], isNotNull);
+      expect(deleted.single['is_dirty'], 1);
+      expect(deleted.single['image_data'], 'data:image/png;base64,ZmFrZQ==');
+    });
   });
 }

@@ -308,7 +308,7 @@ class DbService {
     return await db.update(
       'rectangles',
       {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
+      where: 'local_id = ? AND deleted_at IS NULL',
       whereArgs: [localId],
     );
   }
