@@ -99,6 +99,84 @@ class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
 }
 
 void main() {
+  Future<void> pumpItemDetail(
+    WidgetTester tester,
+    MockClientProvider provider,
+    MockSettingsProvider settings,
+  ) async {
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<ClientProvider>.value(value: provider),
+          ChangeNotifierProvider<SettingsProvider>.value(value: settings),
+        ],
+        child: const MaterialApp(
+          home: ItemDetailScreen(itemLocalId: 1),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('invalid new measurements show field errors and retain input',
+      (WidgetTester tester) async {
+    final item = Item(name: 'Test Item', price: 10.0, localId: 1);
+    final provider = MockClientProvider(item);
+    await pumpItemDetail(tester, provider, MockSettingsProvider());
+
+    final length = find.widgetWithText(TextField, 'Length (ft)');
+    final width = find.widgetWithText(TextField, 'Width (ft)');
+
+    final invalidInputs = <String, String>{
+      '': 'Enter Length',
+      'abc': 'Enter a valid number',
+      '0': 'Length must be greater than 0',
+      '-2': 'Length must be greater than 0',
+      'Infinity': 'Length must be finite',
+      '10001': 'Length must be 10,000 ft or less',
+    };
+
+    for (final entry in invalidInputs.entries) {
+      final value = entry.key;
+      await tester.tap(length);
+      await tester.enterText(length, value);
+      await tester.tap(width);
+      await tester.enterText(width, '2');
+      await tester.testTextInput.receiveAction(TextInputAction.next);
+      await tester.pump();
+
+      expect(find.text(entry.value), findsOneWidget,
+          reason: '$value should be invalid');
+      expect(tester.widget<TextField>(length).controller!.text, value);
+      expect(tester.widget<TextField>(width).focusNode!.hasFocus, isTrue);
+      await tester.tap(length);
+      await tester.enterText(length, '10');
+    }
+
+    expect(provider._item.rectangles, isEmpty);
+  });
+
+  testWidgets('invalid inline measurements show field errors and retain focus',
+      (WidgetTester tester) async {
+    final rect = Rectangle(localId: 1, itemId: 1, length: 10, width: 20);
+    final item =
+        Item(name: 'Test Item', price: 10.0, localId: 1, rectangles: [rect]);
+    final provider = MockClientProvider(item);
+    await pumpItemDetail(tester, provider, MockSettingsProvider());
+
+    final length = find.widgetWithText(TextField, 'Length (ft)').first;
+    final width = find.widgetWithText(TextField, 'Width (ft)').first;
+    await tester.enterText(length, '10001');
+    await tester.tap(width);
+    await tester.testTextInput.receiveAction(TextInputAction.next);
+    await tester.pump();
+
+    expect(find.text('Length must be 10,000 ft or less'), findsOneWidget);
+    expect(tester.widget<TextField>(length).controller!.text, '10001');
+    expect(tester.widget<TextField>(width).focusNode!.hasFocus, isTrue);
+    expect(provider._item.rectangles.first.length, 10);
+  });
+
   testWidgets('ItemDetailScreen edit rectangle test',
       (WidgetTester tester) async {
     final rect = Rectangle(localId: 1, itemId: 1, length: 10, width: 20);
