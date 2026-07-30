@@ -220,55 +220,11 @@ void main() {
   });
 
   group('artifact URL boundary', () {
-    test('accepts an explicitly flavor-bound staging origin only for staging',
-        () {
+    test('production has no caller-controlled trusted-origin override', () {
       const stagingOrigin = 'https://staging.example.test';
       final staging = fixture('available_current')
         ..['artifactUrl'] = '$stagingOrigin/releases/damsure-10400.apk';
-      expect(
-        ReleaseManifestParser.parse(
-          staging,
-          trustedNowUtc: _trustedNow,
-          trustedReleaseOrigin: Uri.parse(stagingOrigin),
-        ),
-        isA<AvailableReleaseManifestResult>(),
-      );
       expect(parse(staging), isA<MalformedReleaseManifest>());
-    });
-
-    test(
-        'keeps staging available/disabled fixtures on the same high-water rules',
-        () {
-      const stagingOrigin = 'https://staging.example.test';
-      final staging = fixture('available_current')
-        ..['artifactUrl'] = '$stagingOrigin/releases/damsure-10400.apk';
-      final availableResult = ReleaseManifestParser.parse(
-        staging,
-        trustedNowUtc: _trustedNow,
-        trustedReleaseOrigin: Uri.parse(stagingOrigin),
-      ) as AvailableReleaseManifestResult;
-      final highWater = ReleaseManifestHighWaterMark.fromAcceptedPolicy(
-        availableResult,
-      );
-      final disabledResult =
-          parse(fixture('disabled_v1')) as DisabledReleaseManifestResult;
-      expect(
-        validateManifestHighWater(disabledResult, previous: highWater)
-            .isAccepted,
-        isTrue,
-      );
-      final changedSameRevision = fixture('available_current')
-        ..['artifactUrl'] = '$stagingOrigin/releases/damsure-10400.apk'
-        ..['releaseNotes'] = 'Different staging payload.';
-      final changedResult = ReleaseManifestParser.parse(
-        changedSameRevision,
-        trustedNowUtc: _trustedNow,
-        trustedReleaseOrigin: Uri.parse(stagingOrigin),
-      ) as AvailableReleaseManifestResult;
-      expect(
-        validateManifestHighWater(changedResult, previous: highWater).failure,
-        ReleaseManifestRollbackFailure.changedPayloadAtSameRevision,
-      );
     });
 
     test('rejects foreign-host, redirect-like, and code/path-mismatch URLs',

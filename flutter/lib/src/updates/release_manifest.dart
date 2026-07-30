@@ -169,7 +169,6 @@ class ReleaseManifestParser {
   static ReleaseManifestParseResult parse(
     Object? document, {
     required DateTime trustedNowUtc,
-    Uri? trustedReleaseOrigin,
   }) {
     if (document is! Map<Object?, Object?> ||
         document.keys.any((key) => key is! String)) {
@@ -183,7 +182,7 @@ class ReleaseManifestParser {
       return _parseAvailable(
         json,
         trustedNowUtc.toUtc(),
-        trustedReleaseOrigin ?? Uri.parse(_releaseOriginForFlavor()),
+        Uri.parse(_releaseOriginForFlavor()),
       );
     }
     if (_hasExactKeys(json, _disabledFields)) {

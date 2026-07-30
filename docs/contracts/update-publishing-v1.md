@@ -94,9 +94,10 @@ Before an available policy, verify the final APK locally:
 ```bash
 node tools/update-publishing/verify-apk.cjs \
   --artifact app-production-release.apk --package-id com.dryspotuppala \
+  --environment production \
   --version-code 2 --version-name 1.0.2 \
   --certificate-sha256 <pinned-certificate-sha256> \
-  --aapt /absolute/path/to/aapt --apksigner /absolute/path/to/apksigner \
+  --tool-manifest /absolute/protected/android-tool-manifest.json \
   --sha256 <lowercase-sha256> --size-bytes <bytes>
 ```
 
@@ -148,6 +149,30 @@ operator-supplied canonical `--receipt-at` value; dry-run is always
 
 Available publication performs required APK verification before upload and
 again after independent download: ZIP/APK shape, exact size/SHA-256, flavor
-package ID, version code/name, and pinned certificate. `--aapt` and
-`--apksigner` are required explicit absolute paths to regular executable
-non-symlink files; environment-variable tool substitution is refused.
+package ID, version code/name, and pinned certificate. A protected tool
+manifest binds explicit canonical executable paths, their SHA-256 digests, and
+the flavor certificate fingerprint; environment-variable tool substitution is
+refused.
+
+## Second independent-verification hardening
+
+Locks are never stolen merely because of age. Each acquired lock contains a
+random owner nonce; release rechecks both nonce and inode before removal, so an
+old owner cannot delete a replacement lock. `recover-lock` is an explicit
+operator action requiring a local recovery receipt and a non-live recorded PID;
+PID reuse remains fail-closed because liveness is not treated as proof of a
+crash.
+
+All journal phases are recoverable. If the exact manifest is present, recovery
+commits that identity only. If it is absent before activation, recovery burns
+the exact revision and available artifact/version identity, clears the pending
+record, and requires a newer revision. A pending receipt stores the complete
+sanitized deterministic receipt; `recover --receipt` recreates it idempotently.
+
+Each release root has an exclusive ownership marker binding canonical root,
+environment, ledger path, and origin. This prevents staging and production (or
+two ledgers) sharing an alias. Tool provenance is supplied by a protected
+schema-v1 tool manifest containing canonical non-symlink executable paths,
+SHA-256 digests, and distinct flavor certificate fingerprints. The publish
+path rejects hash mismatch, writable manifests, symlink parents, and equal
+production/staging fingerprints.

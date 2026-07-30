@@ -15,6 +15,9 @@ val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
 val stagingKeystoreProperties = Properties()
 val stagingKeystorePropertiesFile = rootProject.file("staging-key.properties")
+val releaseCertificateProperties = Properties()
+val releaseCertificatePropertiesFile = rootProject.file("release-certificates.properties")
+val productionCertificateSha256 = "09:9D:60:6D:05:CC:99:3C:D4:04:C0:2A:31:4D:7F:01:A0:F7:B8:02:43:DF:FA:79:F5:52:A7:B1:72:51:0A:EF"
 val requiredSigningProperties = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
 
 if (keystorePropertiesFile.exists()) {
@@ -22,6 +25,9 @@ if (keystorePropertiesFile.exists()) {
 }
 if (stagingKeystorePropertiesFile.exists()) {
     FileInputStream(stagingKeystorePropertiesFile).use { stagingKeystoreProperties.load(it) }
+}
+if (releaseCertificatePropertiesFile.exists()) {
+    FileInputStream(releaseCertificatePropertiesFile).use { releaseCertificateProperties.load(it) }
 }
 
 fun signingProblems(propertiesFile: java.io.File, properties: Properties, label: String): List<String> = buildList {
@@ -40,9 +46,9 @@ val productionSigningProblems = signingProblems(keystorePropertiesFile, keystore
 val stagingSigningProblems = signingProblems(stagingKeystorePropertiesFile, stagingKeystoreProperties, "staging")
 val hasCompleteProductionSigning = productionSigningProblems.isEmpty()
 val hasCompleteStagingSigning = stagingSigningProblems.isEmpty()
-val signingIdentitiesDistinct = !hasCompleteProductionSigning && !hasCompleteStagingSigning ||
-    keystoreProperties.getProperty("keyAlias") != stagingKeystoreProperties.getProperty("keyAlias") ||
-    keystoreProperties.getProperty("storeFile") != stagingKeystoreProperties.getProperty("storeFile")
+val stagingCertificateSha256 = releaseCertificateProperties.getProperty("stagingCertificateSha256")
+val certificatesAreDistinct = !stagingCertificateSha256.isNullOrBlank() &&
+    stagingCertificateSha256.replace(":", "").equals(productionCertificateSha256.replace(":", ""), ignoreCase = true).not()
 
 fun stagingOriginFromDartDefines(): String? {
     val encoded = project.findProperty("dart-defines")?.toString() ?: return null
@@ -154,8 +160,8 @@ tasks.configureEach {
                 name.contains("production", ignoreCase = true) -> productionSigningProblems
                 else -> productionSigningProblems + stagingSigningProblems
             }
-            check(problems.isEmpty() && signingIdentitiesDistinct) {
-                "Release signing is not configured or identities are not distinct: ${problems.joinToString("; ")}. " +
+            check(problems.isEmpty() && certificatesAreDistinct) {
+                "Release signing is not configured or certificate fingerprints are not distinct: ${problems.joinToString("; ")}. " +
                     "See docs/current/android-release-runbook.md."
             }
         }

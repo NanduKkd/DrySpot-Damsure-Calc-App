@@ -34,6 +34,14 @@ function normalizeOrigin(origin, environment) {
 
 async function assertNoSymlinkPath(candidate, { allowMissingFinal = false } = {}) {
   const requested = path.resolve(candidate);
+  const requestedParts = requested.split(path.sep).filter(Boolean);
+  let requestedCurrent = path.parse(requested).root;
+  for (const part of requestedParts) {
+    requestedCurrent = path.join(requestedCurrent, part);
+    const component = await fs.lstat(requestedCurrent).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (!component) break;
+    if (component.isSymbolicLink()) fail(`symlink path component is refused: ${requestedCurrent}`);
+  }
   const requestedStat = await fs.lstat(requested).catch((error) => {
     if (error.code === 'ENOENT' && allowMissingFinal) return false;
     throw error;
@@ -62,6 +70,18 @@ async function secureLedgerAndRoot(ledgerPath, root) {
   if (canonicalLedger === canonicalRoot || canonicalLedger.startsWith(`${canonicalRoot}${path.sep}`) || canonicalRoot.startsWith(`${canonicalLedger}${path.sep}`)) fail('ledger and release root must be separate paths');
   return { ledgerPath: canonicalLedger, root: canonicalRoot };
 }
+async function claimReleaseRoot({ root, ledgerPath, environment, origin }) {
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const markerPath = path.join(root, '.damsure-release-root-owner.json');
+  const owner = { schemaVersion: 1, environment, ledgerPath, origin, root };
+  try { await fs.writeFile(markerPath, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600, flag: 'wx' }); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const existing = JSON.parse(await fs.readFile(markerPath, 'utf8'));
+    if (JSON.stringify(existing) !== JSON.stringify(owner)) fail('release root is already owned by a different environment, ledger, or origin');
+  }
+  return markerPath;
+}
 
 function emptyLedger(environment, root, origin) {
   return { schemaVersion: 2, environment, releaseRoot: root, releaseOrigin: origin, lastManifestRevision: 0, maxLatestVersionCode: 1, strictV1Started: false, reservedVersionCodes: [1], artifacts: {}, manifests: {}, pendingPublication: null, receiptState: null };
@@ -84,25 +104,41 @@ async function atomicWriteJson(filePath, value, fsOps = fs) {
     await fsOps.rename(temporary, filePath);
   } finally { await fsOps.rm(temporary, { force: true }).catch(() => {}); }
 }
-async function withLedgerLock(ledgerPath, callback, { staleLockMs = 5 * 60 * 1000, breakStaleLock = false, waitLockMs = 5000 } = {}, deadline = Date.now() + waitLockMs) {
+async function releaseLedgerLock(lock, owner, inode) {
+  const [stat, body] = await Promise.all([fs.stat(lock).catch(() => null), fs.readFile(path.join(lock, 'owner.json'), 'utf8').catch(() => null)]);
+  if (!stat || stat.ino !== inode || !body) return false;
+  let current; try { current = JSON.parse(body); } catch { return false; }
+  if (current.nonce !== owner.nonce) return false;
+  await fs.rm(lock, { recursive: true, force: true });
+  return true;
+}
+async function recoverLedgerLock(ledgerPath, recoveryReceiptPath) {
+  if (!recoveryReceiptPath) fail('lock recovery requires an explicit operator recovery receipt');
+  await assertNoSymlinkPath(recoveryReceiptPath);
+  const receipt = await fs.lstat(recoveryReceiptPath);
+  if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size === 0) fail('lock recovery receipt is invalid');
+  const lock = `${ledgerPath}.lock`;
+  const ownerText = await fs.readFile(path.join(lock, 'owner.json'), 'utf8').catch(() => fail('lock recovery cannot read owner record'));
+  let owner; try { owner = JSON.parse(ownerText); } catch { fail('lock recovery owner record is invalid'); }
+  if (!Number.isInteger(owner.pid) || typeof owner.nonce !== 'string' || typeof owner.acquiredAt !== 'string') fail('lock recovery owner record is incomplete');
+  try { process.kill(owner.pid, 0); fail('lock recovery refused: recorded PID is currently live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  const quarantined = `${lock}.recovered.${owner.nonce}.${Date.now()}`;
+  await fs.rename(lock, quarantined);
+  return quarantined;
+}
+async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000 } = {}, deadline = Date.now() + waitLockMs) {
   const lock = `${ledgerPath}.lock`;
   try { await fs.mkdir(lock, { mode: 0o700 }); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
-    const stat = await fs.stat(lock).catch(() => null);
-    if (!stat) return withLedgerLock(ledgerPath, callback, { staleLockMs, breakStaleLock, waitLockMs }, deadline);
-    if (Date.now() - stat.mtimeMs <= staleLockMs) {
-      if (Date.now() >= deadline) fail(`ledger lock is held: ${lock}`);
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      return withLedgerLock(ledgerPath, callback, { staleLockMs, breakStaleLock, waitLockMs }, deadline);
-    }
-    if (!breakStaleLock) fail(`stale ledger lock requires explicit break: ${lock}`);
-    await fs.rename(lock, `${lock}.stale.${Date.now()}.${crypto.randomUUID()}`);
-    return withLedgerLock(ledgerPath, callback, { staleLockMs, breakStaleLock: false, waitLockMs }, deadline);
+    if (Date.now() >= deadline) fail(`ledger lock is held; use explicit recover-lock after owner-liveness review: ${lock}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return withLedgerLock(ledgerPath, callback, { waitLockMs }, deadline);
   }
   const owner = { pid: process.pid, acquiredAt: new Date().toISOString(), nonce: crypto.randomUUID() };
+  const inode = (await fs.stat(lock)).ino;
   try { await fs.writeFile(path.join(lock, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' }); return await callback(owner); }
-  finally { await fs.rm(lock, { recursive: true, force: true }); }
+  finally { await releaseLedgerLock(lock, owner, inode); }
 }
 
 function reserveVersionCode(ledger, code) {
@@ -114,6 +150,7 @@ function reserveVersionCode(ledger, code) {
 async function reserveVersionCodeAtPath({ ledgerPath, environment, root, origin, code, dryRun = false, lockOptions }) {
   const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment);
   return withLedgerLock(secure.ledgerPath, async () => {
+    if (!dryRun) await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
     const ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin);
     const next = reserveVersionCode(ledger, code);
     if (!dryRun) await atomicWriteJson(secure.ledgerPath, next);
@@ -163,12 +200,31 @@ async function basicArtifactMetadata(filePath, { requireApkZip = false } = {}) {
 function normalizedCertificate(value) { return value.replace(/[^A-Fa-f0-9]/g, '').toUpperCase(); }
 async function validateTrustedExecutable(candidate, label) {
   if (!candidate || !path.isAbsolute(candidate)) fail(`${label} must be an explicit absolute trusted tool path`);
-  const stat = await fs.lstat(candidate); if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o111) === 0) fail(`${label} must be a non-symlink regular executable`);
-  return candidate;
+  const canonical = await assertNoSymlinkPath(candidate);
+  const stat = await fs.lstat(canonical); if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o111) === 0) fail(`${label} must be a non-symlink regular executable`);
+  return canonical;
 }
-async function verifyApkArtifact({ artifactPath, expectedSha256, expectedSizeBytes, expectedPackageId, expectedVersionCode, expectedVersionName, expectedCertificateSha256, trustedTools }) {
+async function validateToolManifest(toolManifestPath, environment) {
+  const canonicalManifest = await assertNoSymlinkPath(toolManifestPath);
+  const stat = await fs.lstat(canonicalManifest);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0) fail('tool manifest must be a protected non-symlink regular file');
+  const manifest = JSON.parse(await fs.readFile(canonicalManifest, 'utf8'));
+  if (manifest.schemaVersion !== 1 || !manifest.tools || !manifest.certificates) fail('tool manifest schema is invalid');
+  const certificate = manifest.certificates[environment]; const other = manifest.certificates[environment === 'production' ? 'staging' : 'production'];
+  if (typeof certificate !== 'string' || typeof other !== 'string' || normalizedCertificate(certificate) === normalizedCertificate(other)) fail('tool manifest must bind distinct production and staging certificate fingerprints');
+  const tools = {};
+  for (const label of ['aapt', 'apksigner']) {
+    const entry = manifest.tools[label]; if (!entry || typeof entry.path !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)) fail(`tool manifest ${label} entry is invalid`);
+    const executable = await validateTrustedExecutable(entry.path, label);
+    if (await sha256File(executable) !== entry.sha256) fail(`tool manifest ${label} hash mismatch`);
+    tools[label] = executable;
+  }
+  return { tools, certificateSha256: normalizedCertificate(certificate), path: canonicalManifest };
+}
+async function verifyApkArtifact({ artifactPath, expectedSha256, expectedSizeBytes, expectedPackageId, expectedVersionCode, expectedVersionName, expectedCertificateSha256, toolManifestPath, environment }) {
   if (!expectedSha256 || !expectedSizeBytes || !expectedPackageId || !expectedVersionCode || !expectedVersionName || !expectedCertificateSha256) fail('APK verification requires size, SHA-256, package, version code/name, and pinned certificate expectations');
-  const aapt = await validateTrustedExecutable(trustedTools?.aapt, 'aapt'); const apksigner = await validateTrustedExecutable(trustedTools?.apksigner, 'apksigner');
+  const provenance = await validateToolManifest(toolManifestPath, environment); const aapt = provenance.tools.aapt; const apksigner = provenance.tools.apksigner;
+  if (normalizedCertificate(expectedCertificateSha256) !== provenance.certificateSha256) fail('APK certificate expectation is not bound to the flavor tool manifest');
   const basic = await basicArtifactMetadata(artifactPath, { requireApkZip: true });
   if (basic.sha256 !== expectedSha256) fail('artifact SHA-256 does not match expected value'); if (basic.sizeBytes !== expectedSizeBytes) fail('artifact size does not match expected value');
   const { stdout: badging } = await execFileAsync(aapt, ['dump', 'badging', artifactPath], { maxBuffer: 1024 * 1024 });
@@ -191,25 +247,27 @@ class LocalReleaseTarget {
 }
 function gateProduction(options) { if (options.environment === 'production') for (const field of ['approval', 'signingBackupReceipt', 'pilotReceipt', 'dependencyReceipt']) if (!options[field]) fail(`production publication is hard-disabled without ${field}`); }
 function receiptFor({ ledger, manifest, status, phase, trustedReceiptAt, dryRun, failure }) { return { schemaVersion: 2, environment: ledger.environment, action: manifest.updatesEnabled ? 'publish-available' : 'publish-disabled', manifestRevision: manifest.manifestRevision, manifestCanonicalIdentity: canonicalManifestIdentity(manifest), artifactName: manifest.updatesEnabled ? `damsure-${manifest.latestVersionCode}.apk` : null, artifactSha256: manifest.updatesEnabled ? manifest.sha256 : null, trustedReceiptAt, dryRun, activation: dryRun ? 'not-attempted' : status, phase, failure: failure ? String(failure.message || failure).replace(/[\r\n]/g, ' ') : null }; }
-async function publishToLocalFixture({ target, ledgerPath, environment, root, origin, manifest, artifactPath, trustedTools, certificateSha256, receiptPath, trustedReceiptAt, dryRun = false, lockOptions, hooks = {}, ...gates }) {
+async function publishToLocalFixture({ target, ledgerPath, environment, root, origin, manifest, artifactPath, toolManifestPath, receiptPath, trustedReceiptAt, dryRun = false, lockOptions, hooks = {}, ...gates }) {
   gateProduction({ environment, ...gates }); const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment); const receiptTime = canonicalUtc(trustedReceiptAt || manifest.publishedAt);
   if (dryRun) { const ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); buildManifest({ environment, ledger, type: manifest.updatesEnabled ? 'available' : 'disabled', revision: manifest.manifestRevision, publishedAt: manifest.publishedAt, origin: normalizedOrigin, version: manifest.latestVersion, versionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason, reason: manifest.reason }); return { wrote: false, receipt: receiptFor({ ledger, manifest, status: 'not-attempted', phase: 'dry-run', trustedReceiptAt: receiptTime, dryRun: true }) }; }
   return withLedgerLock(secure.ledgerPath, async () => {
+    await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
     let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const identity = canonicalManifestIdentity(manifest);
     if (ledger.pendingPublication) fail(`pending publication revision ${ledger.pendingPublication.manifestRevision} requires recover before retry`);
     buildManifest({ environment, ledger, type: manifest.updatesEnabled ? 'available' : 'disabled', revision: manifest.manifestRevision, publishedAt: manifest.publishedAt, origin: normalizedOrigin, version: manifest.latestVersion, versionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason, reason: manifest.reason });
-    ledger = { ...ledger, pendingPublication: { manifestRevision: manifest.manifestRevision, canonicalIdentity: identity, phase: 'prepared', trustedReceiptAt: receiptTime } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterPrepared?.();
+    ledger = { ...ledger, pendingPublication: { manifestRevision: manifest.manifestRevision, canonicalIdentity: identity, manifest, phase: 'prepared', trustedReceiptAt: receiptTime } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterPrepared?.();
     try {
       if (manifest.updatesEnabled) {
         if (!artifactPath) fail('available publication requires an artifact path');
-        const expected = { expectedSha256: manifest.sha256, expectedSizeBytes: manifest.sizeBytes, expectedPackageId: PACKAGE_IDS[environment], expectedVersionCode: manifest.latestVersionCode, expectedVersionName: manifest.latestVersion, expectedCertificateSha256: certificateSha256, trustedTools };
-        await verifyApkArtifact({ artifactPath, ...expected }); await target.uploadArtifactNoClobber(artifactPath, `damsure-${manifest.latestVersionCode}.apk`);
+        const provenance = await validateToolManifest(toolManifestPath, environment);
+        const expected = { expectedSha256: manifest.sha256, expectedSizeBytes: manifest.sizeBytes, expectedPackageId: PACKAGE_IDS[environment], expectedVersionCode: manifest.latestVersionCode, expectedVersionName: manifest.latestVersion, expectedCertificateSha256: provenance.certificateSha256, toolManifestPath, environment };
+        await verifyApkArtifact({ artifactPath, ...expected }); await hooks.afterLocalVerification?.(); await target.uploadArtifactNoClobber(artifactPath, `damsure-${manifest.latestVersionCode}.apk`);
         ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'artifact-uploaded' } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterArtifactUploaded?.();
-        const downloaded = path.join(path.dirname(artifactPath), `.verify-${crypto.randomUUID()}.apk`); try { await target.downloadArtifact(`damsure-${manifest.latestVersionCode}.apk`, downloaded); await verifyApkArtifact({ artifactPath: downloaded, ...expected }); } finally { await fs.rm(downloaded, { force: true }); }
+        const downloaded = path.join(path.dirname(artifactPath), `.verify-${crypto.randomUUID()}.apk`); try { await target.downloadArtifact(`damsure-${manifest.latestVersionCode}.apk`, downloaded); await verifyApkArtifact({ artifactPath: downloaded, ...expected }); await hooks.afterDownloadVerification?.(); } finally { await fs.rm(downloaded, { force: true }); }
       }
-      await target.replaceManifestAtomically(manifest); await hooks.afterManifestReplaced?.();
+      await hooks.beforeManifestReplace?.(); await target.replaceManifestAtomically(manifest); await hooks.afterManifestReplaced?.();
       ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'manifest-replaced' } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterJournaledActivation?.();
-      ledger = applyPublishedManifest(ledger, manifest); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: manifest.manifestRevision, trustedReceiptAt: receiptTime } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterCommitted?.();
+      ledger = applyPublishedManifest(ledger, manifest); const pendingReceipt = receiptFor({ ledger, manifest, status: 'active', phase: 'committed', trustedReceiptAt: receiptTime, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: manifest.manifestRevision, receipt: pendingReceipt } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterCommitted?.();
       const receipt = receiptFor({ ledger, manifest, status: 'active', phase: 'committed', trustedReceiptAt: receiptTime, dryRun: false });
       if (receiptPath) { try { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); } catch (error) { return { wrote: true, receipt: receiptFor({ ledger, manifest, status: 'active', phase: 'receipt-pending-recovery', trustedReceiptAt: receiptTime, dryRun: false, failure: error }), receiptPending: true }; } }
       return { wrote: true, receipt, nextLedger: ledger };
@@ -219,14 +277,18 @@ async function publishToLocalFixture({ target, ledgerPath, environment, root, or
 async function recoverPublication({ target, ledgerPath, environment, root, origin, receiptPath, lockOptions }) {
   const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment);
   return withLedgerLock(secure.ledgerPath, async () => {
-    let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const pending = ledger.pendingPublication; if (!pending) fail('no pending publication recovery exists');
-    let remote; try { remote = await target.readManifest(); } catch { fail('cannot reconcile pending publication: manifest is unavailable'); }
-    if (canonicalManifestIdentity(remote) !== pending.canonicalIdentity) fail('cannot reconcile pending publication: remote manifest identity differs');
-    ledger = applyPublishedManifest(ledger, remote); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: remote.manifestRevision, trustedReceiptAt: pending.trustedReceiptAt } }; await atomicWriteJson(secure.ledgerPath, ledger);
-    const receipt = receiptFor({ ledger, manifest: remote, status: 'active', phase: 'recovered', trustedReceiptAt: pending.trustedReceiptAt, dryRun: false });
-    if (receiptPath) { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); }
-    return { recovered: true, receipt, nextLedger: ledger };
+    let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const pending = ledger.pendingPublication;
+    if (!pending) {
+      if (ledger.receiptState?.status !== 'pending' || !ledger.receiptState.receipt || !receiptPath) fail('no pending publication or recoverable receipt exists');
+      await atomicWriteJson(receiptPath, ledger.receiptState.receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
+    }
+    const remote = await target.readManifest().catch(() => null);
+    if (remote && canonicalManifestIdentity(remote) !== pending.canonicalIdentity) fail('cannot reconcile pending publication: remote manifest identity differs');
+    if (remote) {
+      ledger = applyPublishedManifest(ledger, remote); const receipt = receiptFor({ ledger, manifest: remote, status: 'active', phase: 'recovered', trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: remote.manifestRevision, receipt } }; await atomicWriteJson(secure.ledgerPath, ledger); if (receiptPath) { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); } return { recovered: true, receipt, nextLedger: ledger };
+    }
+    const burned = pending.manifest; ledger = applyPublishedManifest(ledger, burned); ledger = { ...ledger, manifests: { ...ledger.manifests, [String(burned.manifestRevision)]: { canonicalIdentity: pending.canonicalIdentity, burned: true } }, receiptState: { status: 'burned', manifestRevision: burned.manifestRevision, receipt: receiptFor({ ledger, manifest: burned, status: 'not-active', phase: `burned-${pending.phase}`, trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }) } }; await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, burned: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
   }, lockOptions);
 }
 
-module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };
+module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, recoverLedgerLock, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, validateToolManifest, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };
