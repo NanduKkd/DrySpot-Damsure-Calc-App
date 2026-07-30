@@ -16,7 +16,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-110 | 8 | P0 | T3 | In progress | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
 | APP-111 | 8 | P0 | T3 | Contract frozen | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
 | APP-112 | 8 | P1 | T2 | Contract frozen; queued | Sync status and recovery UX | PD-011; APP-106; APP-111 |
-| APP-113 | 9 | P0 | T3 | Pending | Optional and required Android updater | APP-104; APP-107 test endpoint |
+| APP-113 | 9 | P0 | T3 | Contract frozen; externally gated | Optional and required Android updater | APP-104; APP-107 staging; APP-112; signing backup; pilot |
 
 ## Task contracts
 
@@ -199,6 +199,7 @@ Frozen contract summary:
 | APP-108 | Portfolio manager | `019fb3bd-1ebf-7130-8fc2-1458f6351c36` | Read-only T3 contract frozen; implementation serialized behind APP-110 |
 | APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
 | APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
+| APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
 
 Integrated evidence at `7319450`:
 
@@ -268,3 +269,13 @@ Acceptance:
 - Offline required-update behavior follows the approved emergency policy.
 
 Gates: parser/security tests, update-state widget tests, staging download verification, upgrade-over-installed-app proof, and independent T3 verification.
+
+Frozen contract summary:
+
+- Cached update policy is loaded and enforced before authentication restore or any normal app flow. A validated required policy remains blocking across restart and offline use.
+- Trusted HTTPS transport, strict parsing, anti-rollback validation, and atomic policy persistence occur before download. Downloaded/verified artifact state is separate from accepted policy state.
+- Production manifest and APK requests use the exact release origin/path, reject redirects, and never carry API credentials. Trusted response time comes from the authenticated HTTPS response, not the device clock.
+- Optional updates may be dismissed for 24 trusted hours; reconnect and checks do not trigger background download. A newer target or required policy overrides dismissal.
+- APKs stream to app-private cache with bounded size/free-space checks. Reuse and installer handoff require size, SHA-256, package ID, version name/code, and pinned signing-certificate revalidation.
+- Android uses a non-exported, narrowly scoped `FileProvider` and the system package installer. Silent installation, shared storage, broad storage permission, background/range downloads, and user-configurable endpoints are excluded.
+- APP-107 staging, signing-key backup recovery, a production-signed physical-device upgrade pilot, and exact-commit/exact-APK independent T3 verification remain mandatory external gates.
