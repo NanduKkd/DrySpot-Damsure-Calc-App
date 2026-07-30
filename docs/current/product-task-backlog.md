@@ -5,16 +5,16 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | ID | Weight | Priority | Risk | Status | Task | Dependencies |
 | :--- | ---: | :--- | :--- | :--- | :--- | :--- |
 | APP-101 | 2 | P1 | T1 | Integrated locally | Visible measurement validation | None |
-| APP-102 | 2 | P1 | T1 | Draft | Measurement deletion safety | Interaction decision |
+| APP-102 | 2 | P1 | T1 | In progress | Measurement deletion safety | PD-007 |
 | APP-103 | 3 | P1 | T2 | Integrated; device proof required | Android permission minimization | None |
 | APP-104 | 3 | P0 | T2 | Contract frozen | Update manifest and enforcement contract | PD-003; PD-005 |
-| APP-105 | 4 | P1 | T1 | In progress | PDF Unicode font support | None |
+| APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
 | APP-106 | 4 | P0 | T2 | Draft | Shared-device session hardening | Shared-device policy |
 | APP-107 | 5 | P0 | T2 | Blocked | Update publishing and hosting workflow | APP-104; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Draft | User provisioning and lifecycle MVP | Administration-surface decision |
-| APP-109 | 7 | P1 | T2 | In progress | Durable managed-file cleanup reconciliation | None |
-| APP-110 | 8 | P0 | T3 | Contract frozen; blocked | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
-| APP-111 | 8 | P0 | T3 | Contract design in progress | Last-write-wins synchronization | PD-002; clock policy |
+| APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
+| APP-110 | 8 | P0 | T3 | In progress | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
+| APP-111 | 8 | P0 | T3 | Contract frozen | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
 | APP-112 | 8 | P1 | T2 | Pending | Sync status and recovery UX | APP-111 |
 | APP-113 | 9 | P0 | T3 | Pending | Optional and required Android updater | APP-104; APP-107 test endpoint |
 
@@ -36,7 +36,7 @@ Gates: focused widget tests and `flutter analyze`.
 
 Objective: prevent accidental measurement deletion.
 
-Blocker: choose confirmation, Undo, or both.
+Decision: PD-007 selects a named confirmation with Cancel and one destructive Confirm action. Undo is excluded.
 
 Acceptance:
 
@@ -171,10 +171,19 @@ Frozen contract summary:
 | APP-101 | Portfolio manager | `019fb3a7-ec62-7302-af36-fefc0667e8bc` | Integrated as `b7ac581`; focused tests and analyze pass |
 | APP-103 | Portfolio manager | `019fb3a7-ec63-7dd2-b9d8-5c653622d49f` | Integrated as `b29b631`; automated gates pass, device proof pending |
 | APP-104 | Portfolio manager | `019fb3a7-ec62-7302-af36-ff12211ab995` | Read-only contract frozen against `54b5c5b` |
-| APP-105 | Portfolio manager | `019fb3ac-5e7b-73b3-80f9-a8d3b42e2c77` | Isolated Flutter/PDF worktree |
-| APP-109 | Portfolio manager | `019fb3b0-1b41-7971-8506-629401f2cf41` | Isolated backend worktree |
-| APP-110 | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen; waits for APP-109 |
-| APP-111 | Portfolio manager | `019fb3b0-1b41-7971-8506-627611c50f1e` | Read-only T3 contract design |
+| APP-105 | Portfolio manager | `019fb3ac-5e7b-73b3-80f9-a8d3b42e2c77` | Integrated as `e6144d0`; Unicode render evidence and gates pass |
+| APP-109 | Portfolio manager | `019fb3b0-1b41-7971-8506-629401f2cf41` | Integrated as `bb6ee08` + `7319450`; verifier `019fb3b5-eeae-7660-b05e-4ebd8e12f2a1` passed |
+| APP-110 design | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen |
+| APP-110 implementation | Portfolio manager | `019fb3c0-7c30-72e3-aab7-945028c25c35` | Isolated T3 backend/Flutter worktree |
+| APP-111 | Portfolio manager | `019fb3b0-1b41-7971-8506-627611c50f1e` | Read-only T3 contract frozen |
+| APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Isolated Flutter worktree |
+
+Integrated evidence at `7319450`:
+
+- Backend `npm run verify`: lint exits with warnings only; 15 suites / 65 tests pass; TypeScript build passes.
+- Flutter `flutter test && flutter analyze`: 102 tests pass; analysis reports no issues.
+- APP-109 disposable SQLite migration: forward creates the cleanup table and due index; undo retains the table/data surface and removes only the due index; reapply succeeds; a second forward run is a no-op.
+- PostgreSQL migration rehearsal and the APP-103 physical-device permission scenario remain release evidence, not local completion blockers.
 
 ### APP-111 — Last-write-wins synchronization
 
@@ -190,6 +199,16 @@ Acceptance:
 - Server-managed and tenant-owned fields remain outside conflict resolution.
 
 Gates: cross-device integration matrix, clock-skew/future-time negatives, delete/update races, idempotency, and independent T3 verification.
+
+Frozen contract summary:
+
+- Server-authoritative logical versions replace device timestamps for ordering.
+- The comparison tuple is causal generation, bounded local branch sequence, operation rank, installation writer ID, and change ID; delete wins an otherwise equal comparison.
+- Server timestamps are authoritative, device timestamps are diagnostics only, and a future clock cannot dominate a later edit.
+- Each submitted change receives an explicit applied, already-applied, superseded, rejected, permanently-deleted, or unauthorized outcome.
+- Flutter clears dirty state only by compare-and-set against the submitted change. Pull applies data and advances a tenant-scoped monotonic cursor in one local transaction.
+- Existing v1 dirty data is drained before a cursor-zero v2 bootstrap. Old clients are rejected before mutation only after the compatibility window closes.
+- APP-110 permanent warranty tombstones override this general protocol and must land first.
 
 ### APP-112 — Sync status and recovery UX
 

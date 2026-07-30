@@ -35,6 +35,15 @@ The next delivery program is documented in three durable records:
 - [Product task backlog](product-task-backlog.md) defines effort-weighted task contracts, acceptance criteria, dependencies, and proof gates.
 - [Product roadmap](product-roadmap.md) schedules the work into four parallel lanes with no more than two concurrent write-heavy implementation tasks.
 
+### Active delivery integration (2026-07-30)
+
+The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-103 Android permission minimization, APP-105 Unicode PDF fonts, and APP-109 durable managed-file cleanup. APP-110 and APP-102 are active in isolated worktrees; APP-104 and APP-111 contracts are frozen.
+
+- Integrated backend gate: lint exits successfully with warnings; 15 suites / 65 tests pass; build passes.
+- Integrated Flutter gate: 102 tests pass; `flutter analyze` reports no issues.
+- APP-109 forward/undo/reapply/idempotent migration behavior passes against a disposable SQLite database. PostgreSQL-copy proof remains required before deployment.
+- APP-103 still requires the planned physical-device photo-picker/camera/location permission scenario.
+
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
 ## Files Changed

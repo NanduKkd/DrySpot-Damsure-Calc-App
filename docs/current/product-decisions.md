@@ -25,6 +25,22 @@ Last reconciled: 30 July 2026
 - Database deletion is complete once the transaction commits. Physical PDF cleanup is handled by the durable reconciliation mechanism from APP-109; the user does not wait for unlink completion.
 - Legacy soft-deleted warranty rows may be hard-deleted only after an idempotent tombstone backfill succeeds.
 
+### PD-007 — Measurement deletion requires confirmation
+
+- Deleting a measurement opens a confirmation that identifies it by its dimensions.
+- The user can cancel or deliberately confirm the destructive action. Undo is excluded from APP-102.
+- Local, synced, and image-bearing measurements receive the same protection.
+- Repeated taps or submissions cannot delete more than the one confirmed measurement.
+
+### PD-008 — Sync conflicts use logical versions, not device clocks
+
+- “Newest” means logically or causally newest. Device wall-clock time is diagnostic only and never decides a winner.
+- Each mutable client, item, rectangle, and default-price record carries a server-observed generation plus a bounded local branch sequence, operation rank, installation writer ID, and change ID.
+- The greatest valid logical version wins deterministically. At the same generation and branch sequence, delete beats update; an update based on a strictly newer generation may restore those four soft-deleted entity types.
+- The server returns one outcome per submitted change. Flutter clears pending state only by compare-and-set against the acknowledged change ID; an aggregate HTTP success never clears unrelated or newer local work.
+- Pull synchronization uses a tenant-scoped monotonic cursor, not `updated_at`.
+- Warranty deletion is the permanent exception: an APP-110 tombstone defeats every later mutation, and a historically used warranty UUID cannot be reused by another tenant.
+
 ### PD-001 — Warranty deletion is permanent and user-confirmed
 
 - Replacing or deleting a warranty must require an explicit confirmation that names the warranty and explains that the warranty record and stored PDF cannot be recovered.
@@ -70,5 +86,3 @@ Roadmap assumption: retain one active login at a time. A separate task will hard
 
 1. User administration surface: operator CLI, web admin UI, or both.
 2. Shared-device policy: retain hidden tenant data, encrypt it, or offer a local wipe on logout.
-3. Measurement deletion interaction: confirmation dialog, Undo, or both.
-4. Last-write-wins clock policy: accepted clock skew and tie-breaking rule.
