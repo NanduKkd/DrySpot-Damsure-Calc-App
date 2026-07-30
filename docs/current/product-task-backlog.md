@@ -9,12 +9,12 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-103 | 3 | P1 | T2 | Integrated; device proof required | Android permission minimization | None |
 | APP-104 | 3 | P0 | T2 | Integrated and verified locally | Update manifest and enforcement contract | PD-003; PD-005 |
 | APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
-| APP-106 | 4 | P0 | T2 | Contract frozen; queued | Shared-device session hardening | PD-010; APP-111 |
+| APP-106 | 4 | P0 | T2 | Implementation active | Shared-device session hardening | PD-010; APP-111 |
 | APP-107 | 5 | P0 | T2 | Integrated and independently verified locally; external rollout gated | Update publishing and hosting workflow | APP-104; staging host; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Integrated and independently verified locally; operator rollout gated | User provisioning and lifecycle MVP | PD-009; APP-110 integration |
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
 | APP-110 | 8 | P0 | T3 | Integrated and independently verified locally | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
-| APP-111 | 8 | P0 | T3 | Contract frozen | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
+| APP-111 | 8 | P0 | T3 | Integrated and independently verified locally; external rehearsal required | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
 | APP-112 | 8 | P1 | T2 | Contract frozen; queued | Sync status and recovery UX | PD-011; APP-106; APP-111 |
 | APP-113 | 9 | P0 | T3 | Contract frozen; externally gated | Optional and required Android updater | APP-104; APP-107 staging; APP-112; signing backup; pilot |
 
@@ -203,10 +203,10 @@ Frozen contract summary:
 | APP-109 | Portfolio manager | `019fb3b0-1b41-7971-8506-629401f2cf41` | Integrated as `bb6ee08` + `7319450`; verifier `019fb3b5-eeae-7660-b05e-4ebd8e12f2a1` passed |
 | APP-110 design | Portfolio manager | `019fb3a7-ec62-7302-af36-fed3cac99170` | Read-only T3 contract frozen |
 | APP-110 implementation | Portfolio manager | `019fb3c0-7c30-72e3-aab7-945028c25c35` | Integrated as `53d29f2` + `d12006b` + `1797dee` + `5255d7b`; verifier `019fb3db-2529-78f1-95d4-3b0f844d3f97` passed the exact final tip |
-| APP-111 | Portfolio manager | `019fb3b0-1b41-7971-8506-627611c50f1e` | Read-only T3 contract frozen |
+| APP-111 | Portfolio manager | Design `019fb3b0-1b41-7971-8506-627611c50f1e`; implementation `019fb435-ca57-7283-8d6d-126cd44965fc`; verifier `019fb459-820a-7d22-adbe-b19787e8e2fb` | Integrated as `ccdf14c` + `e236f26` + `b18af26` + `b782335` + `78ceaeb`; exact candidate `29d0d010` passed independent T3 verification |
 | APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Integrated as `7575cc7`; 8 focused tests and analyze pass |
 | APP-108 | Portfolio manager | Design `019fb3bd-1ebf-7130-8fc2-1458f6351c36`; implementation `019fb437-b9e2-7223-8176-e588dfbe3fd7`; verifier `019fb497-c2fb-70b2-a45b-7a9bc7abb934` | Integrated as `e46c08d` + `e176c21` + `174a58a` + `2305f39` + `0510eec`; exact candidate `82089dbe` passed independent T3 verification; operator installation and production proof remain external |
-| APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
+| APP-106 | Portfolio manager | Design `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75`; implementation `019fb52b-1c4f-7172-a185-64c970d20ae7` | T2 implementation active from the verified APP-111 integration |
 | APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
 | APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
 | APP-107 | Portfolio manager | Design `019fb3ee-3c42-79d2-b3d4-1b6a718ec025`; implementation `019fb3f2-1ad3-7062-9093-e35a4404421a`; verifier `019fb3ff-648b-7480-8816-9798720b993f` | Integrated as `7c224ff` + `18e5ee4` + `fe767ca` + `427e207` + `f836f9f` + `7588b5f` + `0202f20` + `7878b9b`; exact candidate `f523ec3` passed independent local verification; staging, signing, pilot, approval, and production activation remain external |
@@ -236,6 +236,13 @@ Current integrated checkpoint after APP-108:
 - Backend `npm run verify`: lint exits with warnings and no errors; 21 suites / 97 tests pass; TypeScript build passes.
 - APP-108's exact final candidate `82089dbe` passed independent T3 review, including tenant-bound current and legacy cursors, cross-tenant rejection, exact decimal sequences above `2^53`, no skips or duplicates, additive PostgreSQL migration rollback/no-op/undo/reapply, pruned compiled CLI proof, and direct-invocation denial.
 - Named Unix/SSH operators, personal keys, tenant allow-lists, root wrapper/sudoers installation, backup and normalization-collision preflight, and staging/production operator runs remain deployment evidence.
+
+Current integrated checkpoint after APP-111:
+
+- Backend `npm run verify`: lint exits with warnings and no errors; 24 suites / 119 tests pass; TypeScript build passes.
+- Production-flavor Flutter tests pass 167 cases; the staging-only release parser passes under the staging flavor and validated origin; `flutter analyze` reports no issues.
+- APP-111's exact candidate `29d0d010` passed independent T3 review with no findings at any severity. The reviewed matrix includes every four-entity LWW ordering case, strict tenant/parent bounds, cursors above `2^53`, rollback gaps and mixed-protocol concurrency, exact change replay, structured-426 and ambiguous-commit recovery, partial-photo failure/CAS, cross-language PostgreSQL storage canonicalization, migration abort/reapply, and APP-109/APP-110 regressions.
+- A physical two-device offline/concurrent reconnect scenario and production-restored-database upgrade/cutoff rehearsal remain deployment evidence, not local integration blockers.
 
 ### APP-111 — Last-write-wins synchronization
 
