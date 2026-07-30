@@ -8,11 +8,10 @@ final _trustedNow = DateTime.utc(2026, 7, 30, 10);
 
 void main() {
   Map<String, Object?> fixture(String name) => Map<String, Object?>.from(
-    jsonDecode(
+        jsonDecode(
           File('test/fixtures/release_manifest/$name.json').readAsStringSync(),
-        )
-        as Map,
-  );
+        ) as Map,
+      );
 
   ReleaseManifestParseResult parse(Map<String, Object?> payload) =>
       ReleaseManifestParser.parse(payload, trustedNowUtc: _trustedNow);
@@ -57,6 +56,11 @@ void main() {
         );
         expect(newer.state, ReleaseUpdateState.current);
         expect(newer.manifest!.artifactUrl.path, '/releases/damsure-10400.apk');
+        expect(
+          classifyReleaseUpdate(result, installedVersionCode: 10299)
+              .requiredUpdateReason,
+          'Please update to continue using Damsure.',
+        );
       },
     );
 
@@ -78,6 +82,17 @@ void main() {
         final legacyWithExtra = fixture('disabled_legacy')
           ..['artifactUrl'] = 'bad';
         expect(parse(legacyWithExtra), isA<MalformedReleaseManifest>());
+
+        final arbitraryLegacyMessage = fixture('disabled_legacy')
+          ..['message'] = 'A different unavailable message.';
+        expect(parse(arbitraryLegacyMessage), isA<MalformedReleaseManifest>());
+
+        final disabledWithRequiredUpdateReason = fixture('disabled_v1')
+          ..['requiredUpdateReason'] = 'Not allowed for disabled manifests.';
+        expect(
+          parse(disabledWithRequiredUpdateReason),
+          isA<MalformedReleaseManifest>(),
+        );
       },
     );
 
@@ -91,6 +106,7 @@ void main() {
       expect(classified.manifest, isNull);
       expect(classified.artifactUrl, isNull);
       expect(classified.releaseNotes, isNull);
+      expect(classified.requiredUpdateReason, isNull);
     });
 
     test(
@@ -131,10 +147,70 @@ void main() {
         }
       },
     );
+
+    test(
+      'requires Dart ints for every numeric field, including schemaVersion',
+      () {
+        const numericFields = [
+          'schemaVersion',
+          'manifestRevision',
+          'latestVersionCode',
+          'minimumSupportedVersionCode',
+          'sizeBytes',
+        ];
+        const wrongTypes = <Object?>[1.0, '1', true, null];
+
+        for (final field in numericFields) {
+          for (final wrongType in wrongTypes) {
+            final payload = fixture('available_current')..[field] = wrongType;
+            expect(
+              parse(payload),
+              isA<MalformedReleaseManifest>(),
+              reason: '$field accepted ${wrongType.runtimeType}',
+            );
+          }
+        }
+      },
+    );
+
+    test('rejects oversized numeric fields', () {
+      const numericFields = [
+        'schemaVersion',
+        'manifestRevision',
+        'latestVersionCode',
+        'minimumSupportedVersionCode',
+        'sizeBytes',
+      ];
+
+      for (final field in numericFields) {
+        final payload = fixture('available_current')..[field] = 2147483648;
+        expect(
+          parse(payload),
+          isA<MalformedReleaseManifest>(),
+          reason: '$field accepted a value above signed int32',
+        );
+      }
+    });
+
+    test('requires a bounded, trimmed required-update reason', () {
+      final missing = fixture('available_current')
+        ..remove('requiredUpdateReason');
+      final blank = fixture('available_current')
+        ..['requiredUpdateReason'] = ' ';
+      final oversized = fixture('available_current')
+        ..['requiredUpdateReason'] = List.filled(501, 'x').join();
+      final extra = fixture('available_current')
+        ..['unexpectedRequiredReason'] = 'not in schema';
+
+      for (final payload in [missing, blank, oversized, extra]) {
+        expect(parse(payload), isA<MalformedReleaseManifest>());
+      }
+    });
   });
 
   group('artifact URL boundary', () {
-    test('rejects foreign-host, redirect-like, and code/path-mismatch URLs', () {
+    test('rejects foreign-host, redirect-like, and code/path-mismatch URLs',
+        () {
       final foreignHost = fixture('available_current')
         ..['artifactUrl'] = 'https://example.com/releases/damsure-10400.apk';
       final redirectLike = fixture('available_current')
@@ -188,10 +264,10 @@ void main() {
       },
     );
 
-    test('rejects changed payload at the same revision', () {
+    test('includes required-update reason in the same-revision identity', () {
       final baseline = available(fixture('available_current'));
       final changedPayload = fixture('available_current')
-        ..['releaseNotes'] = 'Different bytes at the same revision.';
+        ..['requiredUpdateReason'] = 'A different required-update reason.';
 
       final result = validateManifestHighWater(
         available(changedPayload),

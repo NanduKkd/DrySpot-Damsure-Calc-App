@@ -9,5 +9,6 @@
   "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "sizeBytes": 12345678,
   "publishedAt": "2026-07-30T10:00:00Z",
-  "releaseNotes": "Improved calculation reliability."
+  "releaseNotes": "Improved calculation reliability.",
+  "requiredUpdateReason": "Please update to continue using Damsure."
 }

@@ -5,6 +5,7 @@ const String releaseManifestEndpoint =
 
 const String _releaseHost = 'damsure.nandakrishnan.in';
 const int _schemaVersion = 1;
+const int _maxSignedInt32 = 2147483647;
 const int _maxReasonLength = 500;
 const int _maxReleaseNotesLength = 4000;
 
@@ -30,6 +31,7 @@ class AvailableReleaseManifest {
     required this.sizeBytes,
     required this.publishedAt,
     required this.releaseNotes,
+    required this.requiredUpdateReason,
   });
 
   final int manifestRevision;
@@ -41,6 +43,7 @@ class AvailableReleaseManifest {
   final int sizeBytes;
   final DateTime publishedAt;
   final String releaseNotes;
+  final String requiredUpdateReason;
 
   /// A deterministic identity for APP-113 high-water persistence.
   ///
@@ -59,6 +62,7 @@ class AvailableReleaseManifest {
         sizeBytes,
         _formatCanonicalUtc(publishedAt),
         releaseNotes,
+        requiredUpdateReason,
       ].join('|');
 }
 
@@ -137,16 +141,20 @@ class ReleaseManifestParser {
     Map<String, Object?> json,
     DateTime trustedNowUtc,
   ) {
-    if (json['schemaVersion'] != _schemaVersion ||
+    if (!_isExactInt(json['schemaVersion'], _schemaVersion) ||
         json['updatesEnabled'] != true ||
-        !_isPositiveInt(json['manifestRevision']) ||
+        !_isPositiveSignedInt32(json['manifestRevision']) ||
         !_isFinalVersion(json['latestVersion']) ||
-        !_isPositiveInt(json['latestVersionCode']) ||
-        !_isPositiveInt(json['minimumSupportedVersionCode']) ||
-        !_isPositiveInt(json['sizeBytes']) ||
+        !_isPositiveSignedInt32(json['latestVersionCode']) ||
+        !_isPositiveSignedInt32(json['minimumSupportedVersionCode']) ||
+        !_isPositiveSignedInt32(json['sizeBytes']) ||
         !_isBoundedTrimmedString(
           json['releaseNotes'],
           _maxReleaseNotesLength,
+        ) ||
+        !_isBoundedTrimmedString(
+          json['requiredUpdateReason'],
+          _maxReasonLength,
         ) ||
         !_isSha256(json['sha256'])) {
       return const MalformedReleaseManifest(
@@ -188,6 +196,7 @@ class ReleaseManifestParser {
         sizeBytes: json['sizeBytes'] as int,
         publishedAt: publishedAt,
         releaseNotes: json['releaseNotes'] as String,
+        requiredUpdateReason: json['requiredUpdateReason'] as String,
       ),
     );
   }
@@ -196,9 +205,9 @@ class ReleaseManifestParser {
     Map<String, Object?> json,
     DateTime trustedNowUtc,
   ) {
-    if (json['schemaVersion'] != _schemaVersion ||
+    if (!_isExactInt(json['schemaVersion'], _schemaVersion) ||
         json['updatesEnabled'] != false ||
-        !_isPositiveInt(json['manifestRevision']) ||
+        !_isPositiveSignedInt32(json['manifestRevision']) ||
         !_isBoundedTrimmedString(json['reason'], _maxReasonLength)) {
       return const MalformedReleaseManifest(
         ReleaseManifestParseFailure.invalidDisabledManifest,
@@ -225,7 +234,7 @@ class ReleaseManifestParser {
   ) {
     if (json['status'] != 'unavailable' ||
         json['updatesEnabled'] != false ||
-        !_isBoundedTrimmedString(json['message'], _maxReasonLength) ||
+        json['message'] != 'No Android release has been published.' ||
         json['publishedAt'] != null) {
       return const MalformedReleaseManifest(
         ReleaseManifestParseFailure.invalidDisabledManifest,
@@ -254,6 +263,7 @@ const Set<String> _availableFields = {
   'sizeBytes',
   'publishedAt',
   'releaseNotes',
+  'requiredUpdateReason',
 };
 
 const Set<String> _disabledFields = {
@@ -274,7 +284,11 @@ const Set<String> _legacyDisabledFields = {
 bool _hasExactKeys(Map<String, Object?> json, Set<String> expected) =>
     json.length == expected.length && json.keys.toSet().containsAll(expected);
 
-bool _isPositiveInt(Object? value) => value is int && value > 0;
+bool _isExactInt(Object? value, int expected) =>
+    value is int && value == expected;
+
+bool _isPositiveSignedInt32(Object? value) =>
+    value is int && value > 0 && value <= _maxSignedInt32;
 
 bool _isBoundedTrimmedString(Object? value, int maxLength) =>
     value is String &&
@@ -344,6 +358,7 @@ class ReleaseUpdateClassification {
 
   Uri? get artifactUrl => manifest?.artifactUrl;
   String? get releaseNotes => manifest?.releaseNotes;
+  String? get requiredUpdateReason => manifest?.requiredUpdateReason;
 }
 
 ReleaseUpdateClassification classifyReleaseUpdate(
