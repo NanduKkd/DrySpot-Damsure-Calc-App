@@ -64,10 +64,15 @@ proves upload behavior without an SSH connection.
 node tools/update-publishing/publish.cjs reserve \
   --environment staging --ledger /secure/staging-ledger.json --version-code 2
 
+# Use a real, canonical temporary directory. Do not substitute /tmp on macOS,
+# where it is commonly a symlink and is deliberately refused by this tool.
+fixture_root="$(mktemp -d "${TMPDIR:-/var/tmp}/damsure-release.XXXXXX")"
+fixture_root="$(cd "$fixture_root" && pwd -P)"
+
 # This inspects a candidate and changes neither ledger nor fixture root.
 node tools/update-publishing/publish.cjs publish \
   --environment staging --ledger /secure/staging-ledger.json \
-  --fixture-root /tmp/staging-release-fixture --dry-run \
+  --fixture-root "$fixture_root" --dry-run \
   --type available --revision 1 --published-at 2026-07-30T12:00:00Z \
   --origin https://staging.example.invalid --version 1.0.2 --version-code 2 \
   --minimum-supported-version-code 1 --sha256 <lowercase-sha256> \
@@ -139,7 +144,7 @@ under a unique stale name. This serializes separate processes and prevents
 same-code or same-revision split-brain.
 
 Before a non-dry-run publish, a durable pending-publication journal stores the
-exact canonical identity. The journal progresses through prepared,
+complete strict APP-104 serialization and its SHA-256. The journal progresses through prepared,
 artifact-uploaded, manifest-replaced, and committed states. Normal retry never
 reuses a pending revision. `recover` commits only when the fixture manifest has
 the identical canonical identity. Receipt failure records pending evidence in
@@ -152,13 +157,16 @@ again after independent download: ZIP/APK shape, exact size/SHA-256, flavor
 package ID, version code/name, and pinned certificate. A protected tool
 manifest binds explicit canonical executable paths, their SHA-256 digests, and
 the flavor certificate fingerprint; environment-variable tool substitution is
-refused.
+refused. The source is copied to a private local frozen file and re-verified
+before upload, so a source replacement after initial verification fails closed.
 
 ## Second independent-verification hardening
 
 Locks are never stolen merely because of age. Each acquired lock contains a
-random owner nonce; release rechecks both nonce and inode before removal, so an
-old owner cannot delete a replacement lock. `recover-lock` is an explicit
+random owner nonce; release and recovery atomically rename the active lock to
+a unique claim, then recheck both nonce and inode. Claims are retained as local
+audit evidence rather than recursively deleted, so an old owner cannot delete
+or quarantine a replacement lock. `recover-lock` is an explicit
 operator action requiring a local recovery receipt and a non-live recorded PID;
 PID reuse remains fail-closed because liveness is not treated as proof of a
 crash.
@@ -173,6 +181,7 @@ Each release root has an exclusive ownership marker binding canonical root,
 environment, ledger path, and origin. This prevents staging and production (or
 two ledgers) sharing an alias. Tool provenance is supplied by a protected
 schema-v1 tool manifest containing canonical non-symlink executable paths,
-SHA-256 digests, and distinct flavor certificate fingerprints. The publish
+SHA-256 digests, and distinct exactly-64-hex-character flavor certificate
+fingerprints. The publish
 path rejects hash mismatch, writable manifests, symlink parents, and equal
 production/staging fingerprints.

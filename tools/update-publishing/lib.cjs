@@ -89,7 +89,7 @@ function emptyLedger(environment, root, origin) {
 function validateLedger(ledger, environment, root, origin) {
   if (!ledger || ledger.schemaVersion !== 2 || ledger.environment !== environment || ledger.releaseRoot !== root || ledger.releaseOrigin !== origin || !Number.isInteger(ledger.lastManifestRevision) || ledger.lastManifestRevision < 0 || !isPositiveInt(ledger.maxLatestVersionCode) || !Array.isArray(ledger.reservedVersionCodes) || !ledger.reservedVersionCodes.includes(1) || typeof ledger.artifacts !== 'object' || typeof ledger.manifests !== 'object') fail(`invalid or environment-confused ${environment} publication ledger`);
   for (const code of ledger.reservedVersionCodes) requirePositiveInt(code, 'reserved version code');
-  if (ledger.pendingPublication && (!isPositiveInt(ledger.pendingPublication.manifestRevision) || typeof ledger.pendingPublication.canonicalIdentity !== 'string')) fail('invalid pending publication journal');
+  if (ledger.pendingPublication && (!isPositiveInt(ledger.pendingPublication.manifestRevision) || typeof ledger.pendingPublication.canonicalIdentity !== 'string' || typeof ledger.pendingPublication.manifestBytes !== 'string' || !/^[a-f0-9]{64}$/.test(ledger.pendingPublication.manifestSha256 || ''))) fail('invalid pending publication journal');
   return ledger;
 }
 async function readLedger(ledgerPath, environment, root, origin) {
@@ -104,29 +104,59 @@ async function atomicWriteJson(filePath, value, fsOps = fs) {
     await fsOps.rename(temporary, filePath);
   } finally { await fsOps.rm(temporary, { force: true }).catch(() => {}); }
 }
-async function releaseLedgerLock(lock, owner, inode) {
-  const [stat, body] = await Promise.all([fs.stat(lock).catch(() => null), fs.readFile(path.join(lock, 'owner.json'), 'utf8').catch(() => null)]);
-  if (!stat || stat.ino !== inode || !body) return false;
-  let current; try { current = JSON.parse(body); } catch { return false; }
-  if (current.nonce !== owner.nonce) return false;
-  await fs.rm(lock, { recursive: true, force: true });
+async function lockRecord(lockPath) {
+  const stat = await fs.lstat(lockPath).catch(() => null);
+  const body = await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8').catch(() => null);
+  if (!stat || !stat.isDirectory() || !body) return null;
+  try { return { stat, owner: JSON.parse(body) }; } catch { return null; }
+}
+async function restoreClaim(claim, lock) {
+  // A claim is never removed.  If another writer already recreated the active
+  // pathname, leaving this uniquely named evidence is safer than touching it.
+  await fs.rename(claim, lock).catch(() => {});
+}
+async function claimExistingLock(lock, purpose, expected) {
+  const claim = `${lock}.${purpose}.${crypto.randomUUID()}`;
+  try { await fs.rename(lock, claim); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  const actual = await lockRecord(claim);
+  if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) {
+    await restoreClaim(claim, lock);
+    return null;
+  }
+  return claim;
+}
+async function assertLockOwnership(lock, owner, inode) {
+  const current = await lockRecord(lock);
+  if (!current || current.stat.ino !== inode || current.owner.nonce !== owner.nonce) fail('ledger lock ownership changed; refusing critical transition');
+}
+async function releaseLedgerLock(lock, owner, inode, hooks = {}) {
+  await hooks.beforeReleaseClaim?.();
+  const claim = await claimExistingLock(lock, 'released', { inode, nonce: owner.nonce });
+  if (!claim) return false;
+  // Do not recursively delete a lock directory. Keeping a uniquely named,
+  // verified audit record makes a same-user pathname substitution harmless.
+  await hooks.afterReleaseClaim?.(claim);
   return true;
 }
-async function recoverLedgerLock(ledgerPath, recoveryReceiptPath) {
+async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} } = {}) {
   if (!recoveryReceiptPath) fail('lock recovery requires an explicit operator recovery receipt');
   await assertNoSymlinkPath(recoveryReceiptPath);
   const receipt = await fs.lstat(recoveryReceiptPath);
   if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size === 0) fail('lock recovery receipt is invalid');
   const lock = `${ledgerPath}.lock`;
-  const ownerText = await fs.readFile(path.join(lock, 'owner.json'), 'utf8').catch(() => fail('lock recovery cannot read owner record'));
-  let owner; try { owner = JSON.parse(ownerText); } catch { fail('lock recovery owner record is invalid'); }
+  const recorded = await lockRecord(lock); if (!recorded) fail('lock recovery cannot read owner record');
+  const owner = recorded.owner;
   if (!Number.isInteger(owner.pid) || typeof owner.nonce !== 'string' || typeof owner.acquiredAt !== 'string') fail('lock recovery owner record is incomplete');
-  try { process.kill(owner.pid, 0); fail('lock recovery refused: recorded PID is currently live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  const quarantined = `${lock}.recovered.${owner.nonce}.${Date.now()}`;
-  await fs.rename(lock, quarantined);
-  return quarantined;
+  await hooks.beforeRecoveryClaim?.();
+  const claimed = await claimExistingLock(lock, 'recovery-claim', { inode: recorded.stat.ino, nonce: owner.nonce });
+  if (!claimed) fail('lock changed during recovery; refusing to touch successor');
+  // PID liveness is checked after the atomic claim. A live (including reused)
+  // PID is restored unchanged and recovery fails closed.
+  try { process.kill(owner.pid, 0); await restoreClaim(claimed, lock); fail('lock recovery refused: recorded PID is currently live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  await hooks.afterRecoveryClaim?.(claimed);
+  return claimed;
 }
-async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000 } = {}, deadline = Date.now() + waitLockMs) {
+async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000, lockHooks = {} } = {}, deadline = Date.now() + waitLockMs) {
   const lock = `${ledgerPath}.lock`;
   try { await fs.mkdir(lock, { mode: 0o700 }); }
   catch (error) {
@@ -137,8 +167,8 @@ async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000 } = {}, 
   }
   const owner = { pid: process.pid, acquiredAt: new Date().toISOString(), nonce: crypto.randomUUID() };
   const inode = (await fs.stat(lock)).ino;
-  try { await fs.writeFile(path.join(lock, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' }); return await callback(owner); }
-  finally { await releaseLedgerLock(lock, owner, inode); }
+  try { await fs.writeFile(path.join(lock, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' }); const assertOwnership = () => assertLockOwnership(lock, owner, inode); await assertOwnership(); return await callback({ owner, assertOwnership }); }
+  finally { await releaseLedgerLock(lock, owner, inode, lockHooks); }
 }
 
 function reserveVersionCode(ledger, code) {
@@ -149,19 +179,29 @@ function reserveVersionCode(ledger, code) {
 }
 async function reserveVersionCodeAtPath({ ledgerPath, environment, root, origin, code, dryRun = false, lockOptions }) {
   const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment);
-  return withLedgerLock(secure.ledgerPath, async () => {
+  return withLedgerLock(secure.ledgerPath, async ({ assertOwnership }) => {
+    await assertOwnership();
     if (!dryRun) await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
     const ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin);
     const next = reserveVersionCode(ledger, code);
-    if (!dryRun) await atomicWriteJson(secure.ledgerPath, next);
+    if (!dryRun) { await assertOwnership(); await atomicWriteJson(secure.ledgerPath, next); }
     return next;
   }, lockOptions);
 }
 
-function canonicalManifestIdentity(manifest) {
-  const ordered = manifest.updatesEnabled ? { schemaVersion: manifest.schemaVersion, updatesEnabled: true, manifestRevision: manifest.manifestRevision, latestVersion: manifest.latestVersion, latestVersionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, artifactUrl: manifest.artifactUrl, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, publishedAt: manifest.publishedAt, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason } : { schemaVersion: manifest.schemaVersion, updatesEnabled: false, manifestRevision: manifest.manifestRevision, publishedAt: manifest.publishedAt, reason: manifest.reason };
-  return JSON.stringify(ordered);
+function strictManifestBytes(manifest) {
+  if (!manifest || Object.getPrototypeOf(manifest) !== Object.prototype || manifest.schemaVersion !== 1 || typeof manifest.updatesEnabled !== 'boolean') fail('manifest must be a strict APP-104 v1 object');
+  const availableKeys = ['schemaVersion', 'updatesEnabled', 'manifestRevision', 'latestVersion', 'latestVersionCode', 'minimumSupportedVersionCode', 'artifactUrl', 'sha256', 'sizeBytes', 'publishedAt', 'releaseNotes', 'requiredUpdateReason'];
+  const disabledKeys = ['schemaVersion', 'updatesEnabled', 'manifestRevision', 'publishedAt', 'reason'];
+  const keys = manifest.updatesEnabled ? availableKeys : disabledKeys;
+  if (Object.keys(manifest).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(manifest, key))) fail('manifest contains unknown or missing APP-104 fields');
+  requirePositiveInt(manifest.manifestRevision, 'manifest revision'); canonicalUtc(manifest.publishedAt);
+  if (!manifest.updatesEnabled) { if (typeof manifest.reason !== 'string' || !manifest.reason) fail('invalid disabled manifest'); return `${JSON.stringify({ schemaVersion: 1, updatesEnabled: false, manifestRevision: manifest.manifestRevision, publishedAt: manifest.publishedAt, reason: manifest.reason }, null, 2)}\n`; }
+  if (typeof manifest.latestVersion !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(manifest.latestVersion) || !isPositiveInt(manifest.latestVersionCode) || !isPositiveInt(manifest.minimumSupportedVersionCode) || manifest.minimumSupportedVersionCode > manifest.latestVersionCode || typeof manifest.artifactUrl !== 'string' || !/^[a-f0-9]{64}$/.test(manifest.sha256) || !isPositiveInt(manifest.sizeBytes) || typeof manifest.releaseNotes !== 'string' || typeof manifest.requiredUpdateReason !== 'string') fail('invalid available APP-104 manifest');
+  return `${JSON.stringify({ schemaVersion: 1, updatesEnabled: true, manifestRevision: manifest.manifestRevision, latestVersion: manifest.latestVersion, latestVersionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, artifactUrl: manifest.artifactUrl, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, publishedAt: manifest.publishedAt, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason }, null, 2)}\n`;
 }
+function canonicalManifestIdentity(manifest) { return strictManifestBytes(manifest); }
+function manifestSha256(manifest) { return crypto.createHash('sha256').update(strictManifestBytes(manifest)).digest('hex'); }
 function buildManifest({ environment, ledger, type, revision, publishedAt, origin, version, versionCode, minimumSupportedVersionCode, sha256, sizeBytes, releaseNotes, requiredUpdateReason, reason }) {
   validateLedger(ledger, environment, ledger.releaseRoot, normalizeOrigin(origin, environment));
   if (!['available', 'disabled'].includes(type)) fail('manifest type must be available or disabled');
@@ -193,11 +233,12 @@ function applyPublishedManifest(ledger, manifest) {
 
 async function sha256File(filePath) { return crypto.createHash('sha256').update(await fs.readFile(filePath)).digest('hex'); }
 async function basicArtifactMetadata(filePath, { requireApkZip = false } = {}) {
-  const stat = await fs.lstat(filePath); if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) fail('artifact must be a non-empty regular non-symlink file');
-  if (requireApkZip) { const handle = await fs.open(filePath, 'r'); try { const header = Buffer.alloc(4); await handle.read(header, 0, 4, 0); if (!header.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) fail('artifact is not an APK ZIP file'); } finally { await handle.close(); } }
-  return { sizeBytes: stat.size, sha256: await sha256File(filePath) };
+  const canonical = await assertNoSymlinkPath(filePath);
+  const stat = await fs.lstat(canonical); if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) fail('artifact must be a non-empty regular non-symlink file');
+  if (requireApkZip) { const handle = await fs.open(canonical, 'r'); try { const header = Buffer.alloc(4); await handle.read(header, 0, 4, 0); if (!header.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) fail('artifact is not an APK ZIP file'); } finally { await handle.close(); } }
+  return { sizeBytes: stat.size, sha256: await sha256File(canonical), canonicalPath: canonical };
 }
-function normalizedCertificate(value) { return value.replace(/[^A-Fa-f0-9]/g, '').toUpperCase(); }
+function normalizedCertificate(value) { if (typeof value !== 'string' || !/^[A-Fa-f0-9:]+$/.test(value)) fail('certificate fingerprint must be hexadecimal SHA-256'); const normalized = value.replace(/:/g, '').toUpperCase(); if (!/^[A-F0-9]{64}$/.test(normalized)) fail('certificate fingerprint must be exactly 64 hexadecimal characters'); return normalized; }
 async function validateTrustedExecutable(candidate, label) {
   if (!candidate || !path.isAbsolute(candidate)) fail(`${label} must be an explicit absolute trusted tool path`);
   const canonical = await assertNoSymlinkPath(candidate);
@@ -211,7 +252,7 @@ async function validateToolManifest(toolManifestPath, environment) {
   const manifest = JSON.parse(await fs.readFile(canonicalManifest, 'utf8'));
   if (manifest.schemaVersion !== 1 || !manifest.tools || !manifest.certificates) fail('tool manifest schema is invalid');
   const certificate = manifest.certificates[environment]; const other = manifest.certificates[environment === 'production' ? 'staging' : 'production'];
-  if (typeof certificate !== 'string' || typeof other !== 'string' || normalizedCertificate(certificate) === normalizedCertificate(other)) fail('tool manifest must bind distinct production and staging certificate fingerprints');
+  if (normalizedCertificate(certificate) === normalizedCertificate(other)) fail('tool manifest must bind distinct production and staging certificate fingerprints');
   const tools = {};
   for (const label of ['aapt', 'apksigner']) {
     const entry = manifest.tools[label]; if (!entry || typeof entry.path !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)) fail(`tool manifest ${label} entry is invalid`);
@@ -240,9 +281,10 @@ async function verifyApkArtifact({ artifactPath, expectedSha256, expectedSizeByt
 class LocalReleaseTarget {
   constructor(root, fsOps = fs) { this.root = path.resolve(root); this.fs = fsOps; }
   artifactPath(name) { return path.join(this.root, name); } manifestPath() { return path.join(this.root, 'manifest.json'); }
-  async uploadArtifactNoClobber(sourcePath, name) { if (!/^damsure-[1-9]\d*\.apk$/.test(name)) fail('artifact name must be immutable damsure-<versionCode>.apk'); await this.fs.mkdir(this.root, { recursive: true, mode: 0o700 }); try { await this.fs.copyFile(sourcePath, this.artifactPath(name), fsConstants.COPYFILE_EXCL); } catch (error) { if (error.code === 'EEXIST') fail(`refusing to overwrite immutable artifact ${name}`); throw error; } }
-  async downloadArtifact(name, destination) { await this.fs.copyFile(this.artifactPath(name), destination, fsConstants.COPYFILE_EXCL); return destination; }
+  async uploadArtifactNoClobber(sourcePath, name) { if (!/^damsure-[1-9]\d*\.apk$/.test(name)) fail('artifact name must be immutable damsure-<versionCode>.apk'); await assertNoSymlinkPath(sourcePath); await this.fs.mkdir(this.root, { recursive: true, mode: 0o700 }); try { await this.fs.copyFile(sourcePath, this.artifactPath(name), fsConstants.COPYFILE_EXCL); } catch (error) { if (error.code === 'EEXIST') fail(`refusing to overwrite immutable artifact ${name}`); throw error; } }
+  async downloadArtifact(name, destination) { await assertNoSymlinkPath(this.artifactPath(name)); await assertNoSymlinkPath(destination, { allowMissingFinal: true }); await this.fs.copyFile(this.artifactPath(name), destination, fsConstants.COPYFILE_EXCL); return destination; }
   async replaceManifestAtomically(manifest) { await atomicWriteJson(this.manifestPath(), manifest, this.fs); }
+  async readManifestBytes() { await assertNoSymlinkPath(this.manifestPath()); return this.fs.readFile(this.manifestPath(), 'utf8'); }
   async readManifest() { return JSON.parse(await this.fs.readFile(this.manifestPath(), 'utf8')); }
 }
 function gateProduction(options) { if (options.environment === 'production') for (const field of ['approval', 'signingBackupReceipt', 'pilotReceipt', 'dependencyReceipt']) if (!options[field]) fail(`production publication is hard-disabled without ${field}`); }
@@ -250,45 +292,58 @@ function receiptFor({ ledger, manifest, status, phase, trustedReceiptAt, dryRun,
 async function publishToLocalFixture({ target, ledgerPath, environment, root, origin, manifest, artifactPath, toolManifestPath, receiptPath, trustedReceiptAt, dryRun = false, lockOptions, hooks = {}, ...gates }) {
   gateProduction({ environment, ...gates }); const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment); const receiptTime = canonicalUtc(trustedReceiptAt || manifest.publishedAt);
   if (dryRun) { const ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); buildManifest({ environment, ledger, type: manifest.updatesEnabled ? 'available' : 'disabled', revision: manifest.manifestRevision, publishedAt: manifest.publishedAt, origin: normalizedOrigin, version: manifest.latestVersion, versionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason, reason: manifest.reason }); return { wrote: false, receipt: receiptFor({ ledger, manifest, status: 'not-attempted', phase: 'dry-run', trustedReceiptAt: receiptTime, dryRun: true }) }; }
-  return withLedgerLock(secure.ledgerPath, async () => {
+  return withLedgerLock(secure.ledgerPath, async ({ assertOwnership }) => {
+    await assertOwnership();
     await claimReleaseRoot({ root: secure.root, ledgerPath: secure.ledgerPath, environment, origin: normalizedOrigin });
-    let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const identity = canonicalManifestIdentity(manifest);
+    let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const identity = canonicalManifestIdentity(manifest); const exactManifestSha256 = manifestSha256(manifest);
     if (ledger.pendingPublication) fail(`pending publication revision ${ledger.pendingPublication.manifestRevision} requires recover before retry`);
     buildManifest({ environment, ledger, type: manifest.updatesEnabled ? 'available' : 'disabled', revision: manifest.manifestRevision, publishedAt: manifest.publishedAt, origin: normalizedOrigin, version: manifest.latestVersion, versionCode: manifest.latestVersionCode, minimumSupportedVersionCode: manifest.minimumSupportedVersionCode, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, releaseNotes: manifest.releaseNotes, requiredUpdateReason: manifest.requiredUpdateReason, reason: manifest.reason });
-    ledger = { ...ledger, pendingPublication: { manifestRevision: manifest.manifestRevision, canonicalIdentity: identity, manifest, phase: 'prepared', trustedReceiptAt: receiptTime } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterPrepared?.();
+    ledger = { ...ledger, pendingPublication: { manifestRevision: manifest.manifestRevision, canonicalIdentity: identity, manifestBytes: identity, manifestSha256: exactManifestSha256, manifest, phase: 'prepared', trustedReceiptAt: receiptTime } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterPrepared?.();
     try {
       if (manifest.updatesEnabled) {
         if (!artifactPath) fail('available publication requires an artifact path');
         const provenance = await validateToolManifest(toolManifestPath, environment);
         const expected = { expectedSha256: manifest.sha256, expectedSizeBytes: manifest.sizeBytes, expectedPackageId: PACKAGE_IDS[environment], expectedVersionCode: manifest.latestVersionCode, expectedVersionName: manifest.latestVersion, expectedCertificateSha256: provenance.certificateSha256, toolManifestPath, environment };
-        await verifyApkArtifact({ artifactPath, ...expected }); await hooks.afterLocalVerification?.(); await target.uploadArtifactNoClobber(artifactPath, `damsure-${manifest.latestVersionCode}.apk`);
-        ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'artifact-uploaded' } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterArtifactUploaded?.();
+        await verifyApkArtifact({ artifactPath, ...expected }); await hooks.afterLocalVerification?.();
+        // Freeze a verified copy before upload. The source path is never used
+        // after this point, so a replacement between verification and upload
+        // cannot alter the bytes that reach the target.
+        const frozen = path.join(path.dirname(artifactPath), `.publish-${crypto.randomUUID()}.apk`);
+        try {
+          await assertNoSymlinkPath(artifactPath); await fs.copyFile(artifactPath, frozen, fsConstants.COPYFILE_EXCL);
+          await verifyApkArtifact({ artifactPath: frozen, ...expected }); await hooks.beforeUpload?.();
+          await target.uploadArtifactNoClobber(frozen, `damsure-${manifest.latestVersionCode}.apk`);
+        } finally { await fs.rm(frozen, { force: true }); }
+        ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'artifact-uploaded' } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterArtifactUploaded?.();
         const downloaded = path.join(path.dirname(artifactPath), `.verify-${crypto.randomUUID()}.apk`); try { await target.downloadArtifact(`damsure-${manifest.latestVersionCode}.apk`, downloaded); await verifyApkArtifact({ artifactPath: downloaded, ...expected }); await hooks.afterDownloadVerification?.(); } finally { await fs.rm(downloaded, { force: true }); }
       }
       await hooks.beforeManifestReplace?.(); await target.replaceManifestAtomically(manifest); await hooks.afterManifestReplaced?.();
-      ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'manifest-replaced' } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterJournaledActivation?.();
-      ledger = applyPublishedManifest(ledger, manifest); const pendingReceipt = receiptFor({ ledger, manifest, status: 'active', phase: 'committed', trustedReceiptAt: receiptTime, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: manifest.manifestRevision, receipt: pendingReceipt } }; await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterCommitted?.();
+      ledger = { ...ledger, pendingPublication: { ...ledger.pendingPublication, phase: 'manifest-replaced' } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterJournaledActivation?.();
+      ledger = applyPublishedManifest(ledger, manifest); const pendingReceipt = receiptFor({ ledger, manifest, status: 'active', phase: 'committed', trustedReceiptAt: receiptTime, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: manifest.manifestRevision, receipt: pendingReceipt } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); await hooks.afterCommitted?.();
       const receipt = receiptFor({ ledger, manifest, status: 'active', phase: 'committed', trustedReceiptAt: receiptTime, dryRun: false });
-      if (receiptPath) { try { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); } catch (error) { return { wrote: true, receipt: receiptFor({ ledger, manifest, status: 'active', phase: 'receipt-pending-recovery', trustedReceiptAt: receiptTime, dryRun: false, failure: error }), receiptPending: true }; } }
+      if (receiptPath) { try { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); } catch (error) { return { wrote: true, receipt: receiptFor({ ledger, manifest, status: 'active', phase: 'receipt-pending-recovery', trustedReceiptAt: receiptTime, dryRun: false, failure: error }), receiptPending: true }; } }
       return { wrote: true, receipt, nextLedger: ledger };
     } catch (error) { throw error; }
   }, lockOptions);
 }
 async function recoverPublication({ target, ledgerPath, environment, root, origin, receiptPath, lockOptions }) {
   const secure = await secureLedgerAndRoot(ledgerPath, root); const normalizedOrigin = normalizeOrigin(origin, environment);
-  return withLedgerLock(secure.ledgerPath, async () => {
+  return withLedgerLock(secure.ledgerPath, async ({ assertOwnership }) => {
+    await assertOwnership();
     let ledger = await readLedger(secure.ledgerPath, environment, secure.root, normalizedOrigin); const pending = ledger.pendingPublication;
     if (!pending) {
       if (ledger.receiptState?.status !== 'pending' || !ledger.receiptState.receipt || !receiptPath) fail('no pending publication or recoverable receipt exists');
-      await atomicWriteJson(receiptPath, ledger.receiptState.receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
+      await atomicWriteJson(receiptPath, ledger.receiptState.receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
     }
-    const remote = await target.readManifest().catch(() => null);
-    if (remote && canonicalManifestIdentity(remote) !== pending.canonicalIdentity) fail('cannot reconcile pending publication: remote manifest identity differs');
+    const remoteBytes = await target.readManifestBytes().catch(() => null);
+    let remote = null;
+    if (remoteBytes !== null) { try { remote = JSON.parse(remoteBytes); } catch { fail('cannot reconcile pending publication: remote manifest is invalid JSON'); } }
+    if (remote && (strictManifestBytes(remote) !== pending.manifestBytes || manifestSha256(remote) !== pending.manifestSha256)) fail('cannot reconcile pending publication: remote manifest full identity differs');
     if (remote) {
-      ledger = applyPublishedManifest(ledger, remote); const receipt = receiptFor({ ledger, manifest: remote, status: 'active', phase: 'recovered', trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: remote.manifestRevision, receipt } }; await atomicWriteJson(secure.ledgerPath, ledger); if (receiptPath) { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await atomicWriteJson(secure.ledgerPath, ledger); } return { recovered: true, receipt, nextLedger: ledger };
+      ledger = applyPublishedManifest(ledger, remote); const receipt = receiptFor({ ledger, manifest: remote, status: 'active', phase: 'recovered', trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }); ledger = { ...ledger, receiptState: { status: 'pending', manifestRevision: remote.manifestRevision, receipt } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); if (receiptPath) { await atomicWriteJson(receiptPath, receipt); ledger = { ...ledger, receiptState: { ...ledger.receiptState, status: 'written' } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); } return { recovered: true, receipt, nextLedger: ledger };
     }
-    const burned = pending.manifest; ledger = applyPublishedManifest(ledger, burned); ledger = { ...ledger, manifests: { ...ledger.manifests, [String(burned.manifestRevision)]: { canonicalIdentity: pending.canonicalIdentity, burned: true } }, receiptState: { status: 'burned', manifestRevision: burned.manifestRevision, receipt: receiptFor({ ledger, manifest: burned, status: 'not-active', phase: `burned-${pending.phase}`, trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }) } }; await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, burned: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
+    const burned = pending.manifest; ledger = applyPublishedManifest(ledger, burned); ledger = { ...ledger, manifests: { ...ledger.manifests, [String(burned.manifestRevision)]: { canonicalIdentity: pending.canonicalIdentity, burned: true } }, receiptState: { status: 'burned', manifestRevision: burned.manifestRevision, receipt: receiptFor({ ledger, manifest: burned, status: 'not-active', phase: `burned-${pending.phase}`, trustedReceiptAt: pending.trustedReceiptAt, dryRun: false }) } }; await assertOwnership(); await atomicWriteJson(secure.ledgerPath, ledger); return { recovered: true, burned: true, receipt: ledger.receiptState.receipt, nextLedger: ledger };
   }, lockOptions);
 }
 
-module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, recoverLedgerLock, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, validateToolManifest, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };
+module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, recoverLedgerLock, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, strictManifestBytes, manifestSha256, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, validateToolManifest, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };

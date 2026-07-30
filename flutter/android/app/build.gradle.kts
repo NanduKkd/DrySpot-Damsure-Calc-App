@@ -47,8 +47,13 @@ val stagingSigningProblems = signingProblems(stagingKeystorePropertiesFile, stag
 val hasCompleteProductionSigning = productionSigningProblems.isEmpty()
 val hasCompleteStagingSigning = stagingSigningProblems.isEmpty()
 val stagingCertificateSha256 = releaseCertificateProperties.getProperty("stagingCertificateSha256")
-val certificatesAreDistinct = !stagingCertificateSha256.isNullOrBlank() &&
-    stagingCertificateSha256.replace(":", "").equals(productionCertificateSha256.replace(":", ""), ignoreCase = true).not()
+fun normalizedCertificateFingerprint(value: String?): String? = value?.replace(":", "")?.uppercase()?.takeIf {
+    Regex("^[0-9A-F]{64}$").matches(it)
+}
+val normalizedProductionCertificate = normalizedCertificateFingerprint(productionCertificateSha256)
+val normalizedStagingCertificate = normalizedCertificateFingerprint(stagingCertificateSha256)
+val certificatesAreDistinct = normalizedProductionCertificate != null && normalizedStagingCertificate != null &&
+    normalizedProductionCertificate != normalizedStagingCertificate
 
 fun stagingOriginFromDartDefines(): String? {
     val encoded = project.findProperty("dart-defines")?.toString() ?: return null
