@@ -2,8 +2,7 @@ import { Response } from 'express';
 import { Op } from 'sequelize';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Client, Item, Rectangle, DefaultPrice, Warranty, Proposal, sequelize } from '../models';
-import { removeStoredPdf } from '../middleware/uploadMiddleware';
-import { removeStoredPhoto } from '../middleware/photoUploadMiddleware';
+import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
@@ -390,10 +389,17 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			}
 		}
 
+		for (const filename of storedPdfsToRemove) {
+			await queueManagedFileCleanup('pdf', filename, transaction);
+		}
+		for (const filename of storedPhotosToRemove) {
+			await queueManagedFileCleanup('photo', filename, transaction);
+		}
 		await transaction.commit();
 		committed = true;
-		await Promise.all(storedPdfsToRemove.map((filename) => removeStoredPdf('', filename)));
-		await Promise.all(storedPhotosToRemove.map(removeStoredPhoto));
+		await reconcileManagedFileCleanup({
+			storageKeys: [...storedPdfsToRemove, ...storedPhotosToRemove],
+		});
 
 		// 2. Fetch updates for the client
 		const syncTime = last_sync_time ? new Date(last_sync_time) : new Date(0);

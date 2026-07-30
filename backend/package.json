@@ -18,7 +18,8 @@
     "test:integration": "jest --testPathPattern=tests/integration",
     "db:migrate": "sequelize-cli db:migrate --env ${NODE_ENV:-development}",
     "db:migrate:undo": "sequelize-cli db:migrate:undo --env ${NODE_ENV:-development}",
-    "db:seed": "sequelize-cli db:seed:all"
+    "db:seed": "sequelize-cli db:seed:all",
+    "managed-cleanup:reconcile": "ts-node src/scripts/reconcileManagedFileCleanup.ts"
   },
   "dependencies": {
     "@types/multer": "^2.1.0",

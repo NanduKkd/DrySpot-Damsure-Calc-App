@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import app from '../app';
-import { Client, Franchisee, User } from '../models';
+import { Client, Franchisee, ManagedFileCleanup, User } from '../models';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const uploadsDirectory = path.join(__dirname, '../../uploads');
@@ -87,6 +87,9 @@ describe('client photo storage', () => {
     expect(JSON.parse((await Client.findByPk(clientId))!.photos)).not.toContain(url);
     expect(unlink).toHaveBeenCalled();
     expect(errorLog).toHaveBeenCalled();
+    const cleanup = await ManagedFileCleanup.findOne({ where: { storageKey: url.split('/').at(-1) } });
+    expect(cleanup?.attempts).toBe(1);
+    expect(cleanup?.exhaustedAt).toBeNull();
   });
 
   it('sync cannot add forged canonical URLs and removes server photos it drops', async () => {

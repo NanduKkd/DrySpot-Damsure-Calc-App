@@ -3,7 +3,8 @@ import { randomUUID } from 'crypto';
 import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Warranty, Client, sequelize } from '../models';
-import { removeStoredPdf, removeUploadedFile } from '../middleware/uploadMiddleware';
+import { removeUploadedFile } from '../middleware/uploadMiddleware';
+import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
 
 const pdfUrlFor = (id: string) => `/api/warranty/${id}/download`;
 
@@ -73,6 +74,9 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 				replacedPdfs.push({ pdfUrl: existing.pdfUrl, pdfFileName: existing.pdfFileName });
 				await existing.destroy({ transaction });
 			}
+			for (const { pdfFileName } of replacedPdfs) {
+				await queueManagedFileCleanup('pdf', pdfFileName, transaction);
+			}
 			return Warranty.create(
 				{
 					id,
@@ -87,9 +91,9 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 				{ transaction },
 			);
 		});
-		await Promise.all(
-			replacedPdfs.map(({ pdfUrl, pdfFileName }) => removeStoredPdf(pdfUrl, pdfFileName)),
-		);
+		await reconcileManagedFileCleanup({
+			storageKeys: replacedPdfs.map(({ pdfFileName }) => pdfFileName).filter(Boolean) as string[],
+		});
 		return res.status(201).json(warranty);
 	} catch (error: any) {
 		await removeUploadedFile(file);
@@ -139,9 +143,11 @@ export const deleteWarranty = async (req: AuthRequest, res: Response) => {
 		include: [{ model: Client, where: { franchiseeId: req.user?.franchiseeId } }],
 	});
 	if (!warranty) return res.status(404).json({ error: 'Warranty not found or unauthorized' });
-	const pdfUrl = warranty.pdfUrl;
-	await warranty.update({ activeClientId: null });
-	await warranty.destroy();
-	await removeStoredPdf(pdfUrl, warranty.pdfFileName);
+	await sequelize.transaction(async (transaction) => {
+		await warranty.update({ activeClientId: null }, { transaction });
+		await warranty.destroy({ transaction });
+		await queueManagedFileCleanup('pdf', warranty.pdfFileName, transaction);
+	});
+	await reconcileManagedFileCleanup({ storageKeys: warranty.pdfFileName ? [warranty.pdfFileName] : [], limit: 1 });
 	return res.status(204).send();
 };

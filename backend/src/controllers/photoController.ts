@@ -4,6 +4,7 @@ import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Client, sequelize } from '../models';
 import { removeUploadedPhoto } from '../middleware/photoUploadMiddleware';
+import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
 
 const uploadsDirectory = path.join(__dirname, '../../uploads');
 const opaqueFilename = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:jpg|png|webp)$/i;
@@ -93,16 +94,12 @@ export const deletePhoto = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Photo not found or unauthorized' });
     }
     await client.update({ photos: JSON.stringify(photos.filter((photo) => photo !== canonicalPath)) }, { transaction });
+    await queueManagedFileCleanup('photo', filename, transaction);
     await transaction.commit();
     committed = true;
-    try {
-      await fs.promises.unlink(filePath);
-    } catch (error: any) {
-      // The metadata commit is authoritative. Reporting a failure here would
-      // make a retry misleading (the route is already gone), so log for
-      // operational cleanup and return the successful deletion response.
-      if (error?.code !== 'ENOENT') console.error(`Unable to remove deleted photo ${filePath}:`, error);
-    }
+    // Metadata deletion remains authoritative; cleanup failures are retained
+    // by the transactionally-created outbox row for an operator retry.
+    await reconcileManagedFileCleanup({ storageKeys: [filename], limit: 1 });
     return res.status(204).send();
   } catch (error) {
     if (!committed) await transaction.rollback();

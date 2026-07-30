@@ -7,6 +7,7 @@ import { Rectangle } from './Rectangle';
 import { Warranty } from './Warranty';
 import { Proposal } from './Proposal';
 import { DefaultPrice } from './DefaultPrice';
+import { ManagedFileCleanup } from './ManagedFileCleanup';
 
 // Associations
 Franchisee.hasMany(User, { foreignKey: 'franchiseeId' });
@@ -40,4 +41,5 @@ export {
   Warranty,
   Proposal,
   DefaultPrice,
+  ManagedFileCleanup,
 };

@@ -2,8 +2,9 @@ import { Response } from 'express';
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { Proposal, Client } from '../models';
-import { removeStoredPdf, removeUploadedFile } from '../middleware/uploadMiddleware';
+import { Proposal, Client, sequelize } from '../models';
+import { removeUploadedFile } from '../middleware/uploadMiddleware';
+import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
 
 const pdfUrlFor = (id: string) => `/api/proposal/${id}/download`;
 
@@ -44,8 +45,10 @@ export const downloadProposal = async (req: AuthRequest, res: Response) => {
 export const deleteProposal = async (req: AuthRequest, res: Response) => {
   const proposal = await Proposal.findOne({ where: { id: req.params.id }, include: [{ model: Client, where: { franchiseeId: req.user?.franchiseeId } }] });
   if (!proposal) return res.status(404).json({ error: 'Proposal not found or unauthorized' });
-  const pdfUrl = proposal.pdfUrl;
-  await proposal.destroy();
-  await removeStoredPdf(pdfUrl, proposal.pdfFileName);
+  await sequelize.transaction(async (transaction) => {
+    await proposal.destroy({ transaction });
+    await queueManagedFileCleanup('pdf', proposal.pdfFileName, transaction);
+  });
+  await reconcileManagedFileCleanup({ storageKeys: proposal.pdfFileName ? [proposal.pdfFileName] : [], limit: 1 });
   return res.status(204).send();
 };

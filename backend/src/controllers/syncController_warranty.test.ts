@@ -3,8 +3,7 @@ import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import app from '../app';
-import { Client, Franchisee, Proposal, User, Warranty } from '../models';
-import * as uploadMiddleware from '../middleware/uploadMiddleware';
+import { Client, Franchisee, ManagedFileCleanup, Proposal, User, Warranty } from '../models';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const uploadsDirectory = path.join(__dirname, '../../uploads');
@@ -208,20 +207,17 @@ describe('syncController warranty and PDF server invariants', () => {
 			pdfUrl: 'http://localhost/api/proposal/file/download',
 			pdfFileName: 'proposal-owned.pdf',
 		});
-		const removal = jest.spyOn(uploadMiddleware, 'removeStoredPdf').mockResolvedValue();
-
 		const response = await sync({
 			warranties: [{ remote_id: fileWarrantyId, deleted_at: new Date().toISOString() }],
 			proposals: [{ remote_id: fileProposalId, deleted_at: new Date().toISOString() }],
 		});
 
 		expect(response.status).toBe(200);
-		expect(removal).toHaveBeenCalledWith('', 'server-owned.pdf');
-		expect(removal).toHaveBeenCalledWith('', 'proposal-owned.pdf');
+		expect(await ManagedFileCleanup.count({ where: { storageKey: 'server-owned.pdf' } })).toBe(0);
+		expect(await ManagedFileCleanup.count({ where: { storageKey: 'proposal-owned.pdf' } })).toBe(0);
 		expect(
 			(await Warranty.findByPk(fileWarrantyId, { paranoid: false }))?.activeClientId,
 		).toBeNull();
-		removal.mockRestore();
 	});
 
 	it('client tombstone cleans only its managed photo and PDF files after commit', async () => {
