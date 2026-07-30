@@ -10,6 +10,7 @@ import { DefaultPrice } from './DefaultPrice';
 import { ManagedFileCleanup } from './ManagedFileCleanup';
 import { WarrantyDeletionSequence } from './WarrantyDeletionSequence';
 import { WarrantyDeletionTombstone } from './WarrantyDeletionTombstone';
+import { UserAdminAuditEvent } from './UserAdminAuditEvent';
 
 // Associations
 Franchisee.hasMany(User, { foreignKey: 'franchiseeId' });
@@ -46,4 +47,5 @@ export {
 	ManagedFileCleanup,
 	WarrantyDeletionSequence,
 	WarrantyDeletionTombstone,
+	UserAdminAuditEvent,
 };

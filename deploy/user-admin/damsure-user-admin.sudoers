@@ -1,0 +1,4 @@
+# Install root:root 0440 as /etc/sudoers.d/damsure-user-admin after replacing named accounts.
+# Do not allow node, a shell, environment preservation, or arbitrary arguments beyond this wrapper.
+User_Alias DAMSURE_USER_OPERATORS = REPLACE_WITH_NAMED_UNIX_ACCOUNTS
+DAMSURE_USER_OPERATORS ALL=(root) /usr/local/sbin/damsure-user-admin *

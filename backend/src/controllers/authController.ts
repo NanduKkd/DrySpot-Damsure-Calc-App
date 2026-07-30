@@ -5,8 +5,12 @@ import { User } from '../models/User';
 import { Franchisee } from '../models/Franchisee';
 import { JWT_SECRET } from '../config/jwt';
 
+const normalizeLoginEmail = (value: unknown): string =>
+  typeof value === 'string' ? value.trim().toLowerCase() : '';
+
 export const login = async (req: Request, res: Response) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  const email = normalizeLoginEmail(req.body.email);
 
   try {
     const user = await User.findOne({ 

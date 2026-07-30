@@ -3,6 +3,8 @@ import { sequelize } from '../src/models';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const warrantyDeletionMigration = require('../migrations/20260730010000-add-warranty-deletion-tombstones.js');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const userAdminMigration = require('../migrations/20260730020000-add-user-admin-lifecycle.js');
 
 // Deliberately explicit: production code rejects missing/default JWT secrets.
 process.env.JWT_SECRET = 'test-only-jwt-secret-with-32-characters';
@@ -13,6 +15,7 @@ beforeAll(async () => {
 		// sequelize.sync cannot create the database triggers that make UUID
 		// reservation safe against old or rolled-back writers.
 		await warrantyDeletionMigration.up(sequelize.getQueryInterface(), Sequelize);
+		await userAdminMigration.up(sequelize.getQueryInterface(), Sequelize);
 	}
 });
 

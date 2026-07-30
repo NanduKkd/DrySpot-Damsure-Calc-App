@@ -30,7 +30,7 @@ describe('authController', () => {
 
       const response = await request(app)
         .post('/api/auth/login')
-        .send({ email: 'test@example.com', password: password });
+        .send({ email: ' Test@Example.COM ', password: password });
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('token');
