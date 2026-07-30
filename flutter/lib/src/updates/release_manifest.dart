@@ -48,8 +48,9 @@ class AvailableReleaseManifest {
   /// A deterministic identity for APP-113 high-water persistence.
   ///
   /// This is deliberately an exact canonical payload identity rather than a
-  /// cryptographic signature. APP-113 must persist it only after transport and
-  /// APK verification; the manifest itself is not signed by this contract.
+  /// cryptographic signature. APP-113 persists it after trusted transport,
+  /// strict parsing, and anti-rollback validation so required policy survives
+  /// restart/offline. Downloaded-APK verification is a separate install gate.
   String get canonicalFingerprint => [
         _schemaVersion,
         true,

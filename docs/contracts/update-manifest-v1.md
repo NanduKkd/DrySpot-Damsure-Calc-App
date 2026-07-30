@@ -103,8 +103,10 @@ valid-policy rules.
 The parser provides explicit high-water validation helpers but does not persist
 them. APP-113 should persist the accepted manifest revision, canonical payload
 fingerprint (which includes `requiredUpdateReason`), latest version code, and
-minimum-supported version code after its transport and APK gates. It must
-reject a lower revision, a different payload at the same revision, and a lower
-latest or minimum version code. It also owns APK byte-size/hash, package ID,
-version code, signing certificate, download, install, retry, and startup-gate
-behavior.
+minimum-supported version code immediately after trusted transport, strict
+parsing, and anti-rollback validation. This accepted-policy state is separate
+from downloaded-artifact state: only an APK that subsequently passes byte-size,
+hash, package ID, version code, and signing-certificate verification may be
+offered for installation. The client must reject a lower revision, a different
+payload at the same revision, and a lower latest or minimum version code.
+APP-113 also owns download, install, retry, and startup-gate behavior.
