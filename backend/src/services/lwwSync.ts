@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { Op, Transaction, ValidationError } from 'sequelize';
 import {
 	Client,
@@ -48,6 +48,22 @@ type OutcomeStatus =
 	| 'unauthorized';
 
 type JsonObject = Record<string, unknown>;
+
+// Shared CommonJS canonicalization is also consumed directly by Sequelize CLI migrations.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const canonicalPayload = require('../../config/lww-payload-canonical.js') as {
+	canonicalJson: (value: unknown) => string;
+	canonicalMutablePayload: (collection: Collection, payload: JsonObject) => JsonObject;
+	canonicalStorageReal: (value: number | null) => number | null;
+	payloadHash: (value: unknown) => string;
+	storageRealCurrencyRoundTrips: (value: number) => boolean;
+};
+
+export const canonicalJson = canonicalPayload.canonicalJson;
+export const payloadHash = canonicalPayload.payloadHash;
+const canonicalMutablePayload = canonicalPayload.canonicalMutablePayload;
+const canonicalStorageReal = canonicalPayload.canonicalStorageReal;
+const storageRealCurrencyRoundTrips = canonicalPayload.storageRealCurrencyRoundTrips;
 
 export interface ParsedChange {
 	collection: Collection;
@@ -103,22 +119,6 @@ export class SyncTenantAuthorizationError extends Error {
 
 const isObject = (value: unknown): value is JsonObject =>
 	value !== null && typeof value === 'object' && !Array.isArray(value);
-
-const stableValue = (value: unknown): unknown => {
-	if (Array.isArray(value)) return value.map(stableValue);
-	if (isObject(value)) {
-		return Object.fromEntries(
-			Object.keys(value)
-				.sort()
-				.map((key) => [key, stableValue(value[key])]),
-		);
-	}
-	return value;
-};
-
-export const canonicalJson = (value: unknown) => JSON.stringify(stableValue(value));
-export const payloadHash = (value: unknown) =>
-	createHash('sha256').update(canonicalJson(value)).digest('hex');
 
 const exactKeys = (
 	value: JsonObject,
@@ -446,6 +446,40 @@ const currencyNumber = (payload: JsonObject, key: string, nullable = false): num
 	return value;
 };
 
+const storageRealNumber = (
+	payload: JsonObject,
+	key: string,
+	minimum: number,
+	maximum: number,
+	nullable = false,
+): number | null => {
+	const value = finiteNumber(payload, key, minimum, maximum, nullable);
+	if (value === null) return null;
+	const canonical = canonicalStorageReal(value);
+	if (
+		canonical === null ||
+		!Number.isFinite(canonical) ||
+		canonical < minimum ||
+		canonical > maximum
+	) {
+		throw new BusinessRejection('invalid_payload');
+	}
+	return canonical;
+};
+
+const storageRealCurrencyNumber = (
+	payload: JsonObject,
+	key: string,
+	nullable = false,
+): number | null => {
+	const value = currencyNumber(payload, key, nullable);
+	if (value === null) return null;
+	if (!storageRealCurrencyRoundTrips(value)) {
+		throw new BusinessRejection('invalid_payload');
+	}
+	return value;
+};
+
 class BusinessRejection extends Error {
 	constructor(public readonly reasonCode: string) {
 		super(reasonCode);
@@ -492,7 +526,7 @@ const assertPayloadKeys = (
 	}
 };
 
-const validatePayload = (change: ParsedChange): JsonObject => {
+const canonicalizePayload = (change: ParsedChange): JsonObject => {
 	if (change.operation === 'delete') return {};
 	const payload = change.payload;
 	switch (change.collection) {
@@ -523,16 +557,16 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 			if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
 				throw new BusinessRejection('invalid_payload');
 			}
-			return {
+			return canonicalMutablePayload('clients', {
 				address: nullableString(payload, 'address', 255),
-				discounted_price: currencyNumber(payload, 'discounted_price', true),
+				discounted_price: storageRealCurrencyNumber(payload, 'discounted_price', true),
 				email,
-				latitude: finiteNumber(payload, 'latitude', -90, 90, true),
-				longitude: finiteNumber(payload, 'longitude', -180, 180, true),
+				latitude: storageRealNumber(payload, 'latitude', -90, 90, true),
+				longitude: storageRealNumber(payload, 'longitude', -180, 180, true),
 				name: payload.name,
 				phone: nullableString(payload, 'phone', 255),
 				site_address: nullableString(payload, 'site_address', 255),
-			};
+			});
 		}
 		case 'items':
 			assertPayloadKeys(payload, ['name', 'price', 'enabled'], []);
@@ -544,26 +578,26 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 			) {
 				throw new BusinessRejection('invalid_payload');
 			}
-			return {
+			return canonicalMutablePayload('items', {
 				enabled: payload.enabled,
 				name: payload.name,
 				price: currencyNumber(payload, 'price'),
-			};
+			});
 		case 'rectangles':
 			assertPayloadKeys(payload, ['length', 'width'], []);
-			return {
-				length: finiteNumber(payload, 'length', Number.MIN_VALUE, 10_000),
-				width: finiteNumber(payload, 'width', Number.MIN_VALUE, 10_000),
-			};
+			return canonicalMutablePayload('rectangles', {
+				length: storageRealNumber(payload, 'length', Number.MIN_VALUE, 10_000),
+				width: storageRealNumber(payload, 'width', Number.MIN_VALUE, 10_000),
+			});
 		case 'default_prices':
 			assertPayloadKeys(payload, ['price', 'enabled'], []);
 			if (typeof payload.enabled !== 'boolean') {
 				throw new BusinessRejection('invalid_payload');
 			}
-			return {
+			return canonicalMutablePayload('default_prices', {
 				enabled: payload.enabled,
 				price: currencyNumber(payload, 'price'),
-			};
+			});
 	}
 };
 
@@ -758,7 +792,7 @@ export const serializeLwwRecord = (collection: Collection, record: any) => {
 				franchisee_id: record.franchiseeId,
 				payload: record.deletedAt
 					? {}
-					: {
+					: canonicalMutablePayload('clients', {
 							address: record.address ?? null,
 							discounted_price:
 								record.discountedPrice === null
@@ -770,7 +804,7 @@ export const serializeLwwRecord = (collection: Collection, record: any) => {
 							name: record.name,
 							phone: record.phone ?? null,
 							site_address: record.siteAddress ?? null,
-						},
+						}),
 				media: {
 					photos: record.deletedAt ? [] : canonicalClientPhotos(record),
 				},
@@ -781,11 +815,11 @@ export const serializeLwwRecord = (collection: Collection, record: any) => {
 				parent_id: record.clientId,
 				payload: record.deletedAt
 					? {}
-					: {
+					: canonicalMutablePayload('items', {
 							enabled: Boolean(record.enabled),
 							name: record.name,
 							price: Number(record.price),
-						},
+						}),
 			};
 		case 'rectangles':
 			if (
@@ -803,10 +837,10 @@ export const serializeLwwRecord = (collection: Collection, record: any) => {
 				parent_id: record.itemId,
 				payload: record.deletedAt
 					? {}
-					: {
+					: canonicalMutablePayload('rectangles', {
 							length: Number(record.length),
 							width: Number(record.width),
-						},
+						}),
 				media: {
 					image_data: record.deletedAt ? null : (record.imageData ?? null),
 				},
@@ -817,10 +851,10 @@ export const serializeLwwRecord = (collection: Collection, record: any) => {
 				franchisee_id: record.franchiseeId,
 				payload: record.deletedAt
 					? {}
-					: {
+					: canonicalMutablePayload('default_prices', {
 							enabled: Boolean(record.enabled),
 							price: Number(record.price),
-						},
+						}),
 			};
 	}
 };
@@ -1169,7 +1203,7 @@ const processChange = async (
 	};
 
 	try {
-		const normalizedPayload = validatePayload(change);
+		const normalizedPayload = canonicalizePayload(change);
 		const normalizedMedia = validateMedia(change);
 		const candidate = {
 			...change,

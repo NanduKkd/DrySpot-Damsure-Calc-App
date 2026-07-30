@@ -1,10 +1,9 @@
-import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:app_client/src/services/db_service.dart';
+import 'package:app_client/src/services/lww_protocol.dart';
 
 void main() {
   sqfliteFfiInit();
@@ -450,6 +449,13 @@ void main() {
             'remote_id': '40000000-0000-4000-8000-000000000021',
             'franchisee_id': '40000000-0000-4000-8000-000000000022',
             'name': 'Pending payload',
+            'address': '',
+            'site_address': '',
+            'email': '',
+            'phone': '',
+            'latitude': 11.123456789,
+            'longitude': -0.0,
+            'discounted_price': 44.44,
             'is_dirty': 1,
             'updated_at': '2026-07-30T00:00:00.000Z',
             'pending_base_generation': '1',
@@ -481,22 +487,19 @@ void main() {
       await DbService.migrateSchema(database, 12, 13);
 
       final expectedPayload = {
-        'address': null,
-        'discounted_price': null,
+        'address': '',
+        'discounted_price': 44.44,
         'email': null,
-        'latitude': null,
-        'longitude': null,
+        'latitude': 11.123456954956055,
+        'longitude': 0,
         'name': 'Pending payload',
-        'phone': null,
-        'site_address': null,
-      };
-      final sortedPayload = {
-        for (final key in expectedPayload.keys.toList()..sort())
-          key: expectedPayload[key],
+        'phone': '',
+        'site_address': '',
       };
       final expectedHash =
-          sha256.convert(utf8.encode(jsonEncode(sortedPayload))).toString();
+          canonicalLwwMutablePayloadHash('clients', expectedPayload);
       var row = (await database.query('clients')).single;
+      expect(row['email'], '');
       expect(row['pending_operation_rank'], 0);
       expect(row['pending_payload_hash'], expectedHash);
 

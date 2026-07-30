@@ -12,6 +12,7 @@ import {
 	TenantSyncState,
 	User,
 } from '../models';
+import { payloadHash } from '../services/lwwSync';
 import { irreversibleWarrantyConfirmation } from '../services/warrantyLifecycle';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
@@ -405,6 +406,13 @@ describe('APP-111 sync protocol v2', () => {
 				payload: { ...payloads.clients, discounted_price: 1.001 },
 			},
 			{
+				collection: 'clients',
+				payload: {
+					...payloads.clients,
+					discounted_price: 99_999_999.99,
+				},
+			},
+			{
 				collection: 'items',
 				payload: { ...payloads.items, name: 'x'.repeat(256) },
 			},
@@ -457,6 +465,78 @@ describe('APP-111 sync protocol v2', () => {
 			});
 			expect(await modelRecord(invalidCase.collection, remoteId)).toBeNull();
 		}
+	});
+
+	it('canonicalizes nullable email and storage-backed numeric representations before commit', async () => {
+		const clientId = randomUUID();
+		const rectangleId = randomUUID();
+		const rawClientPayload = {
+			...payloads.clients,
+			address: '',
+			site_address: '',
+			email: '',
+			phone: '',
+			latitude: 11.123456789,
+			longitude: -0,
+			discounted_price: 44.44,
+		};
+		const rawRectanglePayload = {
+			length: 11.123456789,
+			width: 0.0000001,
+		};
+		const response = await send({
+			clients: [
+				change({
+					collection: 'clients',
+					remoteId: clientId,
+					payload: rawClientPayload,
+				}),
+			],
+			rectangles: [
+				change({
+					collection: 'rectangles',
+					remoteId: rectangleId,
+					payload: rawRectanglePayload,
+				}),
+			],
+		});
+		expect(response.status).toBe(200);
+		const expectedClientPayload = {
+			...rawClientPayload,
+			email: null,
+			latitude: Math.fround(rawClientPayload.latitude),
+			longitude: 0,
+		};
+		const expectedRectanglePayload = {
+			length: Math.fround(rawRectanglePayload.length),
+			width: Math.fround(rawRectanglePayload.width),
+		};
+		const clientAuthoritative = response.body.outcomes.clients[0].authoritative;
+		const rectangleAuthoritative = response.body.outcomes.rectangles[0].authoritative;
+		expect(clientAuthoritative.payload).toEqual(expectedClientPayload);
+		expect(clientAuthoritative.payload_hash).toBe(payloadHash(expectedClientPayload));
+		expect(rectangleAuthoritative.payload).toEqual(expectedRectanglePayload);
+		expect(rectangleAuthoritative.payload_hash).toBe(payloadHash(expectedRectanglePayload));
+		expect(await modelRecord('clients', clientId)).toMatchObject({
+			email: null,
+			lwwPayloadHash: clientAuthoritative.payload_hash,
+		});
+		expect(await modelRecord('rectangles', rectangleId)).toMatchObject({
+			lwwPayloadHash: rectangleAuthoritative.payload_hash,
+		});
+
+		const nullEmail = await send({
+			clients: [
+				change({
+					collection: 'clients',
+					remoteId: randomUUID(),
+					payload: { ...rawClientPayload, email: null },
+				}),
+			],
+		});
+		expect(nullEmail.body.outcomes.clients[0].authoritative.payload_hash).toBe(
+			clientAuthoritative.payload_hash,
+		);
 	});
 
 	it('durably replays rejected and superseded change outcomes by full fingerprint', async () => {

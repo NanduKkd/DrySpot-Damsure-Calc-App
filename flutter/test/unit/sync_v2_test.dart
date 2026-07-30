@@ -4,6 +4,7 @@ import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/services/db_service.dart';
+import 'package:app_client/src/services/lww_protocol.dart';
 import 'package:app_client/src/services/sync_service.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -2003,293 +2004,303 @@ void main() {
     });
   }
 
-  test(
-      '426 retry finalizes the exact committed identities for all four entities after a lost response',
-      () async {
-    const itemId = '40000000-0000-4000-8000-000000000084';
-    const rectangleId = '40000000-0000-4000-8000-000000000085';
-    const priceId = '40000000-0000-4000-8000-000000000086';
-    const localWriter = '40000000-0000-4000-8000-000000000087';
-    const ids = {
-      'clients': remoteId,
-      'items': itemId,
-      'rectangles': rectangleId,
-      'default_prices': priceId,
-    };
-    const localPayloads = <String, Map<String, dynamic>>{
-      'clients': {
-        'address': 'Preserved address',
-        'discounted_price': 44,
-        'email': 'preserved@example.com',
-        'latitude': 11,
-        'longitude': 22,
-        'name': 'Committed client intent',
-        'phone': '1234567890',
-        'site_address': 'Preserved site',
-      },
-      'items': {
-        'enabled': true,
-        'name': 'Committed item intent',
-        'price': 14,
-      },
-      'rectangles': {'length': 4, 'width': 6},
-      'default_prices': {'enabled': true, 'price': 18},
-    };
-    const baselinePayloads = <String, Map<String, dynamic>>{
-      'clients': {
-        'address': null,
-        'discounted_price': null,
-        'email': null,
-        'latitude': null,
-        'longitude': null,
-        'name': 'Older server client',
-        'phone': null,
-        'site_address': null,
-      },
-      'items': {
-        'enabled': false,
-        'name': 'Older server item',
-        'price': 24,
-      },
-      'rectangles': {'length': 8, 'width': 9},
-      'default_prices': {'enabled': false, 'price': 28},
-    };
-    const baselineChanges = {
-      'clients': '40000000-0000-4000-8000-000000000091',
-      'items': '40000000-0000-4000-8000-000000000092',
-      'rectangles': '40000000-0000-4000-8000-000000000093',
-      'default_prices': '40000000-0000-4000-8000-000000000094',
-    };
+  for (final lostWriterCase in <String, String>{
+    'lexically lower': '10000000-0000-4000-8000-000000000087',
+    'lexically higher': 'f0000000-0000-4000-8000-000000000087',
+  }.entries) {
+    test(
+        '426 retry finalizes exact committed identities with blank email and ${lostWriterCase.key} writer',
+        () async {
+      const itemId = '40000000-0000-4000-8000-000000000084';
+      const rectangleId = '40000000-0000-4000-8000-000000000085';
+      const priceId = '40000000-0000-4000-8000-000000000086';
+      final localWriter = lostWriterCase.value;
+      const ids = {
+        'clients': remoteId,
+        'items': itemId,
+        'rectangles': rectangleId,
+        'default_prices': priceId,
+      };
+      const localPayloads = <String, Map<String, dynamic>>{
+        'clients': {
+          'address': 'Preserved address',
+          'discounted_price': 44.44,
+          'email': '',
+          'latitude': 11.123456789,
+          'longitude': -0.0,
+          'name': 'Committed client intent',
+          'phone': '1234567890',
+          'site_address': 'Preserved site',
+        },
+        'items': {
+          'enabled': true,
+          'name': 'Committed item intent',
+          'price': 14.10,
+        },
+        'rectangles': {'length': 4.123456789, 'width': 0.0000001},
+        'default_prices': {'enabled': true, 'price': 18.10},
+      };
+      final canonicalLocalPayloads = {
+        for (final entry in localPayloads.entries)
+          entry.key: canonicalLwwMutablePayload(entry.key, entry.value),
+      };
+      const baselinePayloads = <String, Map<String, dynamic>>{
+        'clients': {
+          'address': null,
+          'discounted_price': null,
+          'email': null,
+          'latitude': null,
+          'longitude': null,
+          'name': 'Older server client',
+          'phone': null,
+          'site_address': null,
+        },
+        'items': {
+          'enabled': false,
+          'name': 'Older server item',
+          'price': 24,
+        },
+        'rectangles': {'length': 8, 'width': 9},
+        'default_prices': {'enabled': false, 'price': 28},
+      };
+      const baselineChanges = {
+        'clients': '40000000-0000-4000-8000-000000000091',
+        'items': '40000000-0000-4000-8000-000000000092',
+        'rectangles': '40000000-0000-4000-8000-000000000093',
+        'default_prices': '40000000-0000-4000-8000-000000000094',
+      };
 
-    await database.insert('sync_state', {
-      'key': 'lww_installation_writer_id',
-      'value': localWriter,
-    });
-    final clientLocalId = await database.insert('clients', {
-      'remote_id': remoteId,
-      'franchisee_id': tenant,
-      'name': localPayloads['clients']!['name'],
-      'address': localPayloads['clients']!['address'],
-      'site_address': localPayloads['clients']!['site_address'],
-      'email': localPayloads['clients']!['email'],
-      'phone': localPayloads['clients']!['phone'],
-      'latitude': localPayloads['clients']!['latitude'],
-      'longitude': localPayloads['clients']!['longitude'],
-      'discounted_price': localPayloads['clients']!['discounted_price'],
-      'photos': '[]',
-      'is_dirty': 1,
-      'updated_at': now,
-    });
-    final itemLocalId = await database.insert('items', {
-      'remote_id': itemId,
-      'client_id': clientLocalId,
-      'name': localPayloads['items']!['name'],
-      'price': localPayloads['items']!['price'],
-      'enabled': 1,
-      'is_dirty': 1,
-      'updated_at': now,
-    });
-    await database.insert('rectangles', {
-      'remote_id': rectangleId,
-      'item_id': itemLocalId,
-      'length': localPayloads['rectangles']!['length'],
-      'width': localPayloads['rectangles']!['width'],
-      'image_data': null,
-      'is_dirty': 1,
-      'updated_at': now,
-    });
-    await database.insert('default_prices', {
-      'remote_id': priceId,
-      'franchisee_id': tenant,
-      'price': localPayloads['default_prices']!['price'],
-      'enabled': 1,
-      'is_dirty': 1,
-      'updated_at': now,
-    });
+      await database.insert('sync_state', {
+        'key': 'lww_installation_writer_id',
+        'value': localWriter,
+      });
+      final clientLocalId = await database.insert('clients', {
+        'remote_id': remoteId,
+        'franchisee_id': tenant,
+        'name': localPayloads['clients']!['name'],
+        'address': localPayloads['clients']!['address'],
+        'site_address': localPayloads['clients']!['site_address'],
+        'email': localPayloads['clients']!['email'],
+        'phone': localPayloads['clients']!['phone'],
+        'latitude': localPayloads['clients']!['latitude'],
+        'longitude': localPayloads['clients']!['longitude'],
+        'discounted_price': localPayloads['clients']!['discounted_price'],
+        'photos': '[]',
+        'is_dirty': 1,
+        'updated_at': now,
+      });
+      final itemLocalId = await database.insert('items', {
+        'remote_id': itemId,
+        'client_id': clientLocalId,
+        'name': localPayloads['items']!['name'],
+        'price': localPayloads['items']!['price'],
+        'enabled': 1,
+        'is_dirty': 1,
+        'updated_at': now,
+      });
+      await database.insert('rectangles', {
+        'remote_id': rectangleId,
+        'item_id': itemLocalId,
+        'length': localPayloads['rectangles']!['length'],
+        'width': localPayloads['rectangles']!['width'],
+        'image_data': null,
+        'is_dirty': 1,
+        'updated_at': now,
+      });
+      await database.insert('default_prices', {
+        'remote_id': priceId,
+        'franchisee_id': tenant,
+        'price': localPayloads['default_prices']!['price'],
+        'enabled': 1,
+        'is_dirty': 1,
+        'updated_at': now,
+      });
 
-    String? parentFor(String collection) => switch (collection) {
-          'items' => remoteId,
-          'rectangles' => itemId,
-          _ => null,
-        };
-    Map<String, dynamic> recordFor(
-      String collection, {
-      required String generation,
-      required String writer,
-      required String change,
-      required String cursor,
-      required Map<String, dynamic> payload,
-      Map<String, dynamic>? media,
-    }) =>
-        lwwUpsertRecord(
-          id: ids[collection]!,
-          generation: generation,
-          branch: 1,
-          writer: writer,
-          change: change,
-          cursor: cursor,
-          payload: payload,
-          parentId: parentFor(collection),
-          tenantOwned:
-              collection == 'clients' || collection == 'default_prices',
-          media: media ??
-              (collection == 'clients'
-                  ? {'photos': <String>[]}
-                  : collection == 'rectangles'
-                      ? {'image_data': null}
-                      : null),
-        );
-    final baseline = {
-      for (final collection in ids.keys)
-        collection: recordFor(
-          collection,
-          generation: '1',
-          writer: serverWriter,
-          change: baselineChanges[collection]!,
-          cursor: '1',
-          payload: baselinePayloads[collection]!,
-        ),
-    };
+      String? parentFor(String collection) => switch (collection) {
+            'items' => remoteId,
+            'rectangles' => itemId,
+            _ => null,
+          };
+      Map<String, dynamic> recordFor(
+        String collection, {
+        required String generation,
+        required String writer,
+        required String change,
+        required String cursor,
+        required Map<String, dynamic> payload,
+        Map<String, dynamic>? media,
+      }) =>
+          lwwUpsertRecord(
+            id: ids[collection]!,
+            generation: generation,
+            branch: 1,
+            writer: writer,
+            change: change,
+            cursor: cursor,
+            payload: payload,
+            parentId: parentFor(collection),
+            tenantOwned:
+                collection == 'clients' || collection == 'default_prices',
+            media: media ??
+                (collection == 'clients'
+                    ? {'photos': <String>[]}
+                    : collection == 'rectangles'
+                        ? {'image_data': null}
+                        : null),
+          );
+      final baseline = {
+        for (final collection in ids.keys)
+          collection: recordFor(
+            collection,
+            generation: '1',
+            writer: serverWriter,
+            change: baselineChanges[collection]!,
+            cursor: '1',
+            payload: baselinePayloads[collection]!,
+          ),
+      };
 
-    apiService.v1Handler = (_) async => throw const ApiException(
-          'Upgrade required',
-          statusCode: 426,
-          code: 'sync_protocol_upgrade_required',
-        );
-    var round = 0;
-    Map<String, Map<String, dynamic>>? committedChanges;
-    Map<String, Map<String, dynamic>>? committedRecords;
-    apiService.v2Handler = (request) async {
-      round += 1;
-      if (round == 1) {
-        expect(request['request_cursor'], '0');
-        for (final collection in ids.keys) {
-          expect(request['changes'][collection], isEmpty);
+      apiService.v1Handler = (_) async => throw const ApiException(
+            'Upgrade required',
+            statusCode: 426,
+            code: 'sync_protocol_upgrade_required',
+          );
+      var round = 0;
+      Map<String, Map<String, dynamic>>? committedChanges;
+      Map<String, Map<String, dynamic>>? committedRecords;
+      apiService.v2Handler = (request) async {
+        round += 1;
+        if (round == 1) {
+          expect(request['request_cursor'], '0');
+          for (final collection in ids.keys) {
+            expect(request['changes'][collection], isEmpty);
+          }
+          return responseFor(
+            request,
+            cursor: '1',
+            clients: [baseline['clients']!],
+            items: [baseline['items']!],
+            rectangles: [baseline['rectangles']!],
+            defaultPrices: [baseline['default_prices']!],
+          );
         }
-        return responseFor(
-          request,
-          cursor: '1',
-          clients: [baseline['clients']!],
-          items: [baseline['items']!],
-          rectangles: [baseline['rectangles']!],
-          defaultPrices: [baseline['default_prices']!],
-        );
-      }
-      if (round == 2) {
-        committedChanges = {
-          for (final collection in ids.keys)
-            collection: Map<String, dynamic>.from(
-              request['changes'][collection].single as Map,
-            ),
-        };
-        for (final collection in ids.keys) {
-          final submitted = committedChanges![collection]!;
-          expect(submitted['base_generation'], '1');
-          expect(submitted['generation'], '2');
-          expect(submitted['branch_seq'], 1);
-          expect(submitted['writer_id'], localWriter);
-          expect(submitted['payload'], localPayloads[collection]);
-        }
-        committedRecords = {
-          for (final collection in ids.keys)
-            collection: recordFor(
-              collection,
-              generation: '2',
-              writer: committedChanges![collection]!['writer_id'] as String,
-              change: committedChanges![collection]!['change_id'] as String,
-              cursor: '2',
-              payload: Map<String, dynamic>.from(
-                committedChanges![collection]!['payload'] as Map,
+        if (round == 2) {
+          committedChanges = {
+            for (final collection in ids.keys)
+              collection: Map<String, dynamic>.from(
+                request['changes'][collection].single as Map,
               ),
-              media: collection == 'rectangles'
-                  ? Map<String, dynamic>.from(
-                      committedChanges![collection]!['media'] as Map,
-                    )
-                  : null,
-            ),
-        };
-        throw StateError('response lost after committed bootstrap batch');
-      }
-      if (round == 3) {
-        expect(request['request_cursor'], '1');
-        for (final collection in ids.keys) {
-          expect(request['changes'][collection], isEmpty);
+          };
+          for (final collection in ids.keys) {
+            final submitted = committedChanges![collection]!;
+            expect(submitted['base_generation'], '1');
+            expect(submitted['generation'], '2');
+            expect(submitted['branch_seq'], 1);
+            expect(submitted['writer_id'], localWriter);
+            expect(submitted['payload'], canonicalLocalPayloads[collection]);
+          }
+          committedRecords = {
+            for (final collection in ids.keys)
+              collection: recordFor(
+                collection,
+                generation: '2',
+                writer: committedChanges![collection]!['writer_id'] as String,
+                change: committedChanges![collection]!['change_id'] as String,
+                cursor: '2',
+                payload: Map<String, dynamic>.from(
+                  committedChanges![collection]!['payload'] as Map,
+                ),
+                media: collection == 'rectangles'
+                    ? Map<String, dynamic>.from(
+                        committedChanges![collection]!['media'] as Map,
+                      )
+                    : null,
+              ),
+          };
+          throw StateError('response lost after committed bootstrap batch');
         }
-        return responseFor(
-          request,
-          cursor: '2',
-          clients: [committedRecords!['clients']!],
-          items: [committedRecords!['items']!],
-          rectangles: [committedRecords!['rectangles']!],
-          defaultPrices: [committedRecords!['default_prices']!],
-        );
-      }
-      expect(round, 4);
-      expect(request['request_cursor'], '2');
+        if (round == 3) {
+          expect(request['request_cursor'], '1');
+          for (final collection in ids.keys) {
+            expect(request['changes'][collection], isEmpty);
+          }
+          return responseFor(
+            request,
+            cursor: '2',
+            clients: [committedRecords!['clients']!],
+            items: [committedRecords!['items']!],
+            rectangles: [committedRecords!['rectangles']!],
+            defaultPrices: [committedRecords!['default_prices']!],
+          );
+        }
+        expect(round, 4);
+        expect(request['request_cursor'], '2');
+        for (final collection in ids.keys) {
+          expect(
+            request['changes'][collection],
+            isEmpty,
+            reason: 'an exact committed candidate must not become generation 3',
+          );
+        }
+        return responseFor(request, cursor: '2');
+      };
+
+      await expectLater(
+        SyncService(apiService: apiService, dbService: dbService).sync(),
+        throwsA(isA<StateError>()),
+      );
+
+      expect(await dbService.isSyncV2Enabled(tenant), isFalse);
+      expect(await dbService.getSyncV2Cursor(tenant), '1');
       for (final collection in ids.keys) {
+        final row = (await database.query(collection)).single;
+        final submitted = committedChanges![collection]!;
+        expect(row['is_dirty'], 1);
+        expect(row['pending_base_generation'], '1');
+        expect(row['pending_generation'], submitted['generation']);
+        expect(row['pending_branch_seq'], submitted['branch_seq']);
+        expect(row['pending_operation_rank'], 0);
+        expect(row['pending_writer_id'], submitted['writer_id']);
+        expect(row['pending_change_id'], submitted['change_id']);
         expect(
-          request['changes'][collection],
-          isEmpty,
-          reason: 'an exact committed candidate must not become generation 3',
+          row['pending_payload_hash'],
+          payloadHash(canonicalLocalPayloads[collection]!),
         );
       }
-      return responseFor(request, cursor: '2');
-    };
+      expect((await database.query('clients')).single['name'],
+          localPayloads['clients']!['name']);
+      expect((await database.query('items')).single['name'],
+          localPayloads['items']!['name']);
+      expect((await database.query('rectangles')).single['length'],
+          localPayloads['rectangles']!['length']);
+      expect((await database.query('default_prices')).single['price'],
+          localPayloads['default_prices']!['price']);
 
-    await expectLater(
-      SyncService(apiService: apiService, dbService: dbService).sync(),
-      throwsA(isA<StateError>()),
-    );
+      await SyncService(apiService: apiService, dbService: dbService).sync();
 
-    expect(await dbService.isSyncV2Enabled(tenant), isFalse);
-    expect(await dbService.getSyncV2Cursor(tenant), '1');
-    for (final collection in ids.keys) {
-      final row = (await database.query(collection)).single;
-      final submitted = committedChanges![collection]!;
-      expect(row['is_dirty'], 1);
-      expect(row['pending_base_generation'], '1');
-      expect(row['pending_generation'], submitted['generation']);
-      expect(row['pending_branch_seq'], submitted['branch_seq']);
-      expect(row['pending_operation_rank'], 0);
-      expect(row['pending_writer_id'], submitted['writer_id']);
-      expect(row['pending_change_id'], submitted['change_id']);
-      expect(
-        row['pending_payload_hash'],
-        payloadHash(localPayloads[collection]!),
-      );
-    }
-    expect((await database.query('clients')).single['name'],
-        localPayloads['clients']!['name']);
-    expect((await database.query('items')).single['name'],
-        localPayloads['items']!['name']);
-    expect((await database.query('rectangles')).single['length'],
-        localPayloads['rectangles']!['length']);
-    expect((await database.query('default_prices')).single['price'],
-        localPayloads['default_prices']!['price']);
-
-    await SyncService(apiService: apiService, dbService: dbService).sync();
-
-    expect(round, 4);
-    expect(apiService.v2Requests, hasLength(4));
-    expect(await dbService.isSyncV2Enabled(tenant), isTrue);
-    expect(await dbService.getSyncV2Cursor(tenant), '2');
-    for (final collection in ids.keys) {
-      final row = (await database.query(collection)).single;
-      final submitted = committedChanges![collection]!;
-      expect(row['is_dirty'], 0);
-      expect(row['server_generation'], submitted['generation']);
-      expect(row['server_branch_seq'], submitted['branch_seq']);
-      expect(row['server_operation_rank'], 0);
-      expect(row['server_writer_id'], submitted['writer_id']);
-      expect(row['server_change_id'], submitted['change_id']);
-      expect(
-        row['server_payload_hash'],
-        payloadHash(localPayloads[collection]!),
-      );
-      expect(row['pending_change_id'], isNull);
-      expect(row['pending_payload_hash'], isNull);
-    }
-  });
+      expect(round, 4);
+      expect(apiService.v2Requests, hasLength(4));
+      expect(await dbService.isSyncV2Enabled(tenant), isTrue);
+      expect(await dbService.getSyncV2Cursor(tenant), '2');
+      for (final collection in ids.keys) {
+        final row = (await database.query(collection)).single;
+        final submitted = committedChanges![collection]!;
+        expect(row['is_dirty'], 0);
+        expect(row['server_generation'], submitted['generation']);
+        expect(row['server_branch_seq'], submitted['branch_seq']);
+        expect(row['server_operation_rank'], 0);
+        expect(row['server_writer_id'], submitted['writer_id']);
+        expect(row['server_change_id'], submitted['change_id']);
+        expect(
+          row['server_payload_hash'],
+          payloadHash(canonicalLocalPayloads[collection]!),
+        );
+        expect(row['pending_change_id'], isNull);
+        expect(row['pending_payload_hash'], isNull);
+      }
+      expect((await database.query('clients')).single['email'], '');
+    });
+  }
 
   test(
       '426 bootstrap rejection preserves all four dirty values and exact rebased identities for retry',
@@ -2664,6 +2675,15 @@ void main() {
         payload['email'] = 'not-an-email';
         record['payload'] = payload;
         record['payload_hash'] = payloadHash(payload);
+        return responseFor(request, cursor: '1', clients: [record]);
+      },
+      (request) {
+        final record = serverClient(changeId: serverChange, cursor: '1');
+        final payload = Map<String, dynamic>.from(record['payload'] as Map);
+        payload['email'] = '';
+        record['payload'] = payload;
+        record['payload_hash'] =
+            canonicalLwwMutablePayloadHash('clients', payload);
         return responseFor(request, cursor: '1', clients: [record]);
       },
       (request) {

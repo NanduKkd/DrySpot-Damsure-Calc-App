@@ -694,8 +694,11 @@ class SyncService {
     }
   }
 
-  String _payloadHash(Map<String, dynamic> payload) =>
-      canonicalLwwPayloadHash(payload);
+  String _payloadHash(
+    String collection,
+    Map<String, dynamic> payload,
+  ) =>
+      canonicalLwwMutablePayloadHash(collection, payload);
 
   bool _boundedString(dynamic value, {required int max, bool nullable = true}) {
     if (value == null) return nullable;
@@ -925,9 +928,14 @@ class SyncService {
     } else if (record['franchisee_id'] != franchiseeId) {
       throw _protocolError('$collection crossed tenant ownership.');
     }
-    if (_payloadHash(payload) != record['payload_hash']) {
+    final canonicalPayload = canonicalLwwMutablePayload(collection, payload);
+    if (canonicalLwwJson(payload) != canonicalLwwJson(canonicalPayload)) {
+      throw _protocolError('$collection.payload is not canonical.');
+    }
+    if (_payloadHash(collection, canonicalPayload) != record['payload_hash']) {
       throw _protocolError('$collection.payload_hash does not match payload.');
     }
+    record['payload'] = canonicalPayload;
     return record;
   }
 

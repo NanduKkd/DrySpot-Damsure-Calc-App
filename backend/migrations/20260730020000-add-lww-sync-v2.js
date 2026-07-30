@@ -2,6 +2,10 @@
 
 const { createHash } = require('crypto');
 const { QueryTypes } = require('sequelize');
+const {
+	canonicalMutablePayload,
+	payloadHash: sha256,
+} = require('../config/lww-payload-canonical.js');
 
 const entityTables = ['clients', 'items', 'rectangles', 'default_prices'];
 const auxiliaryTables = ['warranties', 'proposals'];
@@ -10,21 +14,6 @@ const maxBigint = 9223372036854775807n;
 const maxBranchSequence = 1000000;
 const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const sha256Hex = /^[0-9a-f]{64}$/;
-
-const stableValue = (value) => {
-	if (Array.isArray(value)) return value.map(stableValue);
-	if (value && typeof value === 'object') {
-		return Object.fromEntries(
-			Object.keys(value)
-				.sort()
-				.map((key) => [key, stableValue(value[key])]),
-		);
-	}
-	return value;
-};
-
-const canonicalJson = (value) => JSON.stringify(stableValue(value));
-const sha256 = (value) => createHash('sha256').update(canonicalJson(value)).digest('hex');
 
 const deterministicUuidV4 = (seed) => {
 	const bytes = createHash('sha256').update(seed).digest().subarray(0, 16);
@@ -63,7 +52,7 @@ const normalizeBoolean = (value) =>
 const payloadFor = (entity, row) => {
 	switch (entity) {
 		case 'clients':
-			return {
+			return canonicalMutablePayload('clients', {
 				address: row.address ?? null,
 				discounted_price:
 					row.discounted_price === null || row.discounted_price === undefined
@@ -81,23 +70,23 @@ const payloadFor = (entity, row) => {
 				name: row.name,
 				phone: row.phone ?? null,
 				site_address: row.site_address ?? null,
-			};
+			});
 		case 'items':
-			return {
+			return canonicalMutablePayload('items', {
 				enabled: normalizeBoolean(row.enabled),
 				name: row.name,
 				price: Number(row.price),
-			};
+			});
 		case 'rectangles':
-			return {
+			return canonicalMutablePayload('rectangles', {
 				length: Number(row.length),
 				width: Number(row.width),
-			};
+			});
 		case 'default_prices':
-			return {
+			return canonicalMutablePayload('default_prices', {
 				enabled: normalizeBoolean(row.enabled),
 				price: Number(row.price),
-			};
+			});
 		default:
 			throw new Error(`Unknown LWW entity ${entity}`);
 	}

@@ -152,7 +152,18 @@ const main = async () => {
 	const queryInterface = await createBaseSchema();
 	await queryInterface.bulkInsert('franchisees', [{ id: tenantId }]);
 	await queryInterface.bulkInsert('clients', [
-		{ id: clientId, franchisee_id: tenantId, name: 'Client' },
+		{
+			id: clientId,
+			franchisee_id: tenantId,
+			name: 'Client',
+			address: '',
+			site_address: '',
+			email: '',
+			phone: '',
+			latitude: 11.123456789,
+			longitude: -0,
+			discounted_price: 44.44,
+		},
 	]);
 	await queryInterface.bulkInsert('items', [
 		{
@@ -172,6 +183,25 @@ const main = async () => {
 	]);
 
 	await migration.up(queryInterface, Sequelize);
+	const clientBackfill = await database.query(
+		`SELECT lww_payload_hash
+     FROM clients WHERE id = :clientId`,
+		{ replacements: { clientId }, type: QueryTypes.SELECT },
+	);
+	assert.equal(
+		clientBackfill[0].lww_payload_hash,
+		canonicalHash({
+			address: '',
+			discounted_price: 44.44,
+			email: null,
+			latitude: Math.fround(11.123456789),
+			longitude: 0,
+			name: 'Client',
+			phone: '',
+			site_address: '',
+		}),
+		'migration backfill must use the same storage-canonical payload hash',
+	);
 	const firstBackfill = await database.query(
 		`SELECT lww_generation, lww_operation_rank, lww_writer_id,
             lww_change_id, lww_payload_hash, sync_cursor
@@ -491,6 +521,8 @@ const main = async () => {
 		Client,
 		DefaultPrice,
 		Franchisee,
+		Item,
+		Rectangle,
 		TenantSyncState,
 		User,
 	} = require('../src/models');
@@ -599,6 +631,92 @@ const main = async () => {
 		[2n, 3n],
 		'v1 and v2 handler rows must carry the same serialized commit order',
 	);
+
+	const canonicalParentItemId = '50000000-0000-4000-8000-000000000011';
+	const canonicalClientId = '50000000-0000-4000-8000-000000000012';
+	const canonicalRectangleId = '50000000-0000-4000-8000-000000000013';
+	await Item.create({
+		id: canonicalParentItemId,
+		clientId: legacyClientId,
+		name: 'Canonical parent item',
+		price: 1,
+		enabled: true,
+	});
+	const clientPayload = {
+		name: 'Canonical storage client',
+		address: '',
+		site_address: '',
+		email: '',
+		phone: '',
+		latitude: 11.123456789,
+		longitude: -0,
+		discounted_price: 44.44,
+	};
+	const rectanglePayload = {
+		length: 11.123456789,
+		width: 0.0000001,
+	};
+	const canonicalResponse = await request(app)
+		.post('/api/sync/v2')
+		.set('Authorization', `Bearer ${handlerToken}`)
+		.send({
+			protocol_version: 2,
+			request_id: randomUUID(),
+			request_cursor: '3',
+			warranty_tombstone_cursor: '0',
+			changes: {
+				clients: [
+					{
+						remote_id: canonicalClientId,
+						operation: 'upsert',
+						base_generation: '0',
+						generation: '1',
+						branch_seq: 1,
+						writer_id: randomUUID(),
+						change_id: randomUUID(),
+						payload: clientPayload,
+					},
+				],
+				items: [],
+				rectangles: [
+					{
+						remote_id: canonicalRectangleId,
+						parent_id: canonicalParentItemId,
+						operation: 'upsert',
+						base_generation: '0',
+						generation: '1',
+						branch_seq: 1,
+						writer_id: randomUUID(),
+						change_id: randomUUID(),
+						payload: rectanglePayload,
+					},
+				],
+				default_prices: [],
+			},
+		});
+	assert.equal(canonicalResponse.status, 200);
+	const canonicalClient = canonicalResponse.body.outcomes.clients[0].authoritative;
+	const canonicalRectangle = canonicalResponse.body.outcomes.rectangles[0].authoritative;
+	assert.deepEqual(canonicalClient.payload, {
+		...clientPayload,
+		email: null,
+		latitude: Math.fround(clientPayload.latitude),
+		longitude: 0,
+	});
+	assert.deepEqual(canonicalRectangle.payload, {
+		length: Math.fround(rectanglePayload.length),
+		width: Math.fround(rectanglePayload.width),
+	});
+	assert.equal(canonicalClient.payload_hash, canonicalHash(canonicalClient.payload));
+	assert.equal(canonicalRectangle.payload_hash, canonicalHash(canonicalRectangle.payload));
+	assert.equal(
+		(await Client.findByPk(canonicalClientId)).lwwPayloadHash,
+		canonicalClient.payload_hash,
+	);
+	assert.equal(
+		(await Rectangle.findByPk(canonicalRectangleId)).lwwPayloadHash,
+		canonicalRectangle.payload_hash,
+	);
 	await appDatabase.close();
 
 	process.stdout.write(
@@ -617,6 +735,7 @@ const main = async () => {
 			inconsistent_legacy_rollback: 'passed',
 			complete_state_invariants: 'passed',
 			concurrent_v1_v2_handlers: 'passed',
+			canonical_payload_round_trip: 'passed',
 		})}\n`,
 	);
 };

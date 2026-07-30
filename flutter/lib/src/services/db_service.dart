@@ -282,9 +282,8 @@ class DbService {
     int operationRank,
   ) {
     if (operationRank == 1) return <String, dynamic>{};
-    switch (collection) {
-      case 'clients':
-        return {
+    final payload = switch (collection) {
+      'clients' => {
           'name': row['name'],
           'address': row['address'],
           'site_address': row['site_address'],
@@ -293,25 +292,23 @@ class DbService {
           'latitude': row['latitude'],
           'longitude': row['longitude'],
           'discounted_price': row['discounted_price'],
-        };
-      case 'items':
-        return {
+        },
+      'items' => {
           'name': row['name'],
           'price': double.parse(row['price'].toString()),
           'enabled': row['enabled'] == 1 || row['enabled'] == true,
-        };
-      case 'rectangles':
-        return {
+        },
+      'rectangles' => {
           'length': double.parse(row['length'].toString()),
           'width': double.parse(row['width'].toString()),
-        };
-      case 'default_prices':
-        return {
+        },
+      'default_prices' => {
           'price': double.parse(row['price'].toString()),
           'enabled': row['enabled'] == 1 || row['enabled'] == true,
-        };
-    }
-    throw StateError('Unsupported LWW collection: $collection');
+        },
+      _ => throw StateError('Unsupported LWW collection: $collection'),
+    };
+    return canonicalLwwMutablePayload(collection, payload);
   }
 
   static String _currentLwwPayloadHash(
