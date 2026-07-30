@@ -27,6 +27,14 @@ The integrated backend and Flutter implementation has passed automated, producti
 - The updater remains blocked pending a signed/published release and pilot validation.
 - File deletion is best-effort after successful database commit; it has no durable retry/reconciliation queue.
 
+### Product roadmap
+
+The next delivery program is documented in three durable records:
+
+- [Product decisions](product-decisions.md) records accepted behavior and the five remaining product choices.
+- [Product task backlog](product-task-backlog.md) defines effort-weighted task contracts, acceptance criteria, dependencies, and proof gates.
+- [Product roadmap](product-roadmap.md) schedules the work into four parallel lanes with no more than two concurrent write-heavy implementation tasks.
+
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
 ## Files Changed
