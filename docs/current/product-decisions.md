@@ -104,9 +104,9 @@ Roadmap assumption: retain one active login at a time. A separate task will hard
 
 - The mobile app exposes login only.
 - Public registration is not routed.
-- There is no administrative API, screen, invitation flow, password-reset flow, or supported provisioning command.
-- Accounts currently have to be created directly in the database with a bcrypt password hash and a franchisee ID.
-- The backend can reject inactive users and revoke all of a user's tokens through `isActive` and `tokenVersion`, but no operator-facing workflow exposes those controls.
+- There is no administrative API, screen, invitation flow, or self-service password-reset flow.
+- APP-108 supplies the supported compiled server-side operator CLI for tenant-scoped account creation, deactivation, reactivation, password reset, token revocation, and immutable audit queries.
+- Direct database account creation is no longer the supported operating procedure once the root-owned wrapper, restricted sudo policy, named operator accounts, and tenant allow-list are installed and verified in the target environment.
 
 ## Decisions still required
 

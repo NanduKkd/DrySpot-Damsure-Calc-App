@@ -37,7 +37,7 @@ The next delivery program is documented in three durable records:
 
 ### Active delivery integration (2026-07-30)
 
-The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-102 measurement deletion confirmation, APP-103 Android permission minimization, APP-104 strict update-manifest parsing, APP-105 Unicode PDF fonts, APP-107 local update-publication tooling, APP-109 durable managed-file cleanup, and APP-110 sync-safe permanent warranty deletion. APP-107 and APP-110 passed independent exact-tip verification; APP-107 remains unpublished and externally gated. APP-106, APP-108, APP-111, and APP-112 contracts are frozen.
+The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-102 measurement deletion confirmation, APP-103 Android permission minimization, APP-104 strict update-manifest parsing, APP-105 Unicode PDF fonts, APP-107 local update-publication tooling, APP-108 CLI-first user administration, APP-109 durable managed-file cleanup, and APP-110 sync-safe permanent warranty deletion. APP-107, APP-108, and APP-110 passed independent exact-tip verification; APP-107 remains unpublished and externally gated. APP-106, APP-111, and APP-112 contracts are frozen.
 
 - Integrated backend gate: lint exits successfully with warnings; 15 suites / 65 tests pass; build passes.
 - Integrated Flutter gate: 102 tests pass; `flutter analyze` reports no issues.
@@ -49,6 +49,8 @@ The local `codex/product-roadmap` integration lane now includes APP-101 measurem
 - APP-110's PostgreSQL guard/migration/concurrency proof and final independent verifier passed. Production-shaped rehearsal, APP-109 operator recovery proof, and the physical two-device deletion/replacement scenario remain rollout evidence.
 - Current manager-branch gate after APP-107 integration: backend remains green at 17 suites / 78 tests and TypeScript build; the production Flutter set passes 133 tests, the staging parser passes its flavor-bound test, and analysis reports no issues. APP-107's publication suite passes 24/24 with zero skips; Nginx, production-isolation, and Gradle release guards pass.
 - APP-107's exact candidate `f523ec3` passed independent local verification within the documented operator-owned `0700` state-directory boundary. No artifact or manifest was published. Staging-host/Nginx endpoint proof, protected signing material and backup restoration, named approval, and a production-signed physical-device pilot remain mandatory external gates.
+- Current manager-branch gate after APP-108 integration: backend lint exits with warnings only, all 21 suites / 97 tests pass, and the TypeScript build passes.
+- APP-108's exact candidate `82089dbe` passed independent T3 verification. Tenant-bound decimal audit cursors, legacy cursor compatibility, malformed/future/foreign rejection, values above `2^53`, additive PostgreSQL migration rollback/no-op/undo/reapply, production-pruned compiled CLI operation, and direct-invocation denial all pass. Root-owned wrapper installation, named operator accounts and keys, tenant allow-lists, backup/collision preflight, and staging/production operator proof remain rollout evidence.
 
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
