@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../models/client.dart';
 import 'api_service.dart';
+import 'session_manager.dart';
 import '../utils/warranty_date_utils.dart';
 
 class PdfService {
@@ -651,14 +652,26 @@ class PdfService {
     return null;
   }
 
-  Future<Uint8List> loadPdfBytes(String pdfUrl) async {
+  Future<Uint8List> loadPdfBytes(
+    String pdfUrl, {
+    required SessionSnapshot session,
+    required bool Function() isSessionCurrent,
+  }) async {
+    void requireCurrent() {
+      if (!isSessionCurrent()) {
+        throw const StaleSessionException();
+      }
+    }
+
+    requireCurrent();
     final protectedUri = resolveProtectedPdfUrl(pdfUrl);
 
     if (protectedUri != null) {
       final response = await http.get(
         protectedUri,
-        headers: _apiService.authenticatedHeaders,
+        headers: _apiService.authenticatedHeadersFor(session),
       );
+      requireCurrent();
       if (response.statusCode == 200) {
         return response.bodyBytes;
       }
@@ -674,11 +687,20 @@ class PdfService {
     if (!await file.exists()) {
       throw Exception('PDF file not found');
     }
-
-    return file.readAsBytes();
+    requireCurrent();
+    final bytes = await file.readAsBytes();
+    requireCurrent();
+    return bytes;
   }
 
-  Future<void> deleteRemotePdf(String pdfUrl) async {
+  Future<void> deleteRemotePdf(
+    String pdfUrl, {
+    required SessionSnapshot session,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
     final uri = resolveProtectedPdfUrl(pdfUrl);
     if (uri == null) {
       return;
@@ -690,8 +712,11 @@ class PdfService {
     segments.removeLast();
     final response = await http.delete(
       uri.replace(pathSegments: segments),
-      headers: _apiService.authenticatedHeaders,
+      headers: _apiService.authenticatedHeadersFor(session),
     );
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
     if (response.statusCode != 204) {
       throw Exception('Failed to delete PDF (${response.statusCode})');
     }
@@ -717,16 +742,28 @@ class PdfService {
   Future<File> cachePdfFile({
     required String pdfUrl,
     required String fallbackFileName,
+    required SessionSnapshot session,
+    required bool Function() isSessionCurrent,
   }) async {
-    final bytes = await loadPdfBytes(pdfUrl);
+    final bytes = await loadPdfBytes(
+      pdfUrl,
+      session: session,
+      isSessionCurrent: isSessionCurrent,
+    );
     final fileName = buildPdfFileName(
       fallbackName: fallbackFileName,
       sourceUrl: pdfUrl,
     );
 
     final tempDir = await getTemporaryDirectory();
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
     final file = File('${tempDir.path}/$fileName');
     await file.writeAsBytes(bytes, flush: true);
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
 
     return file;
   }

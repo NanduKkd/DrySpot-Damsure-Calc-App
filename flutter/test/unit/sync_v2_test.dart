@@ -409,6 +409,58 @@ void main() {
     );
   });
 
+  test('quarantines a cross-tenant remote-id collision without mutating A',
+      () async {
+    const otherTenant = '40000000-0000-4000-8000-000000000009';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'A retained client',
+      updatedAt: DateTime.parse(now),
+    ));
+    final bRecord = serverClient(
+      changeId: '40000000-0000-4000-8000-00000000000a',
+      cursor: '1',
+      name: 'B must not replace A',
+    )..['franchisee_id'] = otherTenant;
+
+    await dbService.applySyncV2Response(
+      franchiseeId: otherTenant,
+      requestCursor: '0',
+      responseCursor: '1',
+      requestWarrantyTombstoneCursor: '0',
+      warrantyTombstoneCursor: '0',
+      records: {
+        'clients': [bRecord],
+        'items': const [],
+        'rectangles': const [],
+        'default_prices': const [],
+      },
+      warranties: const [],
+      proposals: const [],
+      warrantyTombstones: const [],
+      submittedChangeIds: const {
+        'clients': {},
+        'items': {},
+        'rectangles': {},
+        'default_prices': {},
+      },
+      outcomeStatuses: const {},
+      activateProtocol: false,
+    );
+
+    expect(
+      (await dbService.getClientByRemoteIdForFranchisee(remoteId, tenant))!
+          .name,
+      'A retained client',
+    );
+    expect(
+      await dbService.getClientByRemoteIdForFranchisee(remoteId, otherTenant),
+      isNull,
+    );
+    expect(await dbService.getSyncV2Cursor(otherTenant), '1');
+  });
+
   test('an in-flight N+1 edit survives the outcome and snapshot for N',
       () async {
     await activate();

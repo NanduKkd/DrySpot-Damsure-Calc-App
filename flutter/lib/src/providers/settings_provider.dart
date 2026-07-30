@@ -8,7 +8,9 @@ import '../services/session_manager.dart';
 class SettingsProvider with ChangeNotifier {
   SettingsProvider({DbService? dbService, SessionManager? sessionManager})
       : _dbService = dbService ?? DbService(),
-        _sessionManager = sessionManager;
+        _sessionManager = sessionManager {
+    _sessionManager?.addInvalidationListener(_clearForInvalidation);
+  }
 
   final DbService _dbService;
   final SessionManager? _sessionManager;
@@ -69,6 +71,19 @@ class SettingsProvider with ChangeNotifier {
     if (nextSession != null) {
       unawaited(_loadForSession(nextSession));
     }
+  }
+
+  void _clearForInvalidation() {
+    _sessionBound = true;
+    _session = null;
+    _defaultPrices = [];
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _sessionManager?.removeInvalidationListener(_clearForInvalidation);
+    super.dispose();
   }
 
   Future<void> _loadForSession(SessionSnapshot session) async {

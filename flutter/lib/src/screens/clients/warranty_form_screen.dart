@@ -150,6 +150,10 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         warrantyCardNumber: _cardNumberController.text,
       );
 
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
+
       // Upload to API
       final replacement = widget.warrantyToReplace;
       final fields = <String, String>{
@@ -172,6 +176,8 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         fields,
         session,
         idempotencyKey: widget.replacementIdempotencyKey,
+        isSessionCurrent: () =>
+            auth.sessionSnapshot?.generation == session.generation,
       );
       if (auth.sessionSnapshot?.generation != session.generation) return;
 

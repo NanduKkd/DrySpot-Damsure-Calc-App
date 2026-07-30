@@ -9,7 +9,10 @@ class SyncProvider extends ChangeNotifier {
   String? _error;
   SessionSnapshot? _session;
 
-  SyncProvider({required SyncService syncService}) : _syncService = syncService;
+  SyncProvider({required SyncService syncService})
+      : _syncService = syncService {
+    _syncService.sessionManager?.addInvalidationListener(_clearForInvalidation);
+  }
 
   bool get isSyncing => _isSyncing;
   String? get lastSyncTime => _lastSyncTime;
@@ -22,6 +25,21 @@ class SyncProvider extends ChangeNotifier {
     _lastSyncTime = null;
     _error = null;
     notifyListeners();
+  }
+
+  void _clearForInvalidation() {
+    _session = null;
+    _isSyncing = false;
+    _lastSyncTime = null;
+    _error = null;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _syncService.sessionManager
+        ?.removeInvalidationListener(_clearForInvalidation);
+    super.dispose();
   }
 
   Future<void> sync() async {

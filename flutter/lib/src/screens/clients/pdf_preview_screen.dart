@@ -6,6 +6,8 @@ import 'package:provider/provider.dart';
 
 import '../../services/pdf_service.dart';
 import '../../services/api_service.dart';
+import '../../providers/auth_provider.dart';
+import '../../services/session_manager.dart';
 
 class PdfPreviewScreen extends StatefulWidget {
   const PdfPreviewScreen({
@@ -29,7 +31,16 @@ class _PdfPreviewScreenState extends State<PdfPreviewScreen> {
   void initState() {
     super.initState();
     _pdfService = PdfService(apiService: context.read<ApiService>());
-    _pdfBytesFuture = _pdfService.loadPdfBytes(widget.pdfUrl);
+    final auth = context.read<AuthProvider>();
+    final session = auth.sessionSnapshot;
+    _pdfBytesFuture = session == null
+        ? Future<Uint8List>.error(const StaleSessionException())
+        : _pdfService.loadPdfBytes(
+            widget.pdfUrl,
+            session: session,
+            isSessionCurrent: () =>
+                auth.sessionSnapshot?.generation == session.generation,
+          );
   }
 
   @override

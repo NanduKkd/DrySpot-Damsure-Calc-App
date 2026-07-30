@@ -23,6 +23,7 @@ class SessionSnapshot {
 class SessionManager {
   int _generation = 0;
   SessionSnapshot? _activeSession;
+  final Set<void Function()> _invalidationListeners = {};
 
   int get generation => _generation;
   SessionSnapshot? get current => _activeSession;
@@ -46,9 +47,22 @@ class SessionManager {
     );
   }
 
+  void addInvalidationListener(void Function() listener) {
+    _invalidationListeners.add(listener);
+  }
+
+  void removeInvalidationListener(void Function() listener) {
+    _invalidationListeners.remove(listener);
+  }
+
   void invalidate() {
     _generation += 1;
     _activeSession = null;
+    // Cache owners clear synchronously in this call stack, before logout
+    // awaits preferences or the proxy providers receive a rebuild.
+    for (final listener in List<void Function()>.from(_invalidationListeners)) {
+      listener();
+    }
   }
 
   bool isCurrent(SessionSnapshot snapshot) {

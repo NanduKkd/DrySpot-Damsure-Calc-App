@@ -151,6 +151,7 @@ void main() {
     verify(mockDb.markAsSynced(
       'clients',
       'client-remote-id',
+      franchiseeId: anyNamed('franchiseeId'),
       submittedUpdatedAt: anyNamed('submittedUpdatedAt'),
     )).called(1);
   });

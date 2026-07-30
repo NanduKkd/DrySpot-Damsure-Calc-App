@@ -6,6 +6,7 @@ import 'package:app_client/src/models/item.dart';
 import 'package:app_client/src/models/proposal.dart';
 import 'package:app_client/src/models/rectangle.dart';
 import 'package:app_client/src/models/warranty.dart';
+import 'package:app_client/src/models/warranty_deletion_tombstone.dart';
 import 'package:app_client/src/providers/auth_provider.dart';
 import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/providers/settings_provider.dart';
@@ -41,8 +42,9 @@ class _CapturingApi extends ApiService {
   @override
   Future<Map<String, dynamic>> syncForSession(
     Map<String, dynamic> data,
-    SessionSnapshot session,
-  ) async {
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) async {
     requests.add(data);
     return _emptyV1Response;
   }
@@ -59,8 +61,9 @@ class _DelayedApi extends ApiService {
   @override
   Future<Map<String, dynamic>> syncForSession(
     Map<String, dynamic> data,
-    SessionSnapshot session,
-  ) {
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) {
     capturedRequest = data;
     capturedSession = session;
     started.complete();
@@ -325,7 +328,7 @@ void main() {
     final db = DbService(database: database);
     await _seedTwoTenants(db);
     final sessions = SessionManager();
-    sessions.activate(token: 'token-a', franchiseeId: _tenantA);
+    final a = sessions.activate(token: 'token-a', franchiseeId: _tenantA);
     final clientProvider = ClientProvider(sessionManager: sessions);
     final settingsProvider = SettingsProvider(
       dbService: db,
@@ -349,14 +352,21 @@ void main() {
         clientProvider.currentClientWarranties.single.remoteId, 'a-warranty');
     expect(clientProvider.currentClientProposals.single.remoteId, 'a-proposal');
     expect(settingsProvider.defaultPrices.single.remoteId, 'a-price');
+    await db.setSyncV1CursorForSession(
+      _tenantA,
+      'a-retained-v1-cursor',
+      isSessionCurrent: () => sessions.isCurrent(a),
+    );
 
     sessions.invalidate();
-    clientProvider.updateSession(isAuthenticated: false);
-    settingsProvider.updateSession(isAuthenticated: false);
+    // Session invalidation clears caches in this same synchronous call stack;
+    // it does not wait for a proxy-provider rebuild.
     expect(clientProvider.clients, isEmpty);
     expect(clientProvider.currentClientWarranties, isEmpty);
     expect(clientProvider.currentClientProposals, isEmpty);
     expect(settingsProvider.defaultPrices, isEmpty);
+    clientProvider.updateSession(isAuthenticated: false);
+    settingsProvider.updateSession(isAuthenticated: false);
 
     sessions.activate(token: 'token-b', franchiseeId: _tenantB);
     clientProvider.updateSession(
@@ -371,6 +381,7 @@ void main() {
     await settingsProvider.loadSettings();
     expect(clientProvider.clients.single.name, 'B client');
     expect(settingsProvider.defaultPrices.single.remoteId, 'b-price');
+    expect(await db.getSyncV1Cursor(_tenantB), isNull);
 
     sessions.invalidate();
     clientProvider.updateSession(isAuthenticated: false);
@@ -392,6 +403,7 @@ void main() {
         'a-client');
     expect((await db.getPendingClientPhotos(_tenantA)).single['local_path'],
         '/private/a-photo.jpg');
+    expect(await db.getSyncV1Cursor(_tenantA), 'a-retained-v1-cursor');
     await database.close();
   });
 
@@ -477,8 +489,83 @@ void main() {
     await expectLater(running, throwsA(isA<StaleSessionException>()));
     expect((await db.getDirtyClientsForFranchisee(_tenantA)).single.remoteId,
         'a-stale-client');
-    final prefs = await SharedPreferences.getInstance();
-    expect(prefs.containsKey('last_sync_time_$_tenantA'), isFalse);
+    expect(await db.getSyncV1Cursor(_tenantA), isNull);
+    await database.close();
+  });
+
+  test('a committed V1 echo cannot overwrite an intervening client N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'a-v1-race-client',
+        franchiseeId: _tenantA,
+        name: 'N',
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final a = sessions.activate(token: 'token-a', franchiseeId: _tenantA);
+    final service = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    );
+
+    final running = service.sync(a);
+    await api.started.future;
+    await db.updateClient(
+      Client(
+        localId: clientId,
+        remoteId: 'a-v1-race-client',
+        franchiseeId: _tenantA,
+        name: 'N+1',
+        isDirty: true,
+        updatedAt: _now.add(const Duration(seconds: 1)),
+      ),
+    );
+    api.response.complete({
+      'server_time': '2026-07-31T00:00:00.000Z',
+      'warranty_tombstone_cursor': '0',
+      'updates': {
+        'clients': [
+          {
+            'remote_id': 'a-v1-race-client',
+            'name': 'N echoed by server',
+            'photos': '[]',
+            'updated_at': _now.toIso8601String(),
+            'deleted_at': null,
+          },
+        ],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+        'warranties': [],
+        'proposals': [],
+        'warranty_tombstones': [],
+      },
+      'outcomes': {
+        'clients': [
+          {'remote_id': 'a-v1-race-client', 'status': 'applied'},
+        ],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+        'warranties': [],
+        'proposals': [],
+      },
+    });
+
+    await running;
+    final retained = await db.getClientByRemoteIdForFranchisee(
+      'a-v1-race-client',
+      _tenantA,
+    );
+    expect(retained!.name, 'N+1');
+    expect(retained.isDirty, isTrue);
     await database.close();
   });
 
@@ -487,7 +574,7 @@ void main() {
       () async {
     SharedPreferences.setMockInitialValues({
       'last_sync_time': 'legacy-global-cursor',
-      'last_sync_time_$_tenantA': 'retained-a-v1-cursor',
+      'last_sync_time_$_tenantA': 'legacy-tenant-cursor',
     });
     final sessions = SessionManager();
     final auth = AuthProvider(
@@ -512,7 +599,201 @@ void main() {
     expect(auth.isAuthenticated, isFalse);
     expect(sessions.isCurrent(active!), isFalse);
     expect(prefs.containsKey('last_sync_time'), isFalse);
-    expect(prefs.getString('last_sync_time_$_tenantA'), 'retained-a-v1-cursor');
+    expect(prefs.containsKey('last_sync_time_$_tenantA'), isFalse);
+  });
+
+  test('logout fences an in-progress automatic restore', () async {
+    SharedPreferences.setMockInitialValues({
+      'token': 'a-token',
+      'franchisee_id': _tenantA,
+    });
+    final sessions = SessionManager();
+    final auth = AuthProvider(
+      sessionManager: sessions,
+      apiService: _AuthApi(const []),
+      minimumSplashDuration: Duration.zero,
+    );
+
+    final restoring = auth.tryAutoLogin();
+    await Future<void>.delayed(Duration.zero);
+    final restored = auth.sessionSnapshot;
+    expect(restored, isNotNull);
+
+    await auth.logout();
+    await restoring;
+
+    expect(auth.isAuthenticated, isFalse);
+    expect(auth.isRestoringSession, isFalse);
+    expect(sessions.isCurrent(restored!), isFalse);
+  });
+
+  test('a B V2 warranty tombstone cannot delete A warranty identity', () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    await _seedTwoTenants(db);
+
+    await db.applySyncV2Response(
+      franchiseeId: _tenantB,
+      requestCursor: '0',
+      responseCursor: '0',
+      requestWarrantyTombstoneCursor: '0',
+      warrantyTombstoneCursor: '1',
+      records: const {
+        'clients': [],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+      },
+      warranties: const [],
+      proposals: const [],
+      warrantyTombstones: [
+        WarrantyDeletionTombstone(
+          warrantyId: 'a-warranty',
+          franchiseeId: _tenantB,
+          deletionSequence: '1',
+          deletedAt: _now,
+        ),
+      ],
+      submittedChangeIds: const {
+        'clients': {},
+        'items': {},
+        'rectangles': {},
+        'default_prices': {},
+      },
+      outcomeStatuses: const {},
+      activateProtocol: false,
+    );
+
+    expect(
+      await db.getWarrantyByRemoteIdForFranchisee('a-warranty', _tenantA),
+      isNotNull,
+    );
+    await database.close();
+  });
+
+  test('a foreign warranty remote-id is quarantined before B replacement',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final ids = await _seedTwoTenants(db);
+    final sessions = SessionManager();
+    final b = sessions.activate(token: 'token-b', franchiseeId: _tenantB);
+
+    final applied = await db.replaceWarrantyFromServerForSession(
+      Warranty(
+        remoteId: 'a-warranty',
+        clientId: ids['bClient']!,
+        warrantyCardNumber: 'collision',
+        startDate: _now,
+        durationYears: 1,
+        pdfUrl: '/collision.pdf',
+        isDirty: false,
+        updatedAt: _now,
+      ),
+      franchiseeId: _tenantB,
+      isSessionCurrent: () => sessions.isCurrent(b),
+    );
+
+    expect(applied, isFalse);
+    expect(
+      await db.getWarrantyByRemoteIdForFranchisee('a-warranty', _tenantA),
+      isNotNull,
+    );
+    expect(
+      (await db.getWarrantiesByClientIdForFranchisee(
+        ids['bClient']!,
+        _tenantB,
+      ))
+          .single
+          .remoteId,
+      'b-warranty',
+    );
+    await database.close();
+  });
+
+  test('a V1 session write rolls back after invalidation during SQLite I/O',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'rollback-client',
+        franchiseeId: _tenantA,
+        name: 'before',
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    var validations = 0;
+
+    await expectLater(
+      db.writeForSession(
+        table: 'clients',
+        values: {'name': 'stale response', 'is_dirty': 0},
+        where: 'local_id = ?',
+        whereArgs: [clientId],
+        // The first two checks admit the transaction. The third is the check
+        // after SQLite's awaited update but before transaction commit.
+        isSessionCurrent: () => ++validations < 3,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+
+    final retained = await db.getClientByRemoteIdForFranchisee(
+      'rollback-client',
+      _tenantA,
+    );
+    expect(retained!.name, 'before');
+    expect(retained.isDirty, isTrue);
+    await database.close();
+  });
+
+  test('stale sessions cannot begin bearer or multipart API requests',
+      () async {
+    final api = ApiService(serverUrl: 'http://127.0.0.1:1');
+    const snapshot = SessionSnapshot(
+      token: 'captured-bearer',
+      userName: 'A',
+      franchiseeId: _tenantA,
+      franchiseeName: 'A',
+      generation: 1,
+    );
+
+    await expectLater(
+      api.syncForSession(
+        const {},
+        snapshot,
+        isSessionCurrent: () => false,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    await expectLater(
+      api.uploadWarrantyForSession(
+        '/this/file/must/not/be/read.pdf',
+        const {},
+        snapshot,
+        isSessionCurrent: () => false,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    await expectLater(
+      api.uploadProposalForSession(
+        '/this/file/must/not/be/read.pdf',
+        const {},
+        snapshot,
+        isSessionCurrent: () => false,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    await expectLater(
+      api.uploadClientPhotoForSession(
+        'a-client',
+        '/this/file/must/not/be/read.jpg',
+        snapshot,
+        isSessionCurrent: () => false,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
   });
 
   test('sync UI state is cleared on a session transition', () async {

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../services/client_photo_service.dart';
 import '../../services/api_service.dart';
+import '../../providers/auth_provider.dart';
 import 'package:provider/provider.dart';
 
 class ClientPhotoPreviewScreen extends StatelessWidget {
@@ -18,6 +19,9 @@ class ClientPhotoPreviewScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final auth = Provider.of<AuthProvider?>(context, listen: false);
+    final session = auth?.sessionSnapshot;
+    final apiService = context.read<ApiService?>();
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -42,10 +46,16 @@ class ClientPhotoPreviewScreen extends StatelessWidget {
         maxScale: 4,
         child: Center(
           child: Image(
-            image: photoService.buildImageProvider(
-              photoPath,
-              apiService: context.read<ApiService?>(),
-            ),
+            image: session == null || apiService == null
+                ? photoService.buildImageProvider(
+                    photoPath,
+                    apiService: apiService,
+                  )
+                : photoService.buildImageProviderForSession(
+                    photoPath,
+                    apiService: apiService,
+                    session: session,
+                  ),
             fit: BoxFit.contain,
             errorBuilder: (context, error, stackTrace) {
               return const Padding(

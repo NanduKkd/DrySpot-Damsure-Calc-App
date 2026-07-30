@@ -118,6 +118,12 @@ class ApiService {
         ...authenticatedHeadersFor(session),
       };
 
+  void _requireCurrentSession(bool Function()? isSessionCurrent) {
+    if (isSessionCurrent?.call() == false) {
+      throw const StaleSessionException();
+    }
+  }
+
   String resolveUrl(String pathOrUrl) {
     final uri = Uri.tryParse(pathOrUrl);
     if (uri != null && uri.hasScheme) return pathOrUrl;
@@ -237,19 +243,23 @@ class ApiService {
 
   Future<Map<String, dynamic>> syncForSession(
     Map<String, dynamic> data,
-    SessionSnapshot session,
-  ) =>
-      _sync(data, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _sync(data, session: session, isSessionCurrent: isSessionCurrent);
 
   Future<Map<String, dynamic>> _sync(
-    Map<String, dynamic> data, [
+    Map<String, dynamic> data, {
     SessionSnapshot? session,
-  ]) async {
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final response = await http.post(
       Uri.parse('$baseUrl/sync'),
       headers: _headersFor(session),
       body: jsonEncode(data),
     );
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode == 200) {
       return _decodeObjectBody(
@@ -266,19 +276,23 @@ class ApiService {
 
   Future<Map<String, dynamic>> syncV2ForSession(
     Map<String, dynamic> data,
-    SessionSnapshot session,
-  ) =>
-      _syncV2(data, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _syncV2(data, session: session, isSessionCurrent: isSessionCurrent);
 
   Future<Map<String, dynamic>> _syncV2(
-    Map<String, dynamic> data, [
+    Map<String, dynamic> data, {
     SessionSnapshot? session,
-  ]) async {
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final response = await http.post(
       Uri.parse('$baseUrl/sync/v2'),
       headers: _headersFor(session),
       body: jsonEncode(data),
     );
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode == 200) {
       return _decodeObjectBody(
@@ -302,12 +316,14 @@ class ApiService {
     Map<String, String> fields,
     SessionSnapshot session, {
     String? idempotencyKey,
+    required bool Function() isSessionCurrent,
   }) =>
       _uploadWarranty(
         filePath,
         fields,
         idempotencyKey: idempotencyKey,
         session: session,
+        isSessionCurrent: isSessionCurrent,
       );
 
   Future<Map<String, dynamic>> _uploadWarranty(
@@ -315,7 +331,9 @@ class ApiService {
     Map<String, String> fields, {
     String? idempotencyKey,
     SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
   }) async {
+    _requireCurrentSession(isSessionCurrent);
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/warranty/upload'),
@@ -333,8 +351,10 @@ class ApiService {
     );
     request.fields.addAll(fields);
 
+    _requireCurrentSession(isSessionCurrent);
     final streamedResponse = await request.send();
     final response = await http.Response.fromStream(streamedResponse);
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode == 201) {
       return _decodeObjectBody(
@@ -371,6 +391,7 @@ class ApiService {
     required String irreversibleConfirmation,
     required String idempotencyKey,
     required SessionSnapshot session,
+    required bool Function() isSessionCurrent,
   }) =>
       _deleteWarranty(
         id: id,
@@ -379,6 +400,7 @@ class ApiService {
         irreversibleConfirmation: irreversibleConfirmation,
         idempotencyKey: idempotencyKey,
         session: session,
+        isSessionCurrent: isSessionCurrent,
       );
 
   Future<Map<String, dynamic>> _deleteWarranty({
@@ -388,7 +410,9 @@ class ApiService {
     required String irreversibleConfirmation,
     required String idempotencyKey,
     SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
   }) async {
+    _requireCurrentSession(isSessionCurrent);
     final response = await http.delete(
       Uri.parse('$baseUrl/warranty/$id'),
       headers: {..._headersFor(session), 'Idempotency-Key': idempotencyKey},
@@ -399,6 +423,7 @@ class ApiService {
         'irreversible_confirmation': irreversibleConfirmation,
       }),
     );
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode == 200) {
       final result = _decodeObjectBody(
@@ -427,15 +452,23 @@ class ApiService {
   Future<Map<String, dynamic>> uploadProposalForSession(
     String filePath,
     Map<String, String> fields,
-    SessionSnapshot session,
-  ) =>
-      _uploadProposal(filePath, fields, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _uploadProposal(
+        filePath,
+        fields,
+        session: session,
+        isSessionCurrent: isSessionCurrent,
+      );
 
   Future<Map<String, dynamic>> _uploadProposal(
     String filePath,
-    Map<String, String> fields, [
+    Map<String, String> fields, {
     SessionSnapshot? session,
-  ]) async {
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/proposal/upload'),
@@ -450,8 +483,10 @@ class ApiService {
     );
     request.fields.addAll(fields);
 
+    _requireCurrentSession(isSessionCurrent);
     final streamedResponse = await request.send();
     final response = await http.Response.fromStream(streamedResponse);
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode == 201) {
       return _decodeObjectBody(
@@ -470,15 +505,22 @@ class ApiService {
 
   Future<void> deleteProposalForSession(
     String id,
-    SessionSnapshot session,
-  ) =>
-      _deleteProposal(id, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _deleteProposal(id, session: session, isSessionCurrent: isSessionCurrent);
 
-  Future<void> _deleteProposal(String id, [SessionSnapshot? session]) async {
+  Future<void> _deleteProposal(
+    String id, {
+    SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final response = await http.delete(
       Uri.parse('$baseUrl/proposal/$id'),
       headers: _headersFor(session),
     );
+    _requireCurrentSession(isSessionCurrent);
 
     if (response.statusCode != 204) {
       throw ApiException(
@@ -493,15 +535,23 @@ class ApiService {
   Future<String> uploadClientPhotoForSession(
     String clientId,
     String filePath,
-    SessionSnapshot session,
-  ) =>
-      _uploadClientPhoto(clientId, filePath, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _uploadClientPhoto(
+        clientId,
+        filePath,
+        session: session,
+        isSessionCurrent: isSessionCurrent,
+      );
 
   Future<String> _uploadClientPhoto(
     String clientId,
-    String filePath, [
+    String filePath, {
     SessionSnapshot? session,
-  ]) async {
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final request = http.MultipartRequest(
       'POST',
       Uri.parse('$baseUrl/photos/client/$clientId'),
@@ -509,7 +559,9 @@ class ApiService {
     request.headers.addAll(authenticatedHeadersFor(session));
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
+    _requireCurrentSession(isSessionCurrent);
     final response = await http.Response.fromStream(await request.send());
+    _requireCurrentSession(isSessionCurrent);
     if (response.statusCode != 201) {
       throw ApiException(
         _extractErrorMessage(response, 'Failed to upload photo'),
@@ -537,14 +589,21 @@ class ApiService {
 
   Future<void> deleteClientPhotoForSession(
     String photoUrl,
-    SessionSnapshot session,
-  ) =>
-      _deleteClientPhoto(photoUrl, session);
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _deleteClientPhoto(
+        photoUrl,
+        session: session,
+        isSessionCurrent: isSessionCurrent,
+      );
 
   Future<void> _deleteClientPhoto(
-    String photoUrl, [
+    String photoUrl, {
     SessionSnapshot? session,
-  ]) async {
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(isSessionCurrent);
     final resolvedUrl = resolveProtectedClientPhotoUrl(photoUrl);
     if (resolvedUrl == null) {
       throw const ApiException('Photo URL is not on the configured server.');
@@ -553,6 +612,7 @@ class ApiService {
       Uri.parse(resolvedUrl),
       headers: authenticatedHeadersFor(session),
     );
+    _requireCurrentSession(isSessionCurrent);
     if (response.statusCode != 204) {
       throw ApiException(
         _extractErrorMessage(response, 'Failed to delete photo'),

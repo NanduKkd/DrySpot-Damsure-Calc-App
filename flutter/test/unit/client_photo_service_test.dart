@@ -1,5 +1,6 @@
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/services/client_photo_service.dart';
+import 'package:app_client/src/services/session_manager.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -38,5 +39,26 @@ void main() {
       ),
       throwsArgumentError,
     );
+  });
+
+  test('session-bound photo reads retain the captured bearer token', () {
+    final apiService = ApiService(serverUrl: 'https://photos.example.test');
+    apiService.setToken('new-session-token');
+    final photoService = ClientPhotoService();
+    const session = SessionSnapshot(
+      token: 'captured-a-token',
+      userName: null,
+      franchiseeId: 'tenant-a',
+      franchiseeName: null,
+      generation: 7,
+    );
+
+    final image = photoService.buildImageProviderForSession(
+      '/api/photos/client/c1/image.jpg',
+      apiService: apiService,
+      session: session,
+    ) as NetworkImage;
+
+    expect(image.headers, {'Authorization': 'Bearer captured-a-token'});
   });
 }

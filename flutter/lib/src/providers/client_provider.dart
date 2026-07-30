@@ -12,7 +12,9 @@ import '../services/session_manager.dart';
 class ClientProvider extends ChangeNotifier {
   ClientProvider({DbService? dbService, SessionManager? sessionManager})
       : _dbService = dbService ?? DbService(),
-        _sessionManager = sessionManager;
+        _sessionManager = sessionManager {
+    _sessionManager?.addInvalidationListener(_clearForInvalidation);
+  }
 
   final DbService _dbService;
   final SessionManager? _sessionManager;
@@ -102,6 +104,22 @@ class ClientProvider extends ChangeNotifier {
     notifyListeners();
 
     if (nextSession != null) unawaited(loadClients());
+  }
+
+  void _clearForInvalidation() {
+    _sessionBound = true;
+    _session = null;
+    _clients = [];
+    _currentClientWarranties = [];
+    _currentClientProposals = [];
+    _isLoading = false;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _sessionManager?.removeInvalidationListener(_clearForInvalidation);
+    super.dispose();
   }
 
   Future<void> loadClients() async {
@@ -281,7 +299,15 @@ class ClientProvider extends ChangeNotifier {
     }
     // The server has already committed either creation or atomic replacement.
     // Mirror that result locally without creating a dirty offline delete.
-    await _dbService.replaceWarrantyFromServer(warranty);
+    if (session == null) {
+      await _dbService.replaceWarrantyFromServer(warranty);
+    } else {
+      await _dbService.replaceWarrantyFromServerForSession(
+        warranty,
+        franchiseeId: session.franchiseeId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadWarranties(warranty.clientId);
   }

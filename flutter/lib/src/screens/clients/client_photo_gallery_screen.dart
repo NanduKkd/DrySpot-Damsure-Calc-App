@@ -168,7 +168,12 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
         if (session == null) {
           await api.deleteClientPhoto(photoPath);
         } else {
-          await api.deleteClientPhotoForSession(photoPath, session);
+          await api.deleteClientPhotoForSession(
+            photoPath,
+            session,
+            isSessionCurrent: () =>
+                auth?.sessionSnapshot?.generation == session.generation,
+          );
         }
       } else {
         await widget.photoService.deletePhoto(photoPath);
@@ -223,6 +228,9 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
   Widget build(BuildContext context) {
     return Consumer<ClientProvider>(
       builder: (context, provider, _) {
+        final auth = Provider.of<AuthProvider?>(context, listen: false);
+        final session = auth?.sessionSnapshot;
+        final apiService = context.read<ApiService?>();
         final client = provider.clients.firstWhere(
           (entry) => entry.localId == widget.client.localId,
           orElse: () => widget.client,
@@ -304,11 +312,18 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(16),
                                   child: Image(
-                                    image:
-                                        widget.photoService.buildImageProvider(
-                                      photoPath,
-                                      apiService: context.read<ApiService?>(),
-                                    ),
+                                    image: session == null || apiService == null
+                                        ? widget.photoService
+                                            .buildImageProvider(
+                                            photoPath,
+                                            apiService: apiService,
+                                          )
+                                        : widget.photoService
+                                            .buildImageProviderForSession(
+                                            photoPath,
+                                            apiService: apiService,
+                                            session: session,
+                                          ),
                                     fit: BoxFit.cover,
                                     errorBuilder: (context, error, stackTrace) {
                                       return const Center(

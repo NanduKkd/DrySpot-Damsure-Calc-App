@@ -6,6 +6,7 @@ import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
 import 'api_service.dart';
+import 'session_manager.dart';
 
 class ClientPhotoService {
   ClientPhotoService({
@@ -68,6 +69,30 @@ class ClientPhotoService {
   ImageProvider<Object> buildImageProvider(
     String photoPath, {
     ApiService? apiService,
+  }) =>
+      _buildImageProvider(
+        photoPath,
+        apiService: apiService,
+        session: null,
+      );
+
+  /// Network image headers must come from the immutable session capability,
+  /// rather than the API service's mutable bearer token.
+  ImageProvider<Object> buildImageProviderForSession(
+    String photoPath, {
+    required ApiService apiService,
+    required SessionSnapshot session,
+  }) =>
+      _buildImageProvider(
+        photoPath,
+        apiService: apiService,
+        session: session,
+      );
+
+  ImageProvider<Object> _buildImageProvider(
+    String photoPath, {
+    required ApiService? apiService,
+    required SessionSnapshot? session,
   }) {
     if (isRemotePhotoPath(photoPath)) {
       final resolvedUrl = apiService?.resolveProtectedClientPhotoUrl(photoPath);
@@ -76,7 +101,7 @@ class ClientPhotoService {
       }
       return NetworkImage(
         resolvedUrl,
-        headers: apiService?.authenticatedHeaders,
+        headers: apiService?.authenticatedHeadersFor(session),
       );
     }
 

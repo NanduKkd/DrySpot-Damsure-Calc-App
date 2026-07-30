@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:printing/printing.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
@@ -64,11 +65,17 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
 
       final file = await _pdfService.generateProposalPdf(widget.client);
 
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
+
       // Upload to API
       final response = await apiService.uploadProposalForSession(
         file.path,
         {'client_id': widget.client.remoteId},
         session,
+        isSessionCurrent: () =>
+            auth.sessionSnapshot?.generation == session.generation,
       );
       if (auth.sessionSnapshot?.generation != session.generation) return;
 
@@ -105,7 +112,21 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
     required String fallbackFileName,
   }) async {
     try {
-      final bytes = await _pdfService.loadPdfBytes(pdfUrl);
+      final auth = context.read<AuthProvider>();
+      final session = auth.sessionSnapshot;
+      if (session == null ||
+          widget.client.franchiseeId != session.franchiseeId) {
+        return;
+      }
+      final bytes = await _pdfService.loadPdfBytes(
+        pdfUrl,
+        session: session,
+        isSessionCurrent: () =>
+            auth.sessionSnapshot?.generation == session.generation,
+      );
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
       final fileName = _pdfService.buildPdfFileName(
         fallbackName: fallbackFileName,
         sourceUrl: pdfUrl,
@@ -120,6 +141,50 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error sharing PDF: $e')),
+      );
+    }
+  }
+
+  Future<void> _viewPdf({
+    required String pdfUrl,
+    required String fallbackFileName,
+  }) async {
+    try {
+      final auth = context.read<AuthProvider>();
+      final session = auth.sessionSnapshot;
+      if (session == null ||
+          widget.client.franchiseeId != session.franchiseeId) {
+        return;
+      }
+      final file = await _pdfService.cachePdfFile(
+        pdfUrl: pdfUrl,
+        fallbackFileName: fallbackFileName,
+        session: session,
+        isSessionCurrent: () =>
+            auth.sessionSnapshot?.generation == session.generation,
+      );
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
+      final result = await OpenFilex.open(file.path, type: 'application/pdf');
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
+      if (result.type != ResultType.done) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              result.message.isNotEmpty
+                  ? result.message
+                  : 'No app available to open PDF.',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error opening PDF: $e')),
       );
     }
   }
@@ -227,6 +292,7 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
             'This warranty has no server ID. Sync and try again.',
           );
         }
+        if (auth.sessionSnapshot?.generation != session.generation) return;
         await context.read<ApiService>().deleteWarrantyForSession(
               id: warranty.remoteId,
               warrantyCardNumber: warranty.warrantyCardNumber,
@@ -236,6 +302,8 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
               ),
               idempotencyKey: const Uuid().v4(),
               session: session,
+              isSessionCurrent: () =>
+                  auth.sessionSnapshot?.generation == session.generation,
             );
         if (auth.sessionSnapshot?.generation != session.generation) return;
         if (!mounted) return;
@@ -283,7 +351,13 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
           return;
         }
         if (proposal.remoteId.isNotEmpty) {
-          await apiService.deleteProposalForSession(proposal.remoteId, session);
+          if (auth.sessionSnapshot?.generation != session.generation) return;
+          await apiService.deleteProposalForSession(
+            proposal.remoteId,
+            session,
+            isSessionCurrent: () =>
+                auth.sessionSnapshot?.generation == session.generation,
+          );
         }
         if (auth.sessionSnapshot?.generation != session.generation) return;
         await clientProvider.deleteProposal(
@@ -371,6 +445,11 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
                                   'warranty_${warranty.warrantyCardNumber}.pdf',
                             );
                           },
+                          onView: () => _viewPdf(
+                            pdfUrl: warranty.pdfUrl,
+                            fallbackFileName:
+                                'warranty_${warranty.warrantyCardNumber}.pdf',
+                          ),
                         );
                       },
                     ),
@@ -416,6 +495,11 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
                                   'proposal_${proposal.remoteId}.pdf',
                             );
                           },
+                          onView: () => _viewPdf(
+                            pdfUrl: proposal.pdfUrl,
+                            fallbackFileName:
+                                'proposal_${proposal.remoteId}.pdf',
+                          ),
                         );
                       },
                     ),

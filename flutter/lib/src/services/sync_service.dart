@@ -37,13 +37,6 @@ class SyncService {
     this.sessionManager,
   }) : dbService = dbService ?? DbService();
 
-  String _syncKeyForFranchisee(String? franchiseeId) {
-    if (franchiseeId == null || franchiseeId.isEmpty) {
-      return 'last_sync_time';
-    }
-    return 'last_sync_time_$franchiseeId';
-  }
-
   Set<String> _outcomeIds(dynamic outcomes, String collection, String status) {
     final values = outcomes is Map ? outcomes[collection] : null;
     if (values is! List) return {};
@@ -64,6 +57,16 @@ class SyncService {
     if (!_isCurrent(session)) throw const StaleSessionException();
   }
 
+  Future<T> _writeForCurrent<T>(
+    SessionSnapshot? session,
+    Future<T> Function() write,
+  ) async {
+    _requireCurrent(session);
+    final result = await write();
+    _requireCurrent(session);
+    return result;
+  }
+
   Future<Map<String, dynamic>> _requestV1(
     Map<String, dynamic> data,
     SessionSnapshot? session,
@@ -71,7 +74,11 @@ class SyncService {
     _requireCurrent(session);
     return session == null
         ? apiService.sync(data)
-        : apiService.syncForSession(data, session);
+        : apiService.syncForSession(
+            data,
+            session,
+            isSessionCurrent: () => _isCurrent(session),
+          );
   }
 
   Future<Map<String, dynamic>> _requestV2(
@@ -81,7 +88,11 @@ class SyncService {
     _requireCurrent(session);
     return session == null
         ? apiService.syncV2(data)
-        : apiService.syncV2ForSession(data, session);
+        : apiService.syncV2ForSession(
+            data,
+            session,
+            isSessionCurrent: () => _isCurrent(session),
+          );
   }
 
   Future<String> _uploadPhoto(
@@ -92,14 +103,23 @@ class SyncService {
     _requireCurrent(session);
     return session == null
         ? apiService.uploadClientPhoto(clientId, path)
-        : apiService.uploadClientPhotoForSession(clientId, path, session);
+        : apiService.uploadClientPhotoForSession(
+            clientId,
+            path,
+            session,
+            isSessionCurrent: () => _isCurrent(session),
+          );
   }
 
   Future<void> _deleteProposal(String id, SessionSnapshot? session) {
     _requireCurrent(session);
     return session == null
         ? apiService.deleteProposal(id)
-        : apiService.deleteProposalForSession(id, session);
+        : apiService.deleteProposalForSession(
+            id,
+            session,
+            isSessionCurrent: () => _isCurrent(session),
+          );
   }
 
   Future<void> sync([SessionSnapshot? requestedSession]) async {
@@ -183,11 +203,11 @@ class SyncService {
     // unbound branch remains solely for historical isolated service tests;
     // it preserves their old mock surface and is never used by the app.
     final enforceSessionBoundary = sessionManager != null;
-    final syncTimeKey = _syncKeyForFranchisee(activeFranchiseeId);
-    // Never fall back to the device-wide legacy cursor. It has no tenant
-    // owner; a tenant with no cursor safely starts from its own bootstrap.
-    final lastSyncTime =
-        shouldFilterByFranchise ? prefs.getString(syncTimeKey) : null;
+    // Never read or write a device-wide preference cursor. The v1 fallback
+    // shares APP-111's tenant-owned SQLite sync state with v2.
+    final lastSyncTime = shouldFilterByFranchise && enforceSessionBoundary
+        ? await dbService.getSyncV1Cursor(activeFranchiseeId)
+        : null;
     final warrantyTombstoneCursor = shouldFilterByFranchise
         ? await dbService.getWarrantyTombstoneCursor(activeFranchiseeId)
         : '0';
@@ -383,8 +403,15 @@ class SyncService {
       );
       if (canonicalPhotos.length == client.photos.length) {
         if (photosChanged) {
-          _requireCurrent(session);
-          await dbService.updateClient(clientForPayload);
+          await _writeForCurrent(
+            session,
+            () => sessionManager == null
+                ? dbService.updateClient(clientForPayload)
+                : dbService.updateClientForSession(
+                    clientForPayload,
+                    isSessionCurrent: () => _isCurrent(session),
+                  ),
+          );
         }
         clientsToMarkSynced.add(clientForPayload);
       }
@@ -431,6 +458,9 @@ class SyncService {
     final submittedWarrantiesByRemoteId = {
       for (final warranty in warrantiesToSync) warranty.remoteId: warranty,
     };
+    final submittedClientsByRemoteId = {
+      for (final client in clientsToMarkSynced) client.remoteId: client,
+    };
 
     if (shouldFilterByFranchise) {
       final nextCursor = response['warranty_tombstone_cursor']?.toString();
@@ -458,17 +488,23 @@ class SyncService {
       // commit, so a crash cannot advance past an unapplied tombstone.
       _requireCurrent(session);
       if (sessionManager != null) {
-        await dbService.applyWarrantyTombstonesAndCursorForSession(
-          tombstones,
-          franchiseeId: activeFranchiseeId,
-          cursor: parsedCursor.toString(),
-          isSessionCurrent: () => _isCurrent(session),
+        await _writeForCurrent(
+          session,
+          () => dbService.applyWarrantyTombstonesAndCursorForSession(
+            tombstones,
+            franchiseeId: activeFranchiseeId,
+            cursor: parsedCursor.toString(),
+            isSessionCurrent: () => _isCurrent(session),
+          ),
         );
       } else {
-        await dbService.applyWarrantyTombstonesAndCursor(
-          tombstones,
-          franchiseeId: activeFranchiseeId,
-          cursor: parsedCursor.toString(),
+        await _writeForCurrent(
+          session,
+          () => dbService.applyWarrantyTombstonesAndCursor(
+            tombstones,
+            franchiseeId: activeFranchiseeId,
+            cursor: parsedCursor.toString(),
+          ),
         );
       }
     }
@@ -478,6 +514,7 @@ class SyncService {
       // Clients
       for (var clientMap in updates['clients']) {
         final remoteId = clientMap['remote_id'];
+        final submittedClient = submittedClientsByRemoteId[remoteId];
         final existingClient = shouldFilterByFranchise && enforceSessionBoundary
             ? await dbService.getClientByRemoteIdForFranchisee(
                 remoteId,
@@ -486,9 +523,25 @@ class SyncService {
             : await dbService.getClientByRemoteId(remoteId);
 
         if (clientMap['deleted_at'] != null) {
-          if (existingClient != null) {
-            _requireCurrent(session);
-            await dbService.softDeleteClient(existingClient.localId!);
+          if (existingClient != null && !existingClient.isDirty) {
+            await _writeForCurrent(
+              session,
+              () => sessionManager == null
+                  ? dbService.softDeleteClient(existingClient.localId!)
+                  : dbService.writeForSession(
+                      table: 'clients',
+                      values: {
+                        'deleted_at': clientMap['deleted_at'],
+                        'is_dirty': 0,
+                      },
+                      where: 'local_id = ? AND franchisee_id = ?',
+                      whereArgs: [
+                        existingClient.localId,
+                        activeFranchiseeId,
+                      ],
+                      isSessionCurrent: () => _isCurrent(session),
+                    ),
+            );
           }
         } else {
           if (shouldFilterByFranchise) {
@@ -508,13 +561,57 @@ class SyncService {
                   isDirty: true,
                 );
           if (existingClient != null) {
-            _requireCurrent(session);
-            await dbService.updateClient(
-              clientFromServer.copyWith(localId: existingClient.localId),
-            );
+            if (submittedClient != null && appliedClients.contains(remoteId)) {
+              // The response can acknowledge only the exact revision sent.
+              // A local N+1 edit must survive an in-flight N response.
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.applyClientFromServerIfUnchanged(
+                        clientFromServer.copyWith(
+                          localId: existingClient.localId,
+                        ),
+                        franchiseeId: activeFranchiseeId!,
+                        submittedUpdatedAt:
+                            submittedClient.updatedAt.toIso8601String(),
+                      )
+                    : dbService.applyClientFromServerIfUnchangedForSession(
+                        clientFromServer.copyWith(
+                          localId: existingClient.localId,
+                        ),
+                        franchiseeId: activeFranchiseeId!,
+                        submittedUpdatedAt:
+                            submittedClient.updatedAt.toIso8601String(),
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            } else if (!existingClient.isDirty || submittedClient == null) {
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.updateClient(
+                        clientFromServer.copyWith(
+                          localId: existingClient.localId,
+                        ),
+                      )
+                    : dbService.updateClientForSession(
+                        clientFromServer.copyWith(
+                          localId: existingClient.localId,
+                        ),
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            }
           } else {
-            _requireCurrent(session);
-            await dbService.insertClient(clientFromServer);
+            await _writeForCurrent(
+              session,
+              () => sessionManager == null
+                  ? dbService.insertClient(clientFromServer)
+                  : dbService.insertClientForSession(
+                      clientFromServer,
+                      isSessionCurrent: () => _isCurrent(session),
+                    ),
+            );
           }
         }
       }
@@ -538,21 +635,55 @@ class SyncService {
         if (client != null) {
           if (itemMap['deleted_at'] != null) {
             if (existingItem != null) {
-              _requireCurrent(session);
-              await dbService.softDeleteItem(existingItem.localId!);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteItem(existingItem.localId!)
+                    : dbService.writeForSession(
+                        table: 'items',
+                        values: {
+                          'deleted_at': itemMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: 'local_id = ?',
+                        whereArgs: [existingItem.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           } else {
             final item = Item.fromMap(
               itemMap,
             ).copyWith(clientId: client.localId, isDirty: false);
             if (existingItem != null) {
-              _requireCurrent(session);
-              await dbService.updateItem(
-                item.copyWith(localId: existingItem.localId),
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.updateItem(
+                        item.copyWith(localId: existingItem.localId),
+                      )
+                    : dbService.writeForSession(
+                        table: 'items',
+                        values: item
+                            .copyWith(localId: existingItem.localId)
+                            .toMap(),
+                        where: 'local_id = ?',
+                        whereArgs: [existingItem.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
               );
             } else {
-              _requireCurrent(session);
-              await dbService.insertItem(item);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.insertItem(item)
+                    : dbService.writeForSession(
+                        table: 'items',
+                        values: item.toMap(),
+                        insert: true,
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           }
         }
@@ -577,21 +708,55 @@ class SyncService {
         if (item != null) {
           if (rectMap['deleted_at'] != null) {
             if (existingRect != null) {
-              _requireCurrent(session);
-              await dbService.softDeleteRectangle(existingRect.localId!);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteRectangle(existingRect.localId!)
+                    : dbService.writeForSession(
+                        table: 'rectangles',
+                        values: {
+                          'deleted_at': rectMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: 'local_id = ?',
+                        whereArgs: [existingRect.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           } else {
             final rect = Rectangle.fromMap(
               rectMap,
             ).copyWith(itemId: item.localId, isDirty: false);
             if (existingRect != null) {
-              _requireCurrent(session);
-              await dbService.updateRectangle(
-                rect.copyWith(localId: existingRect.localId),
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.updateRectangle(
+                        rect.copyWith(localId: existingRect.localId),
+                      )
+                    : dbService.writeForSession(
+                        table: 'rectangles',
+                        values: rect
+                            .copyWith(localId: existingRect.localId)
+                            .toMap(),
+                        where: 'local_id = ?',
+                        whereArgs: [existingRect.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
               );
             } else {
-              _requireCurrent(session);
-              await dbService.insertRectangle(rect);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.insertRectangle(rect)
+                    : dbService.writeForSession(
+                        table: 'rectangles',
+                        values: rect.toMap(),
+                        insert: true,
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           }
         }
@@ -609,10 +774,23 @@ class SyncService {
           );
           if (priceMap['deleted_at'] != null) {
             if (existing != null && existing.localId != null) {
-              _requireCurrent(session);
-              await dbService.deleteDefaultPrice(
-                existing.localId!,
-                franchiseeId: activeFranchiseeId,
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.deleteDefaultPrice(
+                        existing.localId!,
+                        franchiseeId: activeFranchiseeId,
+                      )
+                    : dbService.writeForSession(
+                        table: 'default_prices',
+                        values: {
+                          'deleted_at': priceMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: 'local_id = ? AND franchisee_id = ?',
+                        whereArgs: [existing.localId, activeFranchiseeId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
               );
             }
             continue;
@@ -622,16 +800,35 @@ class SyncService {
             priceMap,
           ).copyWith(franchiseeId: activeFranchiseeId, isDirty: false);
           if (existing == null) {
-            _requireCurrent(session);
-            await dbService.insertDefaultPrice(
-              price,
-              franchiseeId: activeFranchiseeId,
+            await _writeForCurrent(
+              session,
+              () => sessionManager == null
+                  ? dbService.insertDefaultPrice(
+                      price,
+                      franchiseeId: activeFranchiseeId,
+                    )
+                  : dbService.writeForSession(
+                      table: 'default_prices',
+                      values: price.toMap(),
+                      insert: true,
+                      isSessionCurrent: () => _isCurrent(session),
+                    ),
             );
           } else {
-            _requireCurrent(session);
-            await dbService.updateDefaultPrice(
-              price.copyWith(localId: existing.localId),
-              franchiseeId: activeFranchiseeId,
+            await _writeForCurrent(
+              session,
+              () => sessionManager == null
+                  ? dbService.updateDefaultPrice(
+                      price.copyWith(localId: existing.localId),
+                      franchiseeId: activeFranchiseeId,
+                    )
+                  : dbService.writeForSession(
+                      table: 'default_prices',
+                      values: price.copyWith(localId: existing.localId).toMap(),
+                      where: 'local_id = ? AND franchisee_id = ?',
+                      whereArgs: [existing.localId, activeFranchiseeId],
+                      isSessionCurrent: () => _isCurrent(session),
+                    ),
             );
           }
         }
@@ -673,23 +870,62 @@ class SyncService {
             final submitted = submittedWarrantiesByRemoteId[remoteId];
             if (existingWarranty != null) {
               if (submitted == null) {
-                _requireCurrent(session);
-                await dbService.updateWarranty(
-                  warranty.copyWith(localId: existingWarranty.localId),
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateWarranty(
+                          warranty.copyWith(localId: existingWarranty.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'warranties',
+                          values: warranty
+                              .copyWith(localId: existingWarranty.localId)
+                              .toMap(),
+                          where: 'local_id = ?',
+                          whereArgs: [existingWarranty.localId],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
                 );
               } else if (appliedWarranties.contains(remoteId)) {
                 // Applying the server echo is itself compare-and-set. A local
                 // edit made after request capture must survive both response
                 // application and the later dirty-clear acknowledgement.
-                _requireCurrent(session);
-                await dbService.applyWarrantyFromServerIfUnchanged(
-                  warranty.copyWith(localId: existingWarranty.localId),
-                  submittedUpdatedAt: submitted.updatedAt.toIso8601String(),
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.applyWarrantyFromServerIfUnchanged(
+                          warranty.copyWith(localId: existingWarranty.localId),
+                          submittedUpdatedAt:
+                              submitted.updatedAt.toIso8601String(),
+                        )
+                      : dbService.writeForSession(
+                          table: 'warranties',
+                          values: warranty
+                              .copyWith(localId: existingWarranty.localId)
+                              .toMap(),
+                          where: '''
+                            local_id = ? AND updated_at = ? AND is_dirty = 1
+                          ''',
+                          whereArgs: [
+                            existingWarranty.localId,
+                            submitted.updatedAt.toIso8601String(),
+                          ],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
                 );
               }
             } else if (submitted == null) {
-              _requireCurrent(session);
-              await dbService.insertWarranty(warranty);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.insertWarranty(warranty)
+                    : dbService.writeForSession(
+                        table: 'warranties',
+                        values: warranty.toMap(),
+                        insert: true,
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           }
         }
@@ -715,98 +951,185 @@ class SyncService {
         if (client != null) {
           if (proposalMap['deleted_at'] != null) {
             if (existingProposal != null) {
-              _requireCurrent(session);
-              await dbService.softDeleteProposal(existingProposal.localId!);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteProposal(existingProposal.localId!)
+                    : dbService.writeForSession(
+                        table: 'proposals',
+                        values: {
+                          'deleted_at': proposalMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: 'local_id = ?',
+                        whereArgs: [existingProposal.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           } else {
             final proposal = Proposal.fromMap(
               proposalMap,
             ).copyWith(clientId: client.localId!, isDirty: false);
             if (existingProposal != null) {
-              _requireCurrent(session);
-              await dbService.updateProposal(
-                proposal.copyWith(localId: existingProposal.localId),
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.updateProposal(
+                        proposal.copyWith(localId: existingProposal.localId),
+                      )
+                    : dbService.writeForSession(
+                        table: 'proposals',
+                        values: proposal
+                            .copyWith(localId: existingProposal.localId)
+                            .toMap(),
+                        where: 'local_id = ?',
+                        whereArgs: [existingProposal.localId],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
               );
             } else {
-              _requireCurrent(session);
-              await dbService.insertProposal(proposal);
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.insertProposal(proposal)
+                    : dbService.writeForSession(
+                        table: 'proposals',
+                        values: proposal.toMap(),
+                        insert: true,
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
             }
           }
         }
       }
     }
 
+    Future<int> markAsSynced(
+      String table,
+      String remoteId, {
+      required String submittedUpdatedAt,
+    }) =>
+        sessionManager == null
+            ? dbService.markAsSynced(
+                table,
+                remoteId,
+                franchiseeId: activeFranchiseeId,
+                submittedUpdatedAt: submittedUpdatedAt,
+              )
+            : dbService.markAsSyncedForSession(
+                table,
+                remoteId,
+                franchiseeId: activeFranchiseeId,
+                submittedUpdatedAt: submittedUpdatedAt,
+                isSessionCurrent: () => _isCurrent(session),
+              );
+
     // 4. Clear dirty flags for records we just sent
     for (var c in clientsToMarkSynced) {
       if (appliedClients.contains(c.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'clients',
-          c.remoteId,
-          submittedUpdatedAt: c.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'clients',
+            c.remoteId,
+            submittedUpdatedAt: c.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
     for (var i in itemsToSync) {
       if (appliedItems.contains(i.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'items',
-          i.remoteId,
-          submittedUpdatedAt: i.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'items',
+            i.remoteId,
+            submittedUpdatedAt: i.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
     for (var r in rectanglesToSync) {
       if (appliedRectangles.contains(r.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'rectangles',
-          r.remoteId,
-          submittedUpdatedAt: r.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'rectangles',
+            r.remoteId,
+            submittedUpdatedAt: r.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
     for (final price in dirtyDefaultPrices) {
       if (appliedDefaultPrices.contains(price.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'default_prices',
-          price.remoteId,
-          franchiseeId: activeFranchiseeId,
-          submittedUpdatedAt: price.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'default_prices',
+            price.remoteId,
+            submittedUpdatedAt: price.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
     for (var w in warrantiesToSync) {
       if (tombstonedWarranties.contains(w.remoteId)) {
-        _requireCurrent(session);
-        await dbService.hardDeleteWarrantyByRemoteId(w.remoteId);
+        await _writeForCurrent(
+          session,
+          () => sessionManager == null
+              ? dbService.hardDeleteWarrantyByRemoteId(w.remoteId)
+              : dbService.writeForSession(
+                  table: 'warranties',
+                  values: const {},
+                  delete: true,
+                  where: '''
+                    remote_id = ?
+                    AND client_id IN (
+                      SELECT local_id FROM clients WHERE franchisee_id = ?
+                    )
+                  ''',
+                  whereArgs: [w.remoteId, activeFranchiseeId],
+                  isSessionCurrent: () => _isCurrent(session),
+                ),
+        );
       } else if (appliedWarranties.contains(w.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'warranties',
-          w.remoteId,
-          submittedUpdatedAt: w.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'warranties',
+            w.remoteId,
+            submittedUpdatedAt: w.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
     for (var p in proposalsToSync) {
       if (appliedProposals.contains(p.remoteId)) {
-        _requireCurrent(session);
-        await dbService.markAsSynced(
-          'proposals',
-          p.remoteId,
-          submittedUpdatedAt: p.updatedAt.toIso8601String(),
+        await _writeForCurrent(
+          session,
+          () => markAsSynced(
+            'proposals',
+            p.remoteId,
+            submittedUpdatedAt: p.updatedAt.toIso8601String(),
+          ),
         );
       }
     }
 
-    // 5. Save sync time
+    // 5. Save the v1 compatibility cursor in the tenant-owned APP-111 state.
     _requireCurrent(session);
-    await prefs.setString(syncTimeKey, serverTime);
-    if (syncTimeKey != 'last_sync_time') {
-      await prefs.remove('last_sync_time');
+    if (shouldFilterByFranchise && sessionManager != null) {
+      await _writeForCurrent(
+        session,
+        () => dbService.setSyncV1CursorForSession(
+          activeFranchiseeId,
+          serverTime,
+          isSessionCurrent: () => _isCurrent(session),
+        ),
+      );
     }
   }
 

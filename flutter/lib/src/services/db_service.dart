@@ -11,6 +11,7 @@ import '../models/warranty.dart';
 import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
 import 'lww_protocol.dart';
+import 'session_manager.dart';
 
 class DbService {
   static final DbService _instance = DbService._internal();
@@ -29,6 +30,83 @@ class DbService {
     if (_database != null) return _database!;
     _database = await _initDatabase();
     return _database!;
+  }
+
+  /// Performs one session-bound SQLite mutation.  The final generation
+  /// validation deliberately lives inside the transaction callback, after the
+  /// last awaited write and before commit.  That is the rollback fence used by
+  /// V1 response application for mutations that do not need model-specific
+  /// local-LWW bookkeeping.
+  Future<int> writeForSession({
+    required String table,
+    required bool Function() isSessionCurrent,
+    required Map<String, dynamic> values,
+    String? where,
+    List<Object?>? whereArgs,
+    bool insert = false,
+    bool delete = false,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = delete
+          ? await transaction.delete(table, where: where, whereArgs: whereArgs)
+          : insert
+              ? await transaction.insert(table, values)
+              : await transaction.update(
+                  table,
+                  values,
+                  where: where,
+                  whereArgs: whereArgs,
+                );
+      // Throwing from this callback makes sqflite roll back [changed].
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> updateClientForSession(
+    Client client, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = await transaction.update(
+        'clients',
+        client.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [client.localId],
+      );
+      if (changed == 1 && client.localId != null) {
+        await _syncPendingClientPhotos(transaction, client.localId!);
+      }
+      if (changed == 1 && client.isDirty && client.localId != null) {
+        await _markLocalLwwMutation(transaction, 'clients', client.localId!);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> insertClientForSession(
+    Client client, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final id = await transaction.insert('clients', client.toMap());
+      await _syncPendingClientPhotos(transaction, id);
+      if (client.isDirty) {
+        await _markLocalLwwMutation(transaction, 'clients', id);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return id;
+    });
   }
 
   Future<Database> _initDatabase() async {
@@ -848,6 +926,58 @@ class DbService {
     });
   }
 
+  /// Applies a v1 server echo only when the exact dirty revision that was
+  /// submitted is still present. This prevents an in-flight N response from
+  /// overwriting a user edit made locally as N+1.
+  Future<int> applyClientFromServerIfUnchanged(
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+  }) async {
+    final db = await database;
+    return db.update(
+      'clients',
+      client.toMap(),
+      where: '''
+        remote_id = ? AND franchisee_id = ?
+        AND updated_at = ? AND is_dirty = 1
+      ''',
+      whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
+    );
+  }
+
+  Future<int> applyClientFromServerIfUnchangedForSession(
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) {
+        throw const StaleSessionException();
+      }
+      final changed = await transaction.update(
+        'clients',
+        client.toMap(),
+        where: '''
+          remote_id = ? AND franchisee_id = ?
+          AND updated_at = ? AND is_dirty = 1
+        ''',
+        whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
+      );
+      // The last validation occurs in the transaction callback, immediately
+      // before SQLite commits. A logout during the awaited update rolls back.
+      if (!isSessionCurrent()) {
+        throw const StaleSessionException();
+      }
+      return changed;
+    });
+  }
+
   Future<List<Map<String, String>>> getPendingClientPhotos(
     String franchiseeId,
   ) async {
@@ -978,6 +1108,12 @@ class DbService {
         where: 'local_id = ?',
         whereArgs: [rows.first['local_id']],
       );
+      // The acknowledgement removes a queue row and rewrites the client.
+      // Check after both writes, still inside this transaction, so logout
+      // cannot commit either half of a stale upload outcome.
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
       return true;
     });
   }
@@ -1646,10 +1782,24 @@ class DbService {
 
   Future<int> hardDeleteWarrantyByRemoteId(String remoteId) async {
     final db = await database;
+    return db
+        .delete('warranties', where: 'remote_id = ?', whereArgs: [remoteId]);
+  }
+
+  Future<int> hardDeleteWarrantyByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
     return db.delete(
       'warranties',
-      where: 'remote_id = ?',
-      whereArgs: [remoteId],
+      where: '''
+        remote_id = ?
+        AND client_id IN (
+          SELECT local_id FROM clients WHERE franchisee_id = ?
+        )
+      ''',
+      whereArgs: [remoteId, franchiseeId],
     );
   }
 
@@ -1681,6 +1831,73 @@ class DbService {
     });
   }
 
+  /// Mirrors a server-authoritative warranty only within its owning tenant.
+  ///
+  /// A remote-id collision owned by another tenant is quarantined: neither
+  /// tenant's row is guessed, replaced, or deleted.  This is intentionally a
+  /// separate entry point so old, pre-session test schemas can retain their
+  /// historical helper while session-bound UI never uses the global lookup.
+  Future<bool> replaceWarrantyFromServerForSession(
+    Warranty warranty, {
+    required String franchiseeId,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final owner = await transaction.query(
+        'clients',
+        columns: ['local_id'],
+        where: 'local_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
+        whereArgs: [warranty.clientId, franchiseeId],
+        limit: 1,
+      );
+      if (owner.isEmpty) return false;
+      final foreign = await transaction.rawQuery(
+        '''
+        SELECT w.local_id
+        FROM warranties w
+        JOIN clients c ON c.local_id = w.client_id
+        WHERE w.remote_id = ? AND c.franchisee_id <> ?
+        LIMIT 1
+        ''',
+        [warranty.remoteId, franchiseeId],
+      );
+      if (foreign.isNotEmpty) return false;
+      final existing = await transaction.rawQuery(
+        '''
+        SELECT w.local_id
+        FROM warranties w
+        JOIN clients c ON c.local_id = w.client_id
+        WHERE w.remote_id = ? AND c.franchisee_id = ?
+        LIMIT 1
+        ''',
+        [warranty.remoteId, franchiseeId],
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      await transaction.delete(
+        'warranties',
+        where: 'client_id = ? AND remote_id <> ?',
+        whereArgs: [warranty.clientId, warranty.remoteId],
+      );
+      if (existing.isEmpty) {
+        await transaction.insert('warranties', warranty.toMap());
+      } else {
+        await transaction.update(
+          'warranties',
+          warranty.copyWith(localId: existing.first['local_id'] as int).toMap(),
+          where: 'local_id = ?',
+          whereArgs: [existing.first['local_id']],
+        );
+      }
+      // This runs in the transaction callback after the final write, so an
+      // invalidation during SQLite I/O rolls every mutation back.
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return true;
+    });
+  }
+
   Future<int> applyWarrantyFromServerIfUnchanged(
     Warranty warranty, {
     required String submittedUpdatedAt,
@@ -1704,10 +1921,25 @@ class DbService {
         tombstone.toMap(),
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
+      final hasClients = (await transaction.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'clients'",
+      ))
+          .isNotEmpty;
       await transaction.delete(
         'warranties',
-        where: 'remote_id = ?',
-        whereArgs: [tombstone.warrantyId],
+        where: hasClients
+            ? '''
+                remote_id = ?
+                AND client_id IN (
+                  SELECT local_id FROM clients WHERE franchisee_id = ?
+                )
+              '''
+            // Only compatibility tests/migration fixtures lack ownership
+            // metadata. The production schema always takes the scoped path.
+            : 'remote_id = ?',
+        whereArgs: hasClients
+            ? [tombstone.warrantyId, tombstone.franchiseeId]
+            : [tombstone.warrantyId],
       );
     });
   }
@@ -1765,6 +1997,10 @@ class DbService {
       if (isSessionCurrent?.call() == false) {
         throw StateError('A stale session cannot apply warranty tombstones.');
       }
+      final hasClients = (await transaction.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'clients'",
+      ))
+          .isNotEmpty;
       for (final tombstone in tombstones) {
         if (isSessionCurrent?.call() == false) {
           throw StateError('A stale session cannot apply warranty tombstones.');
@@ -1779,8 +2015,17 @@ class DbService {
         );
         await transaction.delete(
           'warranties',
-          where: 'remote_id = ?',
-          whereArgs: [tombstone.warrantyId],
+          where: hasClients
+              ? '''
+                  remote_id = ?
+                  AND client_id IN (
+                    SELECT local_id FROM clients WHERE franchisee_id = ?
+                  )
+                '''
+              : 'remote_id = ?',
+          whereArgs: hasClients
+              ? [tombstone.warrantyId, franchiseeId]
+              : [tombstone.warrantyId],
         );
       }
       if (isSessionCurrent?.call() == false) {
@@ -1793,6 +2038,9 @@ class DbService {
             'value': cursor,
           },
           conflictAlgorithm: ConflictAlgorithm.replace);
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
+      }
     });
   }
 
@@ -1898,6 +2146,46 @@ class DbService {
       'sync_v2_cursor:$franchiseeId';
   String _syncV2EnabledKey(String franchiseeId) =>
       'sync_v2_enabled:$franchiseeId';
+  String _syncV1CursorKey(String franchiseeId) =>
+      'sync_v1_cursor:$franchiseeId';
+
+  /// V1 compatibility cursors live in APP-111's tenant-scoped sync state,
+  /// never in device-wide SharedPreferences.
+  Future<String?> getSyncV1Cursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV1CursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['value'] as String;
+  }
+
+  Future<void> setSyncV1CursorForSession(
+    String franchiseeId,
+    String cursor, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) {
+      throw StateError('A stale session cannot advance a sync cursor.');
+    }
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (!isSessionCurrent()) {
+        throw StateError('A stale session cannot advance a sync cursor.');
+      }
+      await transaction.insert(
+        'sync_state',
+        {'key': _syncV1CursorKey(franchiseeId), 'value': cursor},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      if (!isSessionCurrent()) {
+        throw StateError('A stale session cannot advance a sync cursor.');
+      }
+    });
+  }
 
   Future<bool> isSyncV2Enabled(String franchiseeId) async {
     final db = await database;
@@ -2045,15 +2333,115 @@ class DbService {
   Future<Map<String, Object?>?> _existingRemoteRow(
     DatabaseExecutor executor,
     String table,
-    String remoteId,
-  ) async {
-    final rows = await executor.query(
-      table,
-      where: 'remote_id = ?',
-      whereArgs: [remoteId],
-      limit: 1,
-    );
+    String remoteId, {
+    required String franchiseeId,
+  }) async {
+    final rows = switch (table) {
+      'clients' || 'default_prices' => await executor.query(
+          table,
+          where: 'remote_id = ? AND franchisee_id = ?',
+          whereArgs: [remoteId, franchiseeId],
+          limit: 1,
+        ),
+      'items' => await executor.rawQuery(
+          '''
+          SELECT i.* FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE i.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'rectangles' => await executor.rawQuery(
+          '''
+          SELECT r.* FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE r.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'warranties' => await executor.rawQuery(
+          '''
+          SELECT w.* FROM warranties w
+          JOIN clients c ON c.local_id = w.client_id
+          WHERE w.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'proposals' => await executor.rawQuery(
+          '''
+          SELECT p.* FROM proposals p
+          JOIN clients c ON c.local_id = p.client_id
+          WHERE p.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      _ => throw ArgumentError('Unknown tenant-owned table: $table'),
+    };
     return rows.isEmpty ? null : rows.first;
+  }
+
+  /// A server identity collision cannot be safely attached to another tenant.
+  /// The caller discards it rather than selecting, reassigning, or deleting
+  /// the foreign row. This only returns an existence bit, never foreign data.
+  Future<bool> _hasForeignRemoteRow(
+    DatabaseExecutor executor,
+    String table,
+    String remoteId, {
+    required String franchiseeId,
+  }) async {
+    final rows = switch (table) {
+      'clients' || 'default_prices' => await executor.query(
+          table,
+          columns: ['local_id'],
+          where: 'remote_id = ? AND franchisee_id <> ?',
+          whereArgs: [remoteId, franchiseeId],
+          limit: 1,
+        ),
+      'items' => await executor.rawQuery(
+          '''
+          SELECT i.local_id FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE i.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'rectangles' => await executor.rawQuery(
+          '''
+          SELECT r.local_id FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE r.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'warranties' => await executor.rawQuery(
+          '''
+          SELECT w.local_id FROM warranties w
+          JOIN clients c ON c.local_id = w.client_id
+          WHERE w.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'proposals' => await executor.rawQuery(
+          '''
+          SELECT p.local_id FROM proposals p
+          JOIN clients c ON c.local_id = p.client_id
+          WHERE p.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      _ => throw ArgumentError('Unknown tenant-owned table: $table'),
+    };
+    return rows.isNotEmpty;
   }
 
   Future<int> _ownedParentLocalId(
@@ -2187,7 +2575,25 @@ class DbService {
   }) async {
     final table = collection;
     final remoteId = record['remote_id'] as String;
-    final existing = await _existingRemoteRow(executor, table, remoteId);
+    if ((collection == 'clients' || collection == 'default_prices') &&
+        record['franchisee_id'] != franchiseeId) {
+      throw const FormatException('V2 response crossed tenant ownership.');
+    }
+    final existing = await _existingRemoteRow(
+      executor,
+      table,
+      remoteId,
+      franchiseeId: franchiseeId,
+    );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          table,
+          remoteId,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
     final submittedChangeId = submittedChangeIds[remoteId];
     final localPendingChangeId = existing?['pending_change_id']?.toString();
     final exactSubmitted =
@@ -2276,11 +2682,6 @@ class DbService {
         throw const FormatException('V2 response changed an immutable parent.');
       }
     }
-    if ((collection == 'clients' || collection == 'default_prices') &&
-        record['franchisee_id'] != franchiseeId) {
-      throw const FormatException('V2 response crossed tenant ownership.');
-    }
-
     final metadata = _serverMetadata(record);
     if (!replaceMutable) {
       final dirtyMetadata = <String, Object?>{...metadata};
@@ -2414,7 +2815,17 @@ class DbService {
       executor,
       'warranties',
       record['remote_id'] as String,
+      franchiseeId: franchiseeId,
     );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          'warranties',
+          record['remote_id'] as String,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
     if (existing != null &&
         existing['client_id'] != parentRows.first['local_id']) {
       throw const FormatException('V2 warranty changed an immutable parent.');
@@ -2464,7 +2875,17 @@ class DbService {
       executor,
       'proposals',
       record['remote_id'] as String,
+      franchiseeId: franchiseeId,
     );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          'proposals',
+          record['remote_id'] as String,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
     if (existing != null &&
         existing['client_id'] != parentRows.first['local_id']) {
       throw const FormatException('V2 proposal changed an immutable parent.');
@@ -2653,8 +3074,13 @@ class DbService {
         );
         await transaction.delete(
           'warranties',
-          where: 'remote_id = ?',
-          whereArgs: [tombstone.warrantyId],
+          where: '''
+            remote_id = ?
+            AND client_id IN (
+              SELECT local_id FROM clients WHERE franchisee_id = ?
+            )
+          ''',
+          whereArgs: [tombstone.warrantyId, franchiseeId],
         );
       }
       for (final collection in _lwwTables) {
@@ -2711,7 +3137,15 @@ class DbService {
             },
             conflictAlgorithm: ConflictAlgorithm.replace);
       }
+      // This is the final check inside the transaction callback. Throwing
+      // here aborts every response/cursor mutation rather than committing a
+      // result that belongs to a logged-out session.
+      requireCurrent();
     });
+    // Check again after SQLite finishes the transaction/commit boundary. The
+    // caller then treats a concurrent sign-out as stale even if it happened
+    // while the database runtime was completing the final commit.
+    requireCurrent();
   }
 
   Future<List<Client>> getDirtyClients() async {
@@ -2859,20 +3293,90 @@ class DbService {
     required String submittedUpdatedAt,
   }) async {
     final db = await database;
-    final tenantScoped = table == 'default_prices';
-    if (tenantScoped && (franchiseeId == null || franchiseeId.isEmpty)) {
-      throw ArgumentError('A franchisee is required for default-price sync');
-    }
+    return _markAsSyncedWithExecutor(
+      db,
+      table,
+      remoteId,
+      franchiseeId: franchiseeId,
+      submittedUpdatedAt: submittedUpdatedAt,
+    );
+  }
+
+  Future<int> markAsSyncedForSession(
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = await _markAsSyncedWithExecutor(
+        transaction,
+        table,
+        remoteId,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> _markAsSyncedWithExecutor(
+    DatabaseExecutor db,
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+  }) async {
+    final tenantScoped = franchiseeId != null && franchiseeId.isNotEmpty;
     final values = <String, Object?>{'is_dirty': 0};
     if (await _supportsLww(db, table)) {
       values.addAll(_clearPendingLww);
     }
+    final where = switch (table) {
+      'clients' || 'default_prices' => tenantScoped
+          ? 'remote_id = ? AND franchisee_id = ? AND updated_at = ? AND is_dirty = 1'
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'items' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND client_id IN (
+                SELECT local_id FROM clients WHERE franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'rectangles' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND item_id IN (
+                SELECT i.local_id
+                FROM items i
+                JOIN clients c ON c.local_id = i.client_id
+                WHERE c.franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'warranties' || 'proposals' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND client_id IN (
+                SELECT local_id FROM clients WHERE franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      _ => throw ArgumentError('Unknown sync table: $table'),
+    };
     return db.update(
       table,
       values,
-      where: tenantScoped
-          ? 'remote_id = ? AND franchisee_id = ? AND updated_at = ? AND is_dirty = 1'
-          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      where: where,
       whereArgs: tenantScoped
           ? [remoteId, franchiseeId, submittedUpdatedAt]
           : [remoteId, submittedUpdatedAt],
