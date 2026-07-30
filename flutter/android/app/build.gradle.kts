@@ -1,4 +1,7 @@
 import java.io.FileInputStream
+import java.net.URI
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import java.util.Properties
 
 plugins {
@@ -30,6 +33,35 @@ val releaseSigningProblems = buildList {
 }
 val hasCompleteReleaseSigning = releaseSigningProblems.isEmpty()
 
+fun stagingOriginFromDartDefines(): String? {
+    val encoded = project.findProperty("dart-defines")?.toString() ?: return null
+    return encoded.split(',').mapNotNull { value ->
+        runCatching { String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8) }.getOrNull()
+    }.firstOrNull { value -> value.startsWith("DAMSURE_STAGING_ORIGIN=") }
+        ?.removePrefix("DAMSURE_STAGING_ORIGIN=")
+}
+
+fun flutterAppFlavorFromDartDefines(): String? {
+    val encoded = project.findProperty("dart-defines")?.toString() ?: return null
+    return encoded.split(',').mapNotNull { value ->
+        runCatching { String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8) }.getOrNull()
+    }.firstOrNull { value -> value.startsWith("FLUTTER_APP_FLAVOR=") }
+        ?.removePrefix("FLUTTER_APP_FLAVOR=")
+}
+
+fun requireStagingOriginAtCompileTime() {
+    val origin = stagingOriginFromDartDefines()
+    check(!origin.isNullOrBlank()) {
+        "Staging builds require --dart-define=DAMSURE_STAGING_ORIGIN=https://staging-host"
+    }
+    val uri = runCatching { URI(origin) }.getOrNull()
+    check(uri != null && uri.scheme == "https" && uri.host != null && uri.port == -1 &&
+        (uri.path.isNullOrEmpty() || uri.path == "/") && uri.query == null && uri.fragment == null &&
+        uri.userInfo == null) {
+        "DAMSURE_STAGING_ORIGIN must be an HTTPS origin without path, port, credentials, query, or fragment"
+    }
+}
+
 android {
     namespace = "com.dryspotuppala"
     compileSdk = flutter.compileSdkVersion
@@ -50,6 +82,20 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+    }
+
+    flavorDimensions += "environment"
+    productFlavors {
+        create("production") {
+            dimension = "environment"
+            applicationId = "com.dryspotuppala"
+            resValue("string", "app_name", "DrySpot Uppala")
+        }
+        create("staging") {
+            dimension = "environment"
+            applicationId = "com.dryspotuppala.staging"
+            resValue("string", "app_name", "DrySpot Uppala Staging")
+        }
     }
 
     signingConfigs {
@@ -76,6 +122,13 @@ android {
 // Do not silently produce an unsigned/debug-signed release artifact.  Values
 // are intentionally never included in this diagnostic.
 tasks.configureEach {
+    if (name.startsWith("compileFlutterBuildStaging")) {
+        doFirst {
+            if (flutterAppFlavorFromDartDefines() == "staging") {
+                requireStagingOriginAtCompileTime()
+            }
+        }
+    }
     if (name in setOf("assembleRelease", "bundleRelease", "packageRelease", "signReleaseBundle")) {
         doFirst {
             check(hasCompleteReleaseSigning) {
