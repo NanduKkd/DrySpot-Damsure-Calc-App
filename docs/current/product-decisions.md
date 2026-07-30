@@ -58,6 +58,15 @@ Last reconciled: 30 July 2026
 - The legacy global sync cursor is discarded rather than attributed to a later account. APP-111 owns the tenant cursor store and atomic pull/cursor migration.
 - This policy prevents cross-account app access; it does not claim protection against a rooted, stolen, or forensically inspected device.
 
+### PD-011 — Sync recovery is explicit and tenant-scoped
+
+- APP-112 presents sync status as a projection of APP-111 outcomes; it does not create another conflict rule or cursor.
+- Last successful sync is recorded only after server acknowledgement and the local apply/cursor transaction completes.
+- Pending record/photo counts, notices, attempts, and recovery actions are scoped to the immutable APP-106 tenant/session snapshot.
+- Reconnect never uploads silently. It reports that connectivity is restored and requires an explicit retry.
+- A sync run is single-flight, preserves dirty data for retryable and correctable failures, and maps authentication, authorization, validation, required-update, network, local-storage, and protocol failures to typed user-safe actions.
+- Photo upload uses a durable tenant-scoped idempotency key so an ambiguous response can be retried without creating a duplicate server file.
+
 ### PD-001 — Warranty deletion is permanent and user-confirmed
 
 - Replacing or deleting a warranty must require an explicit confirmation that names the warranty and explains that the warranty record and stored PDF cannot be recovered.

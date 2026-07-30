@@ -15,7 +15,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
 | APP-110 | 8 | P0 | T3 | In progress | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
 | APP-111 | 8 | P0 | T3 | Contract frozen | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
-| APP-112 | 8 | P1 | T2 | Pending | Sync status and recovery UX | APP-111 |
+| APP-112 | 8 | P1 | T2 | Contract frozen; queued | Sync status and recovery UX | PD-011; APP-106; APP-111 |
 | APP-113 | 9 | P0 | T3 | Pending | Optional and required Android updater | APP-104; APP-107 test endpoint |
 
 ## Task contracts
@@ -197,6 +197,7 @@ Frozen contract summary:
 | APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Integrated as `7575cc7`; 8 focused tests and analyze pass |
 | APP-108 | Portfolio manager | `019fb3bd-1ebf-7130-8fc2-1458f6351c36` | Read-only T3 contract frozen; implementation serialized behind APP-110 |
 | APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
+| APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
 
 Integrated evidence at `7319450`:
 
@@ -242,6 +243,16 @@ Acceptance:
 - Authentication, network, validation, and required-update failures are distinguished.
 
 Gates: provider/service tests, focused widget tests, offline/reconnect proof, and user validation.
+
+Frozen contract summary:
+
+- A typed, immutable sync view state is bound to APP-106's tenant and session generation. Stale-session results change no database, cursor, provider, or UI state.
+- The UI shows the last server-confirmed successful apply, current phase, tenant-only dirty-record/photo counts, APP-111 outcome summaries, and unresolved recovery actions.
+- Reconnect is informational and requires a manual retry. Runs are single-flight and never clear dirty data from an aggregate HTTP success.
+- Applied, already-applied, superseded, rejected, permanently-deleted, and unauthorized outcomes retain APP-111's exact local semantics and receive distinct user-safe explanations.
+- Authentication, authorization, validation, required-update, network, local-storage, and unexpected protocol failures have typed recovery actions; raw exception/server text is never shown.
+- Photo uploads gain a stable tenant-scoped idempotency key and durable queue so a lost success response cannot create a duplicate asset on retry.
+- Automatic/background sync, merge/diff UI, restoring a losing edit, and changes to APP-111 ordering/cursor rules are excluded.
 
 ### APP-113 — Optional and required Android updater
 
