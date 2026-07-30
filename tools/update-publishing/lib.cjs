@@ -114,7 +114,7 @@ async function lockRecord(lockPath) {
 async function assertProtectedLockDirectory(ledgerPath) {
   const directory = await assertNoSymlinkPath(path.dirname(ledgerPath)); const stat = await fs.lstat(directory);
   const uid = typeof process.getuid === 'function' ? process.getuid() : null;
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (uid !== null && stat.uid !== uid)) fail('lock state requires an operator-owned 0700 non-symlink directory');
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || (uid !== null && stat.uid !== uid)) fail('lock state requires an operator-owned 0700 non-symlink directory');
   return directory;
 }
 async function removeOwnedLock(lockPath, expected) {
@@ -170,7 +170,12 @@ async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} }
   if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size === 0) fail('lock recovery receipt is invalid');
   const guard = await createRecoveryGuard(ledgerPath);
   const lock = `${ledgerPath}.lock`;
-  const recorded = await lockRecord(lock); if (!recorded) fail(`lock recovery cannot read owner record; manual recovery required: ${guard}`);
+  const recorded = await lockRecord(lock);
+  if (!recorded) {
+    const empty = await fs.readdir(lock).catch(() => null);
+    if (empty && empty.length === 0) { await fs.rmdir(lock); await fs.unlink(guard); return { recoveredEmptyOwnerWindow: true }; }
+    fail(`lock recovery cannot read owner record; manual recovery required: ${guard}`);
+  }
   const owner = recorded.owner;
   if (!Number.isInteger(owner.pid) || typeof owner.nonce !== 'string' || typeof owner.acquiredAt !== 'string') fail('lock recovery owner record is incomplete');
   try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
