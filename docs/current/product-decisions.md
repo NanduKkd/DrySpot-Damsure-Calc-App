@@ -41,6 +41,14 @@ Last reconciled: 30 July 2026
 - Pull synchronization uses a tenant-scoped monotonic cursor, not `updated_at`.
 - Warranty deletion is the permanent exception: an APP-110 tombstone defeats every later mutation, and a historically used warranty UUID cannot be reused by another tenant.
 
+### PD-009 — User administration is CLI-first
+
+- APP-108 delivers a compiled server-side operator CLI over a reusable administration service. Web administration, invitations, and self-service password recovery are separately scoped.
+- Production operators use named Unix/SSH accounts and personal keys. A root-owned wrapper and restricted sudo rule map the operating-system identity to an explicit franchisee allow-list.
+- No public admin route or mobile administration screen is added.
+- Creation, deactivation, reactivation, password reset, and token revocation are transactional, idempotent, tenant-scoped, and append an immutable audit event.
+- Initial/reset credentials are generated securely or read from a no-echo TTY/stdin path, displayed once on `/dev/tty`, and never placed in arguments, logs, JSON, or audit data.
+
 ### PD-001 — Warranty deletion is permanent and user-confirmed
 
 - Replacing or deleting a warranty must require an explicit confirmation that names the warranty and explains that the warranty record and stored PDF cannot be recovered.
@@ -84,5 +92,4 @@ Roadmap assumption: retain one active login at a time. A separate task will hard
 
 ## Decisions still required
 
-1. User administration surface: operator CLI, web admin UI, or both.
-2. Shared-device policy: retain hidden tenant data, encrypt it, or offer a local wipe on logout.
+1. Shared-device policy: retain hidden tenant data, encrypt it, or offer a local wipe on logout.
