@@ -4,7 +4,8 @@ import {
   managedFileCleanupPolicy,
   managedFilePath,
   queueManagedFileCleanup,
-  reconcileManagedFileCleanup,
+  reconcileDueManagedFileCleanup,
+  reconcileManagedFileCleanupByStorageKeys,
   retryExhaustedManagedFileCleanup,
 } from './managedFileCleanup';
 
@@ -28,7 +29,7 @@ describe('managed file cleanup outbox', () => {
       await queueManagedFileCleanup('photo', photo, transaction);
     });
     expect(await ManagedFileCleanup.count({ where: { storageKey: photo } })).toBe(1);
-    expect(await reconcileManagedFileCleanup({ storageKeys: [photo] })).toEqual({
+    expect(await reconcileManagedFileCleanupByStorageKeys([photo])).toEqual({
       attempted: 1,
       deleted: 1,
       failed: 0,
@@ -41,7 +42,7 @@ describe('managed file cleanup outbox', () => {
       await queueManagedFileCleanup('photo', failingPhoto, transaction);
     });
     const unlink = jest.spyOn(fs.promises, 'unlink').mockRejectedValueOnce(new Error('storage offline'));
-    await reconcileManagedFileCleanup({ storageKeys: [failingPhoto] });
+    await reconcileManagedFileCleanupByStorageKeys([failingPhoto]);
     const retained = await ManagedFileCleanup.findOne({ where: { storageKey: failingPhoto } });
     expect(retained?.attempts).toBe(1);
     expect(retained?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now() + managedFileCleanupPolicy.initialBackoffMs - 2_000);
@@ -57,12 +58,37 @@ describe('managed file cleanup outbox', () => {
       nextAttemptAt: new Date(),
     });
     const unlink = jest.spyOn(fs.promises, 'unlink').mockRejectedValueOnce(new Error('storage offline'));
-    expect((await reconcileManagedFileCleanup({ storageKeys: [exhaustedPhoto] })).exhausted).toBe(1);
+    expect((await reconcileManagedFileCleanupByStorageKeys([exhaustedPhoto])).exhausted).toBe(1);
     expect((await ManagedFileCleanup.findOne({ where: { storageKey: exhaustedPhoto } }))?.exhaustedAt).not.toBeNull();
     expect((await retryExhaustedManagedFileCleanup())[0]).toBeGreaterThanOrEqual(1);
     const requeued = await ManagedFileCleanup.findOne({ where: { storageKey: exhaustedPhoto } });
     expect(requeued?.attempts).toBe(0);
     expect(requeued?.exhaustedAt).toBeNull();
+    unlink.mockRestore();
+    await ManagedFileCleanup.destroy({ where: { storageKey: exhaustedPhoto } });
+  });
+
+  it('does not process global due work for an empty request scope, but does for explicit global reconciliation', async () => {
+    const duePhoto = '00000000-0000-0000-0000-000000009904.jpg';
+    await sequelize.transaction(async (transaction) => {
+      await queueManagedFileCleanup('photo', duePhoto, transaction);
+    });
+    const unlink = jest.spyOn(fs.promises, 'unlink');
+    expect(await reconcileManagedFileCleanupByStorageKeys([])).toEqual({
+      attempted: 0,
+      deleted: 0,
+      failed: 0,
+      exhausted: 0,
+    });
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await ManagedFileCleanup.count({ where: { storageKey: duePhoto } })).toBe(1);
+
+    expect(await reconcileDueManagedFileCleanup()).toEqual({
+      attempted: 1,
+      deleted: 1,
+      failed: 0,
+      exhausted: 0,
+    });
     unlink.mockRestore();
   });
 });

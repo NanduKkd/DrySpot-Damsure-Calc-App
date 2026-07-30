@@ -4,7 +4,7 @@ import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Warranty, Client, sequelize } from '../models';
 import { removeUploadedFile } from '../middleware/uploadMiddleware';
-import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
+import { queueManagedFileCleanup, reconcileManagedFileCleanupByStorageKeys } from '../services/managedFileCleanup';
 
 const pdfUrlFor = (id: string) => `/api/warranty/${id}/download`;
 
@@ -91,9 +91,9 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 				{ transaction },
 			);
 		});
-		await reconcileManagedFileCleanup({
-			storageKeys: replacedPdfs.map(({ pdfFileName }) => pdfFileName).filter(Boolean) as string[],
-		});
+		await reconcileManagedFileCleanupByStorageKeys(
+			replacedPdfs.map(({ pdfFileName }) => pdfFileName).filter(Boolean) as string[],
+		);
 		return res.status(201).json(warranty);
 	} catch (error: any) {
 		await removeUploadedFile(file);
@@ -148,6 +148,9 @@ export const deleteWarranty = async (req: AuthRequest, res: Response) => {
 		await warranty.destroy({ transaction });
 		await queueManagedFileCleanup('pdf', warranty.pdfFileName, transaction);
 	});
-	await reconcileManagedFileCleanup({ storageKeys: warranty.pdfFileName ? [warranty.pdfFileName] : [], limit: 1 });
+	await reconcileManagedFileCleanupByStorageKeys(
+		warranty.pdfFileName ? [warranty.pdfFileName] : [],
+		1,
+	);
 	return res.status(204).send();
 };

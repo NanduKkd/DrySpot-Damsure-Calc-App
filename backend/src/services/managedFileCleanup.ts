@@ -84,16 +84,31 @@ const reconcileOne = async (job: ManagedFileCleanup): Promise<CleanupResult> => 
   }
 };
 
-/** Process only due, non-exhausted rows. Missing files are successful cleanup. */
-export const reconcileManagedFileCleanup = async ({
-  storageKeys,
+const emptyCleanupResult = (): CleanupResult => ({ attempted: 0, deleted: 0, failed: 0, exhausted: 0 });
+
+/** Process only the explicitly named managed files. An empty request scope is a no-op. */
+export const reconcileManagedFileCleanupByStorageKeys = async (
+  storageKeys: string[],
   limit = 100,
-}: { storageKeys?: string[]; limit?: number } = {}): Promise<CleanupResult> => {
+): Promise<CleanupResult> => {
+  const uniqueStorageKeys = [...new Set(storageKeys)];
+  if (!uniqueStorageKeys.length) return emptyCleanupResult();
   const where: any = {
     exhaustedAt: null,
     nextAttemptAt: { [Op.lte]: new Date() },
+    storageKey: { [Op.in]: uniqueStorageKeys },
   };
-  if (storageKeys?.length) where.storageKey = { [Op.in]: [...new Set(storageKeys)] };
+  return reconcileDueManagedFileCleanup({ where, limit });
+};
+
+/** Explicitly process all due, non-exhausted rows; use only from operator jobs. */
+export const reconcileDueManagedFileCleanup = async ({
+  limit = 100,
+  where = {
+    exhaustedAt: null,
+    nextAttemptAt: { [Op.lte]: new Date() },
+  },
+}: { limit?: number; where?: any } = {}): Promise<CleanupResult> => {
   const jobs = await ManagedFileCleanup.findAll({
     where,
     order: [['nextAttemptAt', 'ASC'], ['createdAt', 'ASC']],
@@ -107,7 +122,7 @@ export const reconcileManagedFileCleanup = async ({
       failed: total.failed + result.failed,
       exhausted: total.exhausted + result.exhausted,
     }),
-    { attempted: 0, deleted: 0, failed: 0, exhausted: 0 },
+    emptyCleanupResult(),
   );
 };
 

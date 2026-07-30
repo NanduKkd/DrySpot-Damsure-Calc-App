@@ -2,7 +2,7 @@ import { Response } from 'express';
 import { Op } from 'sequelize';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Client, Item, Rectangle, DefaultPrice, Warranty, Proposal, sequelize } from '../models';
-import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
+import { queueManagedFileCleanup, reconcileManagedFileCleanupByStorageKeys } from '../services/managedFileCleanup';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
@@ -397,9 +397,10 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		}
 		await transaction.commit();
 		committed = true;
-		await reconcileManagedFileCleanup({
-			storageKeys: [...storedPdfsToRemove, ...storedPhotosToRemove],
-		});
+		await reconcileManagedFileCleanupByStorageKeys([
+			...storedPdfsToRemove,
+			...storedPhotosToRemove,
+		]);
 
 		// 2. Fetch updates for the client
 		const syncTime = last_sync_time ? new Date(last_sync_time) : new Date(0);

@@ -29,7 +29,7 @@ const main = async () => {
     const [updated] = await cleanup.retryExhaustedManagedFileCleanup();
     console.log(`Requeued ${updated} exhausted managed-file cleanup row(s).`);
   }
-  console.log(JSON.stringify(await cleanup.reconcileManagedFileCleanup({ limit: parsedLimit })));
+  console.log(JSON.stringify(await cleanup.reconcileDueManagedFileCleanup({ limit: parsedLimit })));
 };
 
 let closeDatabase: (() => Promise<void>) | undefined;

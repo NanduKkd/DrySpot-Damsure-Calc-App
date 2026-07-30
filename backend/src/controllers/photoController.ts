@@ -4,7 +4,7 @@ import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Client, sequelize } from '../models';
 import { removeUploadedPhoto } from '../middleware/photoUploadMiddleware';
-import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
+import { queueManagedFileCleanup, reconcileManagedFileCleanupByStorageKeys } from '../services/managedFileCleanup';
 
 const uploadsDirectory = path.join(__dirname, '../../uploads');
 const opaqueFilename = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:jpg|png|webp)$/i;
@@ -99,7 +99,7 @@ export const deletePhoto = async (req: AuthRequest, res: Response) => {
     committed = true;
     // Metadata deletion remains authoritative; cleanup failures are retained
     // by the transactionally-created outbox row for an operator retry.
-    await reconcileManagedFileCleanup({ storageKeys: [filename], limit: 1 });
+    await reconcileManagedFileCleanupByStorageKeys([filename], 1);
     return res.status(204).send();
   } catch (error) {
     if (!committed) await transaction.rollback();

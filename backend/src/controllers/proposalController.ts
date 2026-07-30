@@ -4,7 +4,7 @@ import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Proposal, Client, sequelize } from '../models';
 import { removeUploadedFile } from '../middleware/uploadMiddleware';
-import { queueManagedFileCleanup, reconcileManagedFileCleanup } from '../services/managedFileCleanup';
+import { queueManagedFileCleanup, reconcileManagedFileCleanupByStorageKeys } from '../services/managedFileCleanup';
 
 const pdfUrlFor = (id: string) => `/api/proposal/${id}/download`;
 
@@ -49,6 +49,6 @@ export const deleteProposal = async (req: AuthRequest, res: Response) => {
     await proposal.destroy({ transaction });
     await queueManagedFileCleanup('pdf', proposal.pdfFileName, transaction);
   });
-  await reconcileManagedFileCleanup({ storageKeys: proposal.pdfFileName ? [proposal.pdfFileName] : [], limit: 1 });
+  await reconcileManagedFileCleanupByStorageKeys(proposal.pdfFileName ? [proposal.pdfFileName] : [], 1);
   return res.status(204).send();
 };
