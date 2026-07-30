@@ -10,7 +10,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-104 | 3 | P0 | T2 | Integrated and verified locally | Update manifest and enforcement contract | PD-003; PD-005 |
 | APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
 | APP-106 | 4 | P0 | T2 | Contract frozen; queued | Shared-device session hardening | PD-010; APP-111 |
-| APP-107 | 5 | P0 | T2 | Contract frozen; externally blocked | Update publishing and hosting workflow | APP-104; staging host; signing backup; pilot |
+| APP-107 | 5 | P0 | T2 | Integrated and independently verified locally; external rollout gated | Update publishing and hosting workflow | APP-104; staging host; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Contract frozen; queued | User provisioning and lifecycle MVP | PD-009; APP-110 integration |
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
 | APP-110 | 8 | P0 | T3 | Integrated and independently verified locally | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
@@ -209,7 +209,7 @@ Frozen contract summary:
 | APP-106 | Portfolio manager | `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75` | Read-only T2 contract frozen; implementation follows APP-111 |
 | APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
 | APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
-| APP-107 | Portfolio manager | `019fb3ee-3c42-79d2-b3d4-1b6a718ec025` | Read-only T2 publication/staging contract frozen; production activation remains externally blocked |
+| APP-107 | Portfolio manager | Design `019fb3ee-3c42-79d2-b3d4-1b6a718ec025`; implementation `019fb3f2-1ad3-7062-9093-e35a4404421a`; verifier `019fb3ff-648b-7480-8816-9798720b993f` | Integrated as `7c224ff` + `18e5ee4` + `fe767ca` + `427e207` + `f836f9f` + `7588b5f` + `0202f20` + `7878b9b`; exact candidate `f523ec3` passed independent local verification; staging, signing, pilot, approval, and production activation remain external |
 
 Integrated evidence at `7319450`:
 

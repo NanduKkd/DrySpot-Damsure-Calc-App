@@ -37,7 +37,7 @@ The next delivery program is documented in three durable records:
 
 ### Active delivery integration (2026-07-30)
 
-The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-102 measurement deletion confirmation, APP-103 Android permission minimization, APP-104 strict update-manifest parsing, APP-105 Unicode PDF fonts, APP-109 durable managed-file cleanup, and APP-110 sync-safe permanent warranty deletion. APP-110 passed independent exact-tip T3 verification; APP-106, APP-108, APP-111, and APP-112 contracts are frozen.
+The local `codex/product-roadmap` integration lane now includes APP-101 measurement validation, APP-102 measurement deletion confirmation, APP-103 Android permission minimization, APP-104 strict update-manifest parsing, APP-105 Unicode PDF fonts, APP-107 local update-publication tooling, APP-109 durable managed-file cleanup, and APP-110 sync-safe permanent warranty deletion. APP-107 and APP-110 passed independent exact-tip verification; APP-107 remains unpublished and externally gated. APP-106, APP-108, APP-111, and APP-112 contracts are frozen.
 
 - Integrated backend gate: lint exits successfully with warnings; 15 suites / 65 tests pass; build passes.
 - Integrated Flutter gate: 102 tests pass; `flutter analyze` reports no issues.
@@ -47,6 +47,8 @@ The local `codex/product-roadmap` integration lane now includes APP-101 measurem
 - Current manager-branch gate after APP-102/APP-104 integration: backend 15 suites / 65 tests and TypeScript build pass with lint warnings only; Flutter 122 tests pass and analysis reports no issues. APP-110 is deliberately not included in this checkpoint.
 - Current manager-branch gate after APP-110 integration: backend 17 suites / 78 tests and TypeScript build pass with 110 lint warnings and no errors; Flutter 132 tests pass and analysis reports no issues.
 - APP-110's PostgreSQL guard/migration/concurrency proof and final independent verifier passed. Production-shaped rehearsal, APP-109 operator recovery proof, and the physical two-device deletion/replacement scenario remain rollout evidence.
+- Current manager-branch gate after APP-107 integration: backend remains green at 17 suites / 78 tests and TypeScript build; the production Flutter set passes 133 tests, the staging parser passes its flavor-bound test, and analysis reports no issues. APP-107's publication suite passes 24/24 with zero skips; Nginx, production-isolation, and Gradle release guards pass.
+- APP-107's exact candidate `f523ec3` passed independent local verification within the documented operator-owned `0700` state-directory boundary. No artifact or manifest was published. Staging-host/Nginx endpoint proof, protected signing material and backup restoration, named approval, and a production-signed physical-device pilot remain mandatory external gates.
 
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
