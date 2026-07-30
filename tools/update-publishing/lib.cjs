@@ -106,9 +106,10 @@ async function atomicWriteJson(filePath, value, fsOps = fs) {
 }
 async function lockRecord(lockPath) {
   const stat = await fs.lstat(lockPath).catch(() => null);
-  const body = await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8').catch(() => null);
-  if (!stat || !stat.isDirectory() || !body) return null;
-  try { return { stat, owner: JSON.parse(body) }; } catch { return null; }
+  const ownerPath = path.join(lockPath, 'owner.json'); const ownerStat = await fs.lstat(ownerPath).catch(() => null);
+  const body = await fs.readFile(ownerPath, 'utf8').catch(() => null);
+  if (!stat || !stat.isDirectory() || !ownerStat || !ownerStat.isFile() || ownerStat.isSymbolicLink() || !body) return null;
+  try { return { stat, ownerStat, body, owner: JSON.parse(body) }; } catch { return null; }
 }
 async function claimExistingLock(lock, purpose, expected) {
   const before = await lockRecord(lock);
@@ -119,24 +120,64 @@ async function claimExistingLock(lock, purpose, expected) {
   if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) {
     return null;
   }
-  return claim;
+  return { path: claim, ...actual };
 }
 async function removeVerifiedClaim(claim, expected, hooks = {}) {
-  await hooks.beforeClaimCleanup?.(claim);
-  const actual = await lockRecord(claim);
-  if (!actual || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce) fail(`claimed lock changed; manual recovery required: ${claim}`);
-  // The pathname is a freshly generated result of our atomic rename, never the
-  // shared active lock. Recheck immediately before removing only that claim.
-  await fs.rm(claim, { recursive: true, force: false });
+  const verify = async () => {
+    const actual = await lockRecord(claim.path); const entries = await fs.readdir(claim.path).catch(() => null);
+    if (!actual || !entries || entries.length !== 1 || entries[0] !== 'owner.json' || actual.stat.ino !== expected.inode || actual.owner.nonce !== expected.nonce || actual.ownerStat.ino !== expected.ownerInode || actual.body !== expected.ownerBody) fail(`claimed lock changed; manual recovery required: ${claim.path}`);
+    return actual;
+  };
+  await hooks.beforeClaimCleanup?.(claim.path); await verify(); await hooks.beforeMetadataClaim?.(claim.path); await verify();
+  const metadataClaim = `${claim.path}.owner.${crypto.randomUUID()}`;
+  await fs.rename(path.join(claim.path, 'owner.json'), metadataClaim);
+  const metadata = await fs.lstat(metadataClaim).catch(() => null); const metadataBody = await fs.readFile(metadataClaim, 'utf8').catch(() => null);
+  if (!metadata || !metadata.isFile() || metadata.isSymbolicLink() || metadata.ino !== expected.ownerInode || metadataBody !== expected.ownerBody) fail(`claimed lock metadata changed; manual recovery required: ${claim.path}`);
+  await hooks.beforeClaimRmdir?.(claim.path); const directory = await fs.lstat(claim.path).catch(() => null);
+  if (!directory || !directory.isDirectory() || directory.ino !== expected.inode) fail(`claimed lock directory changed; manual recovery required: ${claim.path}`);
+  await fs.rmdir(claim.path);
+  await fs.unlink(metadataClaim);
 }
 function recoveryGuardPath(ledgerPath) { return `${ledgerPath}.recovery-guard.json`; }
 async function assertNoRecoveryGuard(ledgerPath) {
   if (await fs.lstat(recoveryGuardPath(ledgerPath)).catch(() => null)) fail(`ledger recovery guard is present; manual recovery required: ${recoveryGuardPath(ledgerPath)}`);
 }
 async function createRecoveryGuard(ledgerPath) {
-  const guard = recoveryGuardPath(ledgerPath); const value = { schemaVersion: 1, nonce: crypto.randomUUID(), createdAt: new Date().toISOString() };
+  const guard = recoveryGuardPath(ledgerPath); const value = { schemaVersion: 2, nonce: crypto.randomUUID(), createdAt: new Date().toISOString(), lockPath: `${ledgerPath}.lock`, quarantine: null };
   try { await fs.writeFile(guard, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' }); } catch (error) { if (error.code === 'EEXIST') fail(`ledger recovery guard is already present; manual recovery required: ${guard}`); throw error; }
   return guard;
+}
+async function readRecoveryGuard(guardPath) {
+  const stat = await fs.lstat(guardPath).catch(() => null); const body = await fs.readFile(guardPath, 'utf8').catch(() => null);
+  if (!stat || !stat.isFile() || stat.isSymbolicLink() || !body) fail(`recovery guard is invalid; manual recovery required: ${guardPath}`);
+  let guard; try { guard = JSON.parse(body); } catch { fail(`recovery guard is invalid; manual recovery required: ${guardPath}`); }
+  const keys = ['schemaVersion', 'nonce', 'createdAt', 'lockPath', 'quarantine'];
+  if (Object.keys(guard).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(guard, key)) || guard.schemaVersion !== 2 || typeof guard.nonce !== 'string' || !guard.nonce || typeof guard.createdAt !== 'string' || typeof guard.lockPath !== 'string' || !Object.prototype.hasOwnProperty.call(guard, 'quarantine')) fail(`recovery guard is invalid; manual recovery required: ${guardPath}`);
+  if (guard.quarantine !== null) { const quarantineKeys = ['path', 'inode', 'nonce', 'ownerInode', 'ownerBody']; if (!guard.quarantine || Object.getPrototypeOf(guard.quarantine) !== Object.prototype || Object.keys(guard.quarantine).length !== quarantineKeys.length || quarantineKeys.some((key) => !Object.prototype.hasOwnProperty.call(guard.quarantine, key)) || typeof guard.quarantine.path !== 'string' || !Number.isInteger(guard.quarantine.inode) || typeof guard.quarantine.nonce !== 'string' || !Number.isInteger(guard.quarantine.ownerInode) || typeof guard.quarantine.ownerBody !== 'string') fail(`recovery guard is invalid; manual recovery required: ${guardPath}`); }
+  return { stat, body, guard };
+}
+async function retainGuardClaim(guardPath, claim) {
+  const current = await readRecoveryGuard(guardPath);
+  const quarantine = { path: claim.path, inode: claim.stat.ino, nonce: claim.owner.nonce, ownerInode: claim.ownerStat.ino, ownerBody: claim.body };
+  await atomicWriteJson(guardPath, { ...current.guard, quarantine });
+}
+async function resolveRecoveryGuard({ ledgerPath, guardNonce, acknowledgement, hooks = {} }) {
+  if (acknowledgement !== 'RESOLVE-RECOVERY-GUARD') fail('guard resolution requires --acknowledge RESOLVE-RECOVERY-GUARD');
+  const guardPath = recoveryGuardPath(ledgerPath); const current = await readRecoveryGuard(guardPath);
+  if (guardNonce !== current.guard.nonce) fail('guard resolution token does not match');
+  if (current.guard.lockPath !== `${ledgerPath}.lock`) fail('guard resolution lock binding is invalid');
+  if (await fs.lstat(current.guard.lockPath).catch(() => null)) fail('guard resolution refuses while an active lock or successor exists');
+  if (current.guard.quarantine) {
+    const claim = { path: current.guard.quarantine.path }; const expected = current.guard.quarantine;
+    if (!claim.path.startsWith(`${ledgerPath}.lock.recovery-claim.`)) fail('guard quarantine binding is invalid');
+    const record = await lockRecord(claim.path); if (!record || record.stat.ino !== expected.inode || record.owner.nonce !== expected.nonce || record.ownerStat.ino !== expected.ownerInode || record.body !== expected.ownerBody) fail('guard quarantine changed; manual recovery required');
+    try { process.kill(record.owner.pid, 0); fail('guard resolution refuses while a recorded publisher is live'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    await removeVerifiedClaim(claim, expected, hooks);
+  }
+  await hooks.beforeGuardCleanup?.(guardPath); const finalGuard = await readRecoveryGuard(guardPath);
+  if (finalGuard.stat.ino !== current.stat.ino || finalGuard.body !== current.body) fail('recovery guard changed; manual recovery required');
+  await fs.unlink(guardPath);
+  return { resolved: true, guardNonce };
 }
 async function assertLockOwnership(lock, owner, inode) {
   const current = await lockRecord(lock);
@@ -146,8 +187,8 @@ async function releaseLedgerLock(lock, owner, inode, hooks = {}) {
   await hooks.beforeReleaseClaim?.();
   const claim = await claimExistingLock(lock, 'released', { inode, nonce: owner.nonce });
   if (!claim) return false;
-  await hooks.afterReleaseClaim?.(claim);
-  await removeVerifiedClaim(claim, { inode, nonce: owner.nonce }, hooks);
+  await hooks.afterReleaseClaim?.(claim.path);
+  await removeVerifiedClaim(claim, { inode, nonce: owner.nonce, ownerInode: claim.ownerStat.ino, ownerBody: claim.body }, hooks);
   return true;
 }
 async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} } = {}) {
@@ -166,11 +207,13 @@ async function recoverLedgerLock(ledgerPath, recoveryReceiptPath, { hooks = {} }
   // PID liveness is checked only after the atomic claim. A live (including
   // reused) PID leaves the claim and guard for an operator; it is never put
   // back over the active pathname.
-  try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  await hooks.afterRecoveryClaim?.(claimed);
-  await removeVerifiedClaim(claimed, { inode: recorded.stat.ino, nonce: owner.nonce }, hooks);
-  await fs.rm(guard, { force: false });
-  return claimed;
+  try {
+    try { process.kill(owner.pid, 0); fail(`lock recovery refused: recorded PID is currently live; manual recovery required: ${guard}`); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    await hooks.afterRecoveryClaim?.(claimed.path);
+    await removeVerifiedClaim(claimed, { inode: recorded.stat.ino, nonce: owner.nonce, ownerInode: claimed.ownerStat.ino, ownerBody: claimed.body }, hooks);
+    await fs.unlink(guard);
+    return claimed.path;
+  } catch (error) { await retainGuardClaim(guard, claimed).catch(() => {}); throw error; }
 }
 async function withLedgerLock(ledgerPath, callback, { waitLockMs = 5000, lockHooks = {} } = {}, deadline = Date.now() + waitLockMs) {
   const lock = `${ledgerPath}.lock`;
@@ -366,4 +409,4 @@ async function recoverPublication({ target, ledgerPath, environment, root, origi
   }, lockOptions);
 }
 
-module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, recoverLedgerLock, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, strictManifestBytes, manifestSha256, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, validateToolManifest, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };
+module.exports = { LEGACY_DISABLED_MANIFEST, PRODUCTION_ORIGIN, PACKAGE_IDS, emptyLedger, readLedger, atomicWriteJson, withLedgerLock, recoverLedgerLock, resolveRecoveryGuard, reserveVersionCode, reserveVersionCodeAtPath, buildManifest, canonicalManifestIdentity, strictManifestBytes, manifestSha256, applyPublishedManifest, basicArtifactMetadata, validateTrustedExecutable, validateToolManifest, verifyApkArtifact, LocalReleaseTarget, publishToLocalFixture, recoverPublication, canonicalUtc, normalizeOrigin, secureLedgerAndRoot };

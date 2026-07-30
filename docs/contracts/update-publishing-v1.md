@@ -139,8 +139,8 @@ disabled v1 policy; never delete an APK first or restore legacy/older metadata.
 Schema-v2 ledgers bind the canonical non-symlink release root, origin, and
 environment. Every mutation takes an auditable sibling `.lock` directory with
 PID, UTC acquisition time, and nonce. A live lock waits only briefly before a
-clear error; a stale lock needs explicit `--break-stale-lock` and is retained
-under a unique stale name. This serializes separate processes and prevents
+clear error; stale-lock handling is only through the explicit local
+`recover-lock` command described below. This serializes separate processes and prevents
 same-code or same-revision split-brain.
 
 Before a non-dry-run publish, a durable pending-publication journal stores the
@@ -175,6 +175,33 @@ renamed back over the active pathname. `recover-lock` is an explicit
 operator action requiring a local recovery receipt and a non-live recorded PID;
 PID reuse remains fail-closed because liveness is not treated as proof of a
 crash.
+
+After reviewing a local non-empty recovery receipt, an operator may run:
+
+```bash
+node tools/update-publishing/publish.cjs recover-lock \
+  --environment staging --ledger /secure/staging-ledger.json \
+  --fixture-root "$fixture_root" --origin https://staging.example.invalid \
+  --lock-recovery-receipt /secure/operator-recovery-receipt.txt
+```
+
+If that command retains a guard, normal work and further lock recovery remain
+blocked. Do not remove files manually. After confirming that no active lock or
+publisher remains, read the exact nonce from the local guard file and run the
+explicit resolution command with a deliberate acknowledgement:
+
+```bash
+guard_nonce="$(node -p "JSON.parse(require('fs').readFileSync('/secure/staging-ledger.json.recovery-guard.json')).nonce")"
+node tools/update-publishing/publish.cjs resolve-recovery-guard \
+  --environment staging --ledger /secure/staging-ledger.json \
+  --fixture-root "$fixture_root" --origin https://staging.example.invalid \
+  --guard-nonce "$guard_nonce" --acknowledge RESOLVE-RECOVERY-GUARD
+```
+
+Resolution refuses a wrong or tampered guard, an active successor, or any live
+recorded publisher. It removes only the guard-bound, inode/nonce-verified
+quarantine claim and then the verified guard itself; it never modifies an
+active lock pathname.
 
 Dry-run is externally immutable: it performs only read-only validation and
 leaves no lock, claim, ledger, root marker, journal, artifact, manifest, receipt,
