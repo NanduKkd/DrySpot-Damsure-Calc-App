@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:app_client/src/services/db_service.dart';
@@ -246,7 +248,7 @@ void main() {
             'franchisee_id': '40000000-0000-4000-8000-000000000002',
             'name': 'Photo client',
             'photos':
-                '["/api/photos/client/canonical.jpg","/offline/one.jpg","/offline/two.jpg"]',
+                '["/api/photos/client/40000000-0000-4000-8000-000000000001/40000000-0000-4000-8000-000000000010.jpg","/offline/one.jpg","/offline/two.jpg"]',
             'is_dirty': 0,
             'updated_at': '2026-07-30T00:00:00.000Z',
           });
@@ -365,6 +367,156 @@ void main() {
         ],
       );
       await upgraded.close();
+    });
+
+    test(
+        'v13 snapshots pending payload identity and rejects inconsistent reapply state',
+        () async {
+      final database = await openDatabase(
+        inMemoryDatabasePath,
+        version: 1,
+        onCreate: (db, _) async {
+          const lww = '''
+            server_generation TEXT NOT NULL DEFAULT '0',
+            server_branch_seq INTEGER NOT NULL DEFAULT 0,
+            server_operation_rank INTEGER NOT NULL DEFAULT 0,
+            server_writer_id TEXT,
+            server_change_id TEXT,
+            server_payload_hash TEXT,
+            server_cursor TEXT NOT NULL DEFAULT '0',
+            pending_base_generation TEXT,
+            pending_generation TEXT,
+            pending_branch_seq INTEGER,
+            pending_writer_id TEXT,
+            pending_change_id TEXT
+          ''';
+          await db.execute('''
+            CREATE TABLE clients (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              name TEXT NOT NULL,
+              address TEXT,
+              site_address TEXT,
+              email TEXT,
+              phone TEXT,
+              latitude REAL,
+              longitude REAL,
+              discounted_price REAL,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              deleted_at TEXT,
+              $lww
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE items (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              name TEXT,
+              price REAL,
+              enabled INTEGER,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT,
+              deleted_at TEXT,
+              $lww
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE rectangles (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              length REAL,
+              width REAL,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT,
+              deleted_at TEXT,
+              $lww
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE default_prices (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              price REAL,
+              enabled INTEGER,
+              is_dirty INTEGER DEFAULT 1,
+              updated_at TEXT,
+              deleted_at TEXT,
+              $lww
+            )
+          ''');
+          await db.insert('clients', {
+            'remote_id': '40000000-0000-4000-8000-000000000021',
+            'franchisee_id': '40000000-0000-4000-8000-000000000022',
+            'name': 'Pending payload',
+            'is_dirty': 1,
+            'updated_at': '2026-07-30T00:00:00.000Z',
+            'pending_base_generation': '1',
+            'pending_generation': '2',
+            'pending_branch_seq': 1000001,
+            'pending_writer_id': '40000000-0000-4000-8000-000000000023',
+            'pending_change_id': '40000000-0000-4000-8000-000000000024',
+          });
+        },
+      );
+      addTearDown(database.close);
+
+      await expectLater(
+        DbService.migrateSchema(database, 12, 13),
+        throwsA(isA<StateError>()),
+      );
+      expect(
+        (await database.rawQuery('PRAGMA table_info(clients)'))
+            .map((column) => column['name']),
+        isNot(contains('pending_payload_hash')),
+        reason: 'failed validation must roll back the schema additions',
+      );
+
+      await database.update(
+        'clients',
+        {'pending_branch_seq': 1},
+      );
+      await DbService.migrateSchema(database, 12, 13);
+      await DbService.migrateSchema(database, 12, 13);
+
+      final expectedPayload = {
+        'address': null,
+        'discounted_price': null,
+        'email': null,
+        'latitude': null,
+        'longitude': null,
+        'name': 'Pending payload',
+        'phone': null,
+        'site_address': null,
+      };
+      final sortedPayload = {
+        for (final key in expectedPayload.keys.toList()..sort())
+          key: expectedPayload[key],
+      };
+      final expectedHash =
+          sha256.convert(utf8.encode(jsonEncode(sortedPayload))).toString();
+      var row = (await database.query('clients')).single;
+      expect(row['pending_operation_rank'], 0);
+      expect(row['pending_payload_hash'], expectedHash);
+
+      final corruptHash = List.filled(64, 'f').join();
+      await database.update(
+        'clients',
+        {'pending_payload_hash': corruptHash},
+      );
+      await expectLater(
+        DbService.migrateSchema(database, 12, 13),
+        throwsA(isA<StateError>()),
+      );
+      row = (await database.query('clients')).single;
+      expect(row['pending_payload_hash'], corruptHash);
+
+      await database.update(
+        'clients',
+        {'pending_payload_hash': expectedHash},
+      );
+      await DbService.migrateSchema(database, 12, 13);
     });
   });
 }

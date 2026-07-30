@@ -25,6 +25,10 @@ class ApiException implements Exception {
 
 class ApiService {
   static const _serverUrlKey = 'server_url';
+  static final _canonicalUploadedPhotoName = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    r'\.(jpg|png|webp)$',
+  );
 
   ApiService({String? serverUrl})
       : _serverUrl =
@@ -394,7 +398,12 @@ class ApiService {
           'Photo upload succeeded but the server response was invalid.',
     );
     final url = payload['url']?.toString();
-    if (url == null || !url.startsWith('/api/photos/client/')) {
+    final expectedPrefix = '/api/photos/client/$clientId/';
+    if (url == null ||
+        !url.startsWith(expectedPrefix) ||
+        !_canonicalUploadedPhotoName.hasMatch(
+          url.substring(expectedPrefix.length),
+        )) {
       throw const ApiException('Photo upload returned an invalid URL.');
     }
     return url;

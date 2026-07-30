@@ -1,10 +1,10 @@
 import 'dart:convert';
 
-import 'package:crypto/crypto.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'api_service.dart';
 import 'db_service.dart';
+import 'lww_protocol.dart';
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/rectangle.dart';
@@ -694,25 +694,8 @@ class SyncService {
     }
   }
 
-  dynamic _stableJsonValue(dynamic value) {
-    if (value is List) return value.map(_stableJsonValue).toList();
-    if (value is Map) {
-      final keys = value.keys.map((key) => key.toString()).toList()..sort();
-      return {
-        for (final key in keys) key: _stableJsonValue(value[key]),
-      };
-    }
-    if (value is double &&
-        value.isFinite &&
-        value == value.truncateToDouble()) {
-      return value.toInt();
-    }
-    return value;
-  }
-
-  String _payloadHash(Map<String, dynamic> payload) => sha256
-      .convert(utf8.encode(jsonEncode(_stableJsonValue(payload))))
-      .toString();
+  String _payloadHash(Map<String, dynamic> payload) =>
+      canonicalLwwPayloadHash(payload);
 
   bool _boundedString(dynamic value, {required int max, bool nullable = true}) {
     if (value == null) return nullable;
@@ -1023,11 +1006,27 @@ class SyncService {
       final remoteId = pending['client_remote_id']!;
       final photo = pending['local_path']!;
       try {
-        if (photo.startsWith('/api/photos/client/')) continue;
+        if (photo.startsWith('/api/photos/client/')) {
+          await dbService.acknowledgeClientPhotoUpload(
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+            localPath: photo,
+            canonicalPath: photo,
+          );
+          continue;
+        }
         final uri = Uri.tryParse(photo);
         if (uri != null &&
             (uri.scheme == 'http' || uri.scheme == 'https') &&
             uri.path.startsWith('/api/photos/client/')) {
+          if (apiService.resolveProtectedClientPhotoUrl(photo) == null ||
+              uri.hasQuery ||
+              uri.hasFragment ||
+              uri.userInfo.isNotEmpty) {
+            throw const FormatException(
+              'Photo acknowledgement is not on the configured server.',
+            );
+          }
           await dbService.acknowledgeClientPhotoUpload(
             franchiseeId: franchiseeId,
             remoteId: remoteId,

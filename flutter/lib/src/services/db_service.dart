@@ -10,6 +10,7 @@ import '../models/default_price.dart';
 import '../models/warranty.dart';
 import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
+import 'lww_protocol.dart';
 
 class DbService {
   static final DbService _instance = DbService._internal();
@@ -34,7 +35,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 12,
+      version: 13,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
@@ -97,6 +98,9 @@ class DbService {
       await _createPendingClientPhotosTable(db);
       await _backfillPendingClientPhotos(db);
     }
+    if (oldVersion < 13 && newVersion >= 13) {
+      await _addPendingLwwSnapshots(db);
+    }
   }
 
   Future _onCreate(Database db, int version) async {
@@ -128,7 +132,9 @@ class DbService {
         pending_generation TEXT,
         pending_branch_seq INTEGER,
         pending_writer_id TEXT,
-        pending_change_id TEXT
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT
       )
     ''');
 
@@ -155,6 +161,8 @@ class DbService {
         pending_branch_seq INTEGER,
         pending_writer_id TEXT,
         pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT,
         FOREIGN KEY (client_id) REFERENCES clients (local_id) ON DELETE CASCADE
       )
     ''');
@@ -182,6 +190,8 @@ class DbService {
         pending_branch_seq INTEGER,
         pending_writer_id TEXT,
         pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT,
         FOREIGN KEY (item_id) REFERENCES items (local_id) ON DELETE CASCADE
       )
     ''');
@@ -216,7 +226,9 @@ class DbService {
         pending_generation TEXT,
         pending_branch_seq INTEGER,
         pending_writer_id TEXT,
-        pending_change_id TEXT
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT
       )
     ''');
   }
@@ -243,6 +255,88 @@ class DbService {
     'pending_change_id': 'TEXT',
   };
 
+  static const _pendingLwwSnapshotColumnDefinitions = <String, String>{
+    'pending_operation_rank': 'INTEGER',
+    'pending_payload_hash': 'TEXT',
+  };
+
+  static final _uuidV4 = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  );
+  static final _payloadHashPattern = RegExp(r'^[0-9a-f]{64}$');
+  static final _canonicalDecimal = RegExp(r'^(0|[1-9][0-9]*)$');
+  static final _canonicalClientPhoto = RegExp(
+    r'^/api/photos/client/([^/]+)/'
+    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    r'\.(jpg|png|webp)$',
+  );
+  static final _maxLogicalGeneration = BigInt.parse('9223372036854775807');
+
+  static int _operationRankForRow(Map<String, Object?> row) =>
+      row['deleted_at'] == null ? 0 : 1;
+
+  static Map<String, dynamic> _lwwMutablePayload(
+    String collection,
+    Map<String, Object?> row,
+    int operationRank,
+  ) {
+    if (operationRank == 1) return <String, dynamic>{};
+    switch (collection) {
+      case 'clients':
+        return {
+          'name': row['name'],
+          'address': row['address'],
+          'site_address': row['site_address'],
+          'email': row['email'],
+          'phone': row['phone'],
+          'latitude': row['latitude'],
+          'longitude': row['longitude'],
+          'discounted_price': row['discounted_price'],
+        };
+      case 'items':
+        return {
+          'name': row['name'],
+          'price': double.parse(row['price'].toString()),
+          'enabled': row['enabled'] == 1 || row['enabled'] == true,
+        };
+      case 'rectangles':
+        return {
+          'length': double.parse(row['length'].toString()),
+          'width': double.parse(row['width'].toString()),
+        };
+      case 'default_prices':
+        return {
+          'price': double.parse(row['price'].toString()),
+          'enabled': row['enabled'] == 1 || row['enabled'] == true,
+        };
+    }
+    throw StateError('Unsupported LWW collection: $collection');
+  }
+
+  static String _currentLwwPayloadHash(
+    String collection,
+    Map<String, Object?> row,
+    int operationRank,
+  ) =>
+      canonicalLwwPayloadHash(
+        _lwwMutablePayload(collection, row, operationRank),
+      );
+
+  static BigInt? _validLogicalGeneration(
+    Object? value, {
+    required bool allowZero,
+  }) {
+    final encoded = value?.toString();
+    if (encoded == null || !_canonicalDecimal.hasMatch(encoded)) return null;
+    final parsed = BigInt.parse(encoded);
+    if ((!allowZero && parsed == BigInt.zero) ||
+        parsed > _maxLogicalGeneration) {
+      return null;
+    }
+    return parsed;
+  }
+
   static Future<void> _addLwwSyncColumns(Database db) async {
     await db.transaction((transaction) async {
       for (final table in _lwwTables) {
@@ -267,6 +361,98 @@ class DbService {
           'CREATE INDEX IF NOT EXISTS ${table}_pending_lww '
           'ON $table (is_dirty, pending_change_id)',
         );
+      }
+    });
+  }
+
+  static Future<void> _addPendingLwwSnapshots(Database db) async {
+    await db.transaction((transaction) async {
+      for (final table in _lwwTables) {
+        final tableExists = (await transaction.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          [table],
+        ))
+            .isNotEmpty;
+        if (!tableExists) {
+          throw StateError('APP-111 requires the existing $table table.');
+        }
+        final columns = await transaction.rawQuery('PRAGMA table_info($table)');
+        final names = columns.map((column) => column['name']).toSet();
+        for (final definition in _pendingLwwSnapshotColumnDefinitions.entries) {
+          if (!names.contains(definition.key)) {
+            await transaction.execute(
+              'ALTER TABLE $table ADD COLUMN '
+              '${definition.key} ${definition.value}',
+            );
+          }
+        }
+
+        final rows = await transaction.query(table);
+        for (final row in rows) {
+          const pendingCore = [
+            'pending_base_generation',
+            'pending_generation',
+            'pending_branch_seq',
+            'pending_writer_id',
+            'pending_change_id',
+          ];
+          final presentCore =
+              pendingCore.where((column) => row[column] != null).length;
+          final snapshotRank = row['pending_operation_rank'];
+          final snapshotHash = row['pending_payload_hash']?.toString();
+          if (presentCore == 0) {
+            if (snapshotRank != null || snapshotHash != null) {
+              throw StateError(
+                'APP-111 found orphaned pending state in $table.',
+              );
+            }
+            continue;
+          }
+          final pendingBase = _validLogicalGeneration(
+            row['pending_base_generation'],
+            allowZero: true,
+          );
+          final pendingGeneration = _validLogicalGeneration(
+            row['pending_generation'],
+            allowZero: false,
+          );
+          if (presentCore != pendingCore.length ||
+              row['is_dirty'] != 1 ||
+              pendingBase == null ||
+              pendingGeneration == null ||
+              pendingGeneration <= pendingBase ||
+              row['pending_branch_seq'] is! int ||
+              (row['pending_branch_seq'] as int) < 1 ||
+              (row['pending_branch_seq'] as int) > 1000000 ||
+              !_uuidV4.hasMatch(row['pending_writer_id'].toString()) ||
+              !_uuidV4.hasMatch(row['pending_change_id'].toString())) {
+            throw StateError(
+              'APP-111 found inconsistent pending state in $table.',
+            );
+          }
+          final expectedRank = _operationRankForRow(row);
+          final expectedHash = _currentLwwPayloadHash(table, row, expectedRank);
+          if (snapshotRank == null && snapshotHash == null) {
+            await transaction.update(
+              table,
+              {
+                'pending_operation_rank': expectedRank,
+                'pending_payload_hash': expectedHash,
+              },
+              where: 'local_id = ?',
+              whereArgs: [row['local_id']],
+            );
+            continue;
+          }
+          if (snapshotRank != expectedRank ||
+              snapshotHash == null ||
+              !_payloadHashPattern.hasMatch(snapshotHash) ||
+              snapshotHash != expectedHash) {
+            throw StateError(
+              'APP-111 found a changed pending payload in $table.',
+            );
+          }
+        }
       }
     });
   }
@@ -334,8 +520,13 @@ class DbService {
     ''');
   }
 
-  static bool _isCanonicalClientPhotoPath(String path) =>
-      path.startsWith('/api/photos/client/');
+  static bool _isCanonicalClientPhotoPath(
+    String path, {
+    String? remoteId,
+  }) {
+    final match = _canonicalClientPhoto.firstMatch(path);
+    return match != null && (remoteId == null || match.group(1) == remoteId);
+  }
 
   static List<String> _decodeClientPhotos(Object? value) {
     final decoded = jsonDecode(value?.toString() ?? '[]');
@@ -364,7 +555,7 @@ class DbService {
         continue;
       }
       for (final path in photos.where(
-        (photo) => !_isCanonicalClientPhotoPath(photo),
+        (photo) => !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
       )) {
         await db.insert(
           'pending_client_photos',
@@ -435,12 +626,6 @@ class DbService {
     if (!await _supportsLww(executor, table)) return;
     final rows = await executor.query(
       table,
-      columns: [
-        'server_generation',
-        'pending_base_generation',
-        'pending_generation',
-        'pending_branch_seq',
-      ],
       where: 'local_id = ?',
       whereArgs: [localId],
       limit: 1,
@@ -465,6 +650,8 @@ class DbService {
     if (branch > 1000000) {
       throw StateError('The local logical branch sequence is exhausted.');
     }
+    final operationRank = _operationRankForRow(row);
+    final payloadHash = _currentLwwPayloadHash(table, row, operationRank);
     await executor.update(
       table,
       {
@@ -474,6 +661,8 @@ class DbService {
         'pending_branch_seq': branch,
         'pending_writer_id': await _installationWriterId(executor),
         'pending_change_id': const Uuid().v4(),
+        'pending_operation_rank': operationRank,
+        'pending_payload_hash': payloadHash,
       },
       where: 'local_id = ?',
       whereArgs: [localId],
@@ -486,6 +675,8 @@ class DbService {
     'pending_branch_seq': null,
     'pending_writer_id': null,
     'pending_change_id': null,
+    'pending_operation_rank': null,
+    'pending_payload_hash': null,
   };
 
   Future<bool> _supportsPendingClientPhotos(
@@ -533,7 +724,10 @@ class DbService {
     );
     final desired = row['deleted_at'] == null
         ? _decodeClientPhotos(row['photos'])
-            .where((photo) => !_isCanonicalClientPhotoPath(photo))
+            .where(
+              (photo) =>
+                  !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
+            )
             .toSet()
         : const <String>{};
     for (final pending in pendingRows) {
@@ -652,6 +846,14 @@ class DbService {
     required String localPath,
     required String canonicalPath,
   }) async {
+    if (!_isCanonicalClientPhotoPath(
+      canonicalPath,
+      remoteId: remoteId,
+    )) {
+      throw const FormatException(
+        'Photo acknowledgement does not belong to the requested client.',
+      );
+    }
     final db = await database;
     return db.transaction((transaction) async {
       if (!await _supportsPendingClientPhotos(transaction)) return false;
@@ -918,26 +1120,20 @@ class DbService {
     await db.transaction((transaction) async {
       final tableQueries = <String, String>{
         'clients': '''
-          SELECT c.local_id, c.server_generation, c.pending_base_generation,
-                 c.pending_generation, c.pending_branch_seq,
-                 c.pending_writer_id, c.pending_change_id
+          SELECT c.*
           FROM clients c
           WHERE c.franchisee_id = ?
             AND c.is_dirty = 1
         ''',
         'items': '''
-          SELECT i.local_id, i.server_generation, i.pending_base_generation,
-                 i.pending_generation, i.pending_branch_seq,
-                 i.pending_writer_id, i.pending_change_id
+          SELECT i.*
           FROM items i
           JOIN clients c ON c.local_id = i.client_id
           WHERE c.franchisee_id = ?
             AND i.is_dirty = 1
         ''',
         'rectangles': '''
-          SELECT r.local_id, r.server_generation, r.pending_base_generation,
-                 r.pending_generation, r.pending_branch_seq,
-                 r.pending_writer_id, r.pending_change_id
+          SELECT r.*
           FROM rectangles r
           JOIN items i ON i.local_id = r.item_id
           JOIN clients c ON c.local_id = i.client_id
@@ -945,44 +1141,101 @@ class DbService {
             AND r.is_dirty = 1
         ''',
         'default_prices': '''
-          SELECT d.local_id, d.server_generation, d.pending_base_generation,
-                 d.pending_generation, d.pending_branch_seq,
-                 d.pending_writer_id, d.pending_change_id
+          SELECT d.*
           FROM default_prices d
           WHERE d.franchisee_id = ?
             AND d.is_dirty = 1
         ''',
       };
       final writerId = await _installationWriterId(transaction);
-      const maxGeneration = '9223372036854775807';
       for (final entry in tableQueries.entries) {
         final rows = await transaction.rawQuery(entry.value, [franchiseeId]);
         for (final row in rows) {
-          final serverGeneration = BigInt.tryParse(
-            row['server_generation']?.toString() ?? '',
+          final serverGeneration = _validLogicalGeneration(
+            row['server_generation'],
+            allowZero: true,
           );
-          if (serverGeneration == null ||
-              serverGeneration.isNegative ||
-              serverGeneration >= BigInt.parse(maxGeneration)) {
+          if (serverGeneration == null) {
+            throw StateError(
+              'The authoritative logical generation cannot be rebased.',
+            );
+          }
+          final currentRank = _operationRankForRow(row);
+          final currentHash =
+              _currentLwwPayloadHash(entry.key, row, currentRank);
+          final pendingRank = row['pending_operation_rank'] as int?;
+          final pendingHash = row['pending_payload_hash']?.toString();
+          final pendingWriter = row['pending_writer_id']?.toString();
+          final pendingChange = row['pending_change_id']?.toString();
+          final pendingSnapshotMatchesCurrent = pendingRank == currentRank &&
+              pendingHash == currentHash &&
+              pendingHash != null &&
+              _payloadHashPattern.hasMatch(pendingHash);
+          final pendingGeneration = _validLogicalGeneration(
+            row['pending_generation'],
+            allowZero: false,
+          );
+          final pendingBranch = row['pending_branch_seq'] as int?;
+          final pendingIdentityIsValid = pendingWriter != null &&
+              pendingChange != null &&
+              _uuidV4.hasMatch(pendingWriter) &&
+              _uuidV4.hasMatch(pendingChange);
+
+          final exactCommitted = pendingGeneration == serverGeneration &&
+              pendingBranch == row['server_branch_seq'] &&
+              pendingRank == row['server_operation_rank'] &&
+              pendingWriter == row['server_writer_id'] &&
+              pendingChange == row['server_change_id'] &&
+              pendingHash == row['server_payload_hash'] &&
+              pendingIdentityIsValid &&
+              pendingSnapshotMatchesCurrent;
+          if (exactCommitted) {
+            await transaction.update(
+              entry.key,
+              {
+                'is_dirty': 0,
+                ..._clearPendingLww,
+              },
+              where: '''
+                local_id = ?
+                AND is_dirty = 1
+                AND pending_generation = ?
+                AND pending_branch_seq = ?
+                AND pending_operation_rank = ?
+                AND pending_writer_id = ?
+                AND pending_change_id = ?
+                AND pending_payload_hash = ?
+              ''',
+              whereArgs: [
+                row['local_id'],
+                pendingGeneration.toString(),
+                pendingBranch,
+                pendingRank,
+                pendingWriter,
+                pendingChange,
+                pendingHash,
+              ],
+            );
+            continue;
+          }
+
+          if (serverGeneration >= _maxLogicalGeneration) {
             throw StateError(
               'The authoritative logical generation cannot be rebased.',
             );
           }
           final rebasedGeneration = serverGeneration + BigInt.one;
-          final pendingBase = BigInt.tryParse(
-            row['pending_base_generation']?.toString() ?? '',
+          final pendingBase = _validLogicalGeneration(
+            row['pending_base_generation'],
+            allowZero: true,
           );
-          final pendingGeneration = BigInt.tryParse(
-            row['pending_generation']?.toString() ?? '',
-          );
-          final pendingBranch = row['pending_branch_seq'] as int?;
           final alreadyRebased = pendingBase == serverGeneration &&
               pendingGeneration == rebasedGeneration &&
               pendingBranch != null &&
               pendingBranch >= 1 &&
               pendingBranch <= 1000000 &&
-              row['pending_writer_id'] != null &&
-              row['pending_change_id'] != null;
+              pendingIdentityIsValid &&
+              pendingSnapshotMatchesCurrent;
           if (alreadyRebased) continue;
           await transaction.update(
             entry.key,
@@ -993,6 +1246,8 @@ class DbService {
               'pending_branch_seq': 1,
               'pending_writer_id': writerId,
               'pending_change_id': const Uuid().v4(),
+              'pending_operation_rank': currentRank,
+              'pending_payload_hash': currentHash,
             },
             where: 'local_id = ?',
             whereArgs: [row['local_id']],
@@ -1343,39 +1598,21 @@ class DbService {
     String collection,
     Map<String, Object?> row,
   ) {
-    final operation = row['deleted_at'] == null ? 'upsert' : 'delete';
-    final payload = <String, dynamic>{};
-    if (operation == 'upsert') {
-      switch (collection) {
-        case 'clients':
-          payload.addAll({
-            'name': row['name'],
-            'address': row['address'],
-            'site_address': row['site_address'],
-            'email': row['email'],
-            'phone': row['phone'],
-            'latitude': row['latitude'],
-            'longitude': row['longitude'],
-            'discounted_price': row['discounted_price'],
-          });
-        case 'items':
-          payload.addAll({
-            'name': row['name'],
-            'price': double.parse(row['price'].toString()),
-            'enabled': row['enabled'] == 1 || row['enabled'] == true,
-          });
-        case 'rectangles':
-          payload.addAll({
-            'length': double.parse(row['length'].toString()),
-            'width': double.parse(row['width'].toString()),
-          });
-        case 'default_prices':
-          payload.addAll({
-            'price': double.parse(row['price'].toString()),
-            'enabled': row['enabled'] == 1 || row['enabled'] == true,
-          });
-      }
+    final pendingRank = row['pending_operation_rank'];
+    final currentRank = _operationRankForRow(row);
+    final pendingHash = row['pending_payload_hash']?.toString();
+    final payload = _lwwMutablePayload(collection, row, currentRank);
+    final currentHash = canonicalLwwPayloadHash(payload);
+    if ((pendingRank != 0 && pendingRank != 1) ||
+        pendingRank != currentRank ||
+        pendingHash == null ||
+        !_payloadHashPattern.hasMatch(pendingHash) ||
+        pendingHash != currentHash) {
+      throw StateError(
+        'The pending $collection payload changed without a logical mutation.',
+      );
     }
+    final operation = pendingRank == 1 ? 'delete' : 'upsert';
     return {
       'remote_id': row['remote_id'],
       'operation': operation,
@@ -1583,7 +1820,7 @@ class DbService {
     } else {
       pendingPaths.addAll(
         legacyFallback.where(
-          (photo) => !_isCanonicalClientPhotoPath(photo),
+          (photo) => !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
         ),
       );
     }
