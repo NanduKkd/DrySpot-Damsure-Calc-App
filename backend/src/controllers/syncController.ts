@@ -46,6 +46,24 @@ const assertActiveOwnedClient = async (id: string, franchiseeId: string, transac
 	return client;
 };
 
+const lockActiveOwnedWarrantyClient = async (
+	id: unknown,
+	franchiseeId: string,
+	transaction: any,
+) => {
+	if (typeof id !== 'string' || !id) return null;
+	const client = await Client.findByPk(id, {
+		paranoid: false,
+		transaction,
+		lock: transaction.LOCK.UPDATE,
+	});
+	if (!client) return null;
+	if (client.franchiseeId !== franchiseeId) {
+		throw new OwnershipError('Client belongs to another franchisee');
+	}
+	return client.deletedAt ? null : client;
+};
+
 const managedPdfUrl = (resource: 'warranty' | 'proposal', id: string) =>
 	`/api/${resource}/${id}/download`;
 
@@ -92,6 +110,20 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		return res
 			.status(400)
 			.json({ error: 'warranty_tombstone_cursor must be a non-negative integer' });
+	}
+	const parsedTombstoneCursor = BigInt(requestedTombstoneCursor);
+	if (parsedTombstoneCursor > 9223372036854775807n) {
+		return res.status(400).json({
+			error: 'warranty_tombstone_cursor exceeds the PostgreSQL BIGINT range',
+		});
+	}
+	const normalizedTombstoneCursor = parsedTombstoneCursor.toString();
+	const syncTime =
+		last_sync_time === undefined || last_sync_time === null
+			? new Date(0)
+			: new Date(last_sync_time);
+	if (Number.isNaN(syncTime.getTime())) {
+		return res.status(400).json({ error: 'last_sync_time must be a valid date' });
 	}
 
 	const transaction = await sequelize.transaction();
@@ -325,24 +357,52 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						updated_at: _clientUpdatedAt,
 						...rest
 					} = wData;
-					if (await findReservedWarrantyId(remote_id, transaction)) {
-						recordOutcome('warranties', remote_id, 'tombstoned', 'warranty_deleted');
-						continue;
-					}
 					const candidate = await Warranty.findByPk(remote_id, {
 						paranoid: false,
 						transaction,
 					});
-					await assertOwnedClient(
-						candidate?.clientId ?? client_id,
-						franchiseeId,
-						transaction,
-						true,
-					);
+					if (
+						candidate &&
+						!(await lockActiveOwnedWarrantyClient(
+							candidate.clientId,
+							franchiseeId,
+							transaction,
+						))
+					) {
+						recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
+						continue;
+					}
+					if (
+						!(await lockActiveOwnedWarrantyClient(
+							deleted_at ? (candidate?.clientId ?? client_id) : client_id,
+							franchiseeId,
+							transaction,
+						))
+					) {
+						recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
+						continue;
+					}
 					// A confirmed delete/replacement may have committed while this
 					// mutation waited for the client lock.
-					if (await findReservedWarrantyId(remote_id, transaction)) {
-						recordOutcome('warranties', remote_id, 'tombstoned', 'warranty_deleted');
+					const reservation = await findReservedWarrantyId(remote_id, transaction);
+					if (reservation) {
+						if (reservation.franchiseeId === franchiseeId) {
+							recordOutcome(
+								'warranties',
+								remote_id,
+								'tombstoned',
+								'warranty_deleted',
+							);
+						} else {
+							// Do not disclose whether the opaque UUID is reserved, deleted,
+							// or owned by another tenant.
+							recordOutcome(
+								'warranties',
+								remote_id,
+								'rejected',
+								'warranty_conflict',
+							);
+						}
 						continue;
 					}
 					const existing = await Warranty.findByPk(remote_id, {
@@ -359,9 +419,6 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							'online_delete_required',
 						);
 					} else {
-						if (candidate && candidate.clientId !== client_id) {
-							await assertActiveOwnedClient(client_id, franchiseeId, transaction);
-						}
 						const otherActive = await Warranty.findOne({
 							where: { clientId: client_id, id: { [Op.ne]: remote_id } },
 							transaction,
@@ -467,9 +524,6 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			console.error('Unable to run post-commit sync file reconciliation:', error);
 		});
 
-		// 2. Fetch updates for the client
-		const syncTime = last_sync_time ? new Date(last_sync_time) : new Date(0);
-
 		const updatedClients = await Client.findAll({
 			where: {
 				franchiseeId,
@@ -534,11 +588,11 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		});
 		const warrantyTombstones = await warrantyTombstonesAfter(
 			franchiseeId,
-			requestedTombstoneCursor,
+			normalizedTombstoneCursor,
 		);
 		const warrantyTombstoneCursor = warrantyTombstones.length
 			? warrantyTombstones.at(-1)!.deletionSequence.toString()
-			: requestedTombstoneCursor;
+			: normalizedTombstoneCursor;
 
 		return res.json({
 			server_time: serverTime,

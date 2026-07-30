@@ -71,6 +71,10 @@ void main() {
         find.widgetWithText(ElevatedButton, 'Create Warranty'), findsOneWidget);
 
     await tester.tap(find.widgetWithText(ElevatedButton, 'Create Warranty'));
+    await tester.tap(
+      find.widgetWithText(ElevatedButton, 'Create Warranty'),
+      warnIfMissed: false,
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('Permanently replace warranty?'), findsOneWidget);
@@ -127,6 +131,7 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.tap(find.byIcon(Icons.delete).first);
+    await tester.tap(find.byIcon(Icons.delete).first, warnIfMissed: false);
     await tester.pumpAndSettle();
 
     expect(find.text('Permanently delete warranty?'), findsOneWidget);

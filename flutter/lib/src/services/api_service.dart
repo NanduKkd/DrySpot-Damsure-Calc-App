@@ -234,7 +234,7 @@ class ApiService {
     }
   }
 
-  Future<void> deleteWarranty({
+  Future<Map<String, dynamic>> deleteWarranty({
     required String id,
     required String warrantyCardNumber,
     required int warrantyVersion,
@@ -255,11 +255,22 @@ class ApiService {
       }),
     );
 
-    if (response.statusCode != 204) {
-      throw ApiException(
-        _extractErrorMessage(response, 'Failed to delete warranty'),
+    if (response.statusCode == 200) {
+      final result = _decodeObjectBody(
+        response.body,
+        fallbackMessage:
+            'Warranty deletion succeeded but the server response was invalid.',
       );
+      if (result['status'] != 'deleted' || result['warranty_id'] != id) {
+        throw const ApiException(
+          'Warranty deletion returned an invalid result.',
+        );
+      }
+      return result;
     }
+    throw ApiException(
+      _extractErrorMessage(response, 'Failed to delete warranty'),
+    );
   }
 
   Future<Map<String, dynamic>> uploadProposal(

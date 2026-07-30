@@ -13,6 +13,8 @@ export class WarrantyDeletionTombstone extends Model {
 	public franchiseeId!: string;
 	public deletionSequence!: string;
 	public idempotencyKey!: string | null;
+	public idempotencyAction!: string | null;
+	public requestDigest!: string | null;
 	public replacementWarrantyId!: string | null;
 	public deletedAt!: Date;
 }
@@ -35,6 +37,14 @@ WarrantyDeletionTombstone.init(
 		},
 		idempotencyKey: {
 			type: DataTypes.STRING(128),
+			allowNull: true,
+		},
+		idempotencyAction: {
+			type: DataTypes.STRING(32),
+			allowNull: true,
+		},
+		requestDigest: {
+			type: DataTypes.STRING(64),
 			allowNull: true,
 		},
 		replacementWarrantyId: {

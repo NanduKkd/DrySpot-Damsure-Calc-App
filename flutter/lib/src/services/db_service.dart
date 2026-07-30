@@ -31,7 +31,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 9,
+      version: 10,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
@@ -76,6 +76,9 @@ class DbService {
       // Removing them prevents an old device from initiating deletion through
       // sync; the server's live row or permanent tombstone will converge later.
       await db.delete('warranties', where: 'deleted_at IS NOT NULL');
+    }
+    if (oldVersion < 10 && newVersion >= 10) {
+      await _createSyncStateTable(db);
     }
   }
 
@@ -133,6 +136,7 @@ class DbService {
     await _createDefaultPricesTable(db);
     await _createWarrantiesTable(db);
     await _createWarrantyDeletionTombstonesTable(db);
+    await _createSyncStateTable(db);
     await _createProposalsTable(db);
   }
 
@@ -184,6 +188,15 @@ class DbService {
     await db.execute('''
       CREATE INDEX IF NOT EXISTS warranty_deletion_tombstones_tenant_cursor
       ON warranty_deletion_tombstones (franchisee_id, deletion_sequence)
+    ''');
+  }
+
+  static Future<void> _createSyncStateTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
     ''');
   }
 
@@ -504,6 +517,54 @@ class DbService {
     });
   }
 
+  String _warrantyTombstoneCursorKey(String franchiseeId) =>
+      'warranty_tombstone_cursor:$franchiseeId';
+
+  Future<String> getWarrantyTombstoneCursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_warrantyTombstoneCursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? '0' : rows.first['value'] as String;
+  }
+
+  Future<void> applyWarrantyTombstonesAndCursor(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+  }) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      for (final tombstone in tombstones) {
+        if (tombstone.franchiseeId != franchiseeId) {
+          throw ArgumentError('A tombstone cannot cross the active franchisee');
+        }
+        await transaction.insert(
+          'warranty_deletion_tombstones',
+          tombstone.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await transaction.delete(
+          'warranties',
+          where: 'remote_id = ?',
+          whereArgs: [tombstone.warrantyId],
+        );
+      }
+      await transaction.insert(
+        'sync_state',
+        {
+          'key': _warrantyTombstoneCursorKey(franchiseeId),
+          'value': cursor,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+  }
+
   Future<bool> hasWarrantyTombstone(
     String warrantyId, {
     required String franchiseeId,
@@ -618,20 +679,26 @@ class DbService {
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
-  Future<void> markAsSynced(String table, String remoteId,
-      {String? franchiseeId}) async {
+  Future<int> markAsSynced(
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+  }) async {
     final db = await database;
     final tenantScoped = table == 'default_prices';
     if (tenantScoped && (franchiseeId == null || franchiseeId.isEmpty)) {
       throw ArgumentError('A franchisee is required for default-price sync');
     }
-    await db.update(
+    return db.update(
       table,
       {'is_dirty': 0},
       where: tenantScoped
-          ? 'remote_id = ? AND franchisee_id = ?'
-          : 'remote_id = ?',
-      whereArgs: tenantScoped ? [remoteId, franchiseeId] : [remoteId],
+          ? 'remote_id = ? AND franchisee_id = ? AND updated_at = ? AND is_dirty = 1'
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      whereArgs: tenantScoped
+          ? [remoteId, franchiseeId, submittedUpdatedAt]
+          : [remoteId, submittedUpdatedAt],
     );
   }
 }

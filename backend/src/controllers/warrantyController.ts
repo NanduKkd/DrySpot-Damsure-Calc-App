@@ -1,5 +1,6 @@
 import { Response } from 'express';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Warranty, Client } from '../models';
@@ -9,6 +10,7 @@ import {
 	deleteConfirmedWarranty,
 	triggerWarrantyFileCleanup,
 	validIdempotencyKey,
+	warrantyRequestDigest,
 	WarrantyConfirmation,
 	WarrantyLifecycleError,
 } from '../services/warrantyLifecycle';
@@ -81,11 +83,27 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 	}
 
 	try {
+		const pdfSha256 = createHash('sha256')
+			.update(await fs.promises.readFile(file.path))
+			.digest('hex');
 		const id = randomUUID();
 		const result = await createOrReplaceConfirmedWarranty({
 			franchiseeId,
 			idempotencyKey: validIdempotencyKey(idempotencyKey) ? idempotencyKey : undefined,
 			confirmation,
+			requestDigest: confirmation
+				? warrantyRequestDigest({
+						action: 'replace',
+						confirmation,
+						replacement: {
+							clientId: client_id,
+							startDate: parsedStartDate,
+							durationYears: parsedDurationYears,
+							warrantyCardNumber: warranty_card_number.trim(),
+							pdfSha256,
+						},
+					})
+				: undefined,
 			values: {
 				id,
 				clientId: client_id,
@@ -155,14 +173,24 @@ export const deleteWarranty = async (req: AuthRequest, res: Response) => {
 		});
 	}
 	try {
+		const requestDigest = warrantyRequestDigest({
+			action: 'delete',
+			confirmation,
+		});
 		const result = await deleteConfirmedWarranty({
 			warrantyId: req.params.id,
 			franchiseeId,
 			idempotencyKey,
 			confirmation,
+			requestDigest,
 		});
 		triggerWarrantyFileCleanup([result.storageKey]);
-		return res.status(204).send();
+		return res.status(200).json({
+			status: 'deleted',
+			warranty_id: result.tombstone.warrantyId,
+			deletion_sequence: result.tombstone.deletionSequence.toString(),
+			replayed: result.replayed,
+		});
 	} catch (error) {
 		if (lifecycleErrorResponse(res, error)) return;
 		console.error('Warranty deletion error:', error);

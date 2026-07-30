@@ -38,6 +38,12 @@ void main() {
             PRIMARY KEY (franchisee_id, warranty_id)
           )
         ''');
+        await db.execute('''
+          CREATE TABLE sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          )
+        ''');
       },
     );
     addTearDown(database.close);
@@ -82,8 +88,16 @@ void main() {
       deletionSequence: '9',
       deletedAt: DateTime.utc(2026, 7, 30),
     );
-    await service.applyWarrantyTombstone(tombstone);
-    await service.applyWarrantyTombstone(tombstone);
+    await service.applyWarrantyTombstonesAndCursor(
+      [tombstone],
+      franchiseeId: 'tenant-a',
+      cursor: '9',
+    );
+    await service.applyWarrantyTombstonesAndCursor(
+      [tombstone],
+      franchiseeId: 'tenant-a',
+      cursor: '9',
+    );
 
     expect(await database.query('warranties'), isEmpty);
     expect(await database.query('warranty_deletion_tombstones'), hasLength(1));
@@ -93,6 +107,91 @@ void main() {
         franchiseeId: 'tenant-a',
       ),
       isTrue,
+    );
+    expect(await service.getWarrantyTombstoneCursor('tenant-a'), '9');
+
+    await expectLater(
+      service.applyWarrantyTombstonesAndCursor(
+        [
+          WarrantyDeletionTombstone(
+            warrantyId: 'foreign-warranty',
+            franchiseeId: 'tenant-b',
+            deletionSequence: '10',
+            deletedAt: DateTime.utc(2026, 7, 30),
+          ),
+        ],
+        franchiseeId: 'tenant-a',
+        cursor: '10',
+      ),
+      throwsArgumentError,
+    );
+    expect(await service.getWarrantyTombstoneCursor('tenant-a'), '9');
+  });
+
+  test('an in-flight newer edit defeats submitted-snapshot dirty clearing',
+      () async {
+    final database = await openDatabase(
+      inMemoryDatabasePath,
+      version: 1,
+      onCreate: (db, _) async {
+        await db.execute('''
+          CREATE TABLE clients (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_id TEXT UNIQUE,
+            franchisee_id TEXT,
+            name TEXT NOT NULL,
+            is_dirty INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL
+          )
+        ''');
+      },
+    );
+    addTearDown(database.close);
+    final service = DbService(database: database);
+    const remoteId = 'edited-during-sync';
+    const submittedAt = '2026-07-30T00:00:00.000Z';
+    const newerAt = '2026-07-30T00:00:01.000Z';
+    await database.insert('clients', {
+      'remote_id': remoteId,
+      'franchisee_id': 'tenant-a',
+      'name': 'submitted snapshot',
+      'is_dirty': 1,
+      'updated_at': submittedAt,
+    });
+
+    // This update represents the user editing after the request captured and
+    // submitted the first timestamp but before its outcome arrived.
+    await database.update(
+      'clients',
+      {
+        'name': 'newer local edit',
+        'is_dirty': 1,
+        'updated_at': newerAt,
+      },
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
+    expect(
+      await service.markAsSynced(
+        'clients',
+        remoteId,
+        submittedUpdatedAt: submittedAt,
+      ),
+      0,
+    );
+    expect(
+      (await database.query(
+        'clients',
+        columns: ['name', 'is_dirty', 'updated_at'],
+        where: 'remote_id = ?',
+        whereArgs: [remoteId],
+      ))
+          .single,
+      {
+        'name': 'newer local edit',
+        'is_dirty': 1,
+        'updated_at': newerAt,
+      },
     );
   });
 }

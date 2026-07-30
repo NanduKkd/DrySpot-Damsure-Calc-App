@@ -2,6 +2,8 @@ import { DataTypes, Sequelize } from 'sequelize';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const migration = require('../migrations/20260730010000-add-warranty-deletion-tombstones.js');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const cleanupMigration = require('../migrations/20260730000000-add-managed-file-cleanups.js');
 
 describe('APP-110 warranty deletion migration', () => {
 	let database: Sequelize;
@@ -17,8 +19,10 @@ describe('APP-110 warranty deletion migration', () => {
 		await queryInterface.createTable('warranties', {
 			id: { type: DataTypes.UUID, primaryKey: true },
 			client_id: { type: DataTypes.UUID, allowNull: false },
+			pdf_file_name: { type: DataTypes.STRING, allowNull: true },
 			deleted_at: { type: DataTypes.DATE, allowNull: true },
 		});
+		await cleanupMigration.up(queryInterface, Sequelize);
 	});
 
 	afterEach(async () => {
@@ -38,9 +42,15 @@ describe('APP-110 warranty deletion migration', () => {
 			{
 				id: deletedWarrantyId,
 				client_id: clientId,
+				pdf_file_name: 'legacy-warranty.pdf',
 				deleted_at: new Date('2026-07-01T00:00:00.000Z'),
 			},
-			{ id: activeWarrantyId, client_id: clientId, deleted_at: null },
+			{
+				id: activeWarrantyId,
+				client_id: clientId,
+				pdf_file_name: 'active-warranty.pdf',
+				deleted_at: null,
+			},
 		]);
 
 		await migration.up(queryInterface, Sequelize);
@@ -58,6 +68,21 @@ describe('APP-110 warranty deletion migration', () => {
 			}),
 		).toEqual([{ id: activeWarrantyId }]);
 		expect(Object.keys(await queryInterface.describeTable('warranties'))).toContain('version');
+		expect(
+			await database.query(
+				'SELECT storage_key, kind FROM managed_file_cleanups ORDER BY storage_key',
+				{ type: 'SELECT' as any },
+			),
+		).toEqual([{ storage_key: 'legacy-warranty.pdf', kind: 'pdf' }]);
+		expect(
+			await database.query(
+				'SELECT warranty_id, reservation_state FROM warranty_uuid_reservations ORDER BY warranty_id',
+				{ type: 'SELECT' as any },
+			),
+		).toEqual([
+			{ warranty_id: deletedWarrantyId, reservation_state: 'tombstoned' },
+			{ warranty_id: activeWarrantyId, reservation_state: 'live' },
+		]);
 
 		await migration.down(queryInterface, Sequelize);
 		expect(await queryInterface.showAllTables()).toEqual(
@@ -65,6 +90,7 @@ describe('APP-110 warranty deletion migration', () => {
 				'warranties',
 				'warranty_deletion_sequence',
 				'warranty_deletion_tombstones',
+				'warranty_uuid_reservations',
 			]),
 		);
 		expect(
@@ -72,6 +98,58 @@ describe('APP-110 warranty deletion migration', () => {
 				type: 'SELECT' as any,
 			}),
 		).toEqual([{ warranty_id: deletedWarrantyId }]);
+		await expect(
+			database.query(
+				`INSERT INTO warranties (id, client_id, pdf_file_name, deleted_at, version)
+         VALUES (:id, :clientId, 'resurrection.pdf', NULL, 1)`,
+				{ replacements: { id: deletedWarrantyId, clientId } },
+			),
+		).rejects.toThrow();
+	});
+
+	it('allows tombstoning the current live row but blocks later inserts and id updates', async () => {
+		const queryInterface = database.getQueryInterface();
+		const liveId = '30000000-0000-0000-0000-000000000020';
+		const otherId = '30000000-0000-0000-0000-000000000021';
+		const clientId = '30000000-0000-0000-0000-000000000022';
+		const franchiseeId = '30000000-0000-0000-0000-000000000023';
+		await queryInterface.bulkInsert('clients', [
+			{ id: clientId, franchisee_id: franchiseeId, deleted_at: null },
+		]);
+		await migration.up(queryInterface, Sequelize);
+		await database.query(
+			`INSERT INTO warranties (id, client_id, pdf_file_name, deleted_at, version)
+       VALUES (:id, :clientId, 'live.pdf', NULL, 1)`,
+			{ replacements: { id: liveId, clientId } },
+		);
+		await database.query(
+			`INSERT INTO warranty_deletion_tombstones
+       (warranty_id, franchisee_id, deletion_sequence, deleted_at)
+       VALUES (:id, :franchiseeId, 1, CURRENT_TIMESTAMP)`,
+			{ replacements: { id: liveId, franchiseeId } },
+		);
+		await database.query('DELETE FROM warranties WHERE id = :id', {
+			replacements: { id: liveId },
+		});
+
+		await expect(
+			database.query(
+				`INSERT INTO warranties (id, client_id, pdf_file_name, deleted_at, version)
+         VALUES (:id, :clientId, 'resurrection.pdf', NULL, 1)`,
+				{ replacements: { id: liveId, clientId } },
+			),
+		).rejects.toThrow();
+
+		await database.query(
+			`INSERT INTO warranties (id, client_id, pdf_file_name, deleted_at, version)
+       VALUES (:id, :clientId, 'other.pdf', NULL, 1)`,
+			{ replacements: { id: otherId, clientId } },
+		);
+		await expect(
+			database.query('UPDATE warranties SET id = :liveId WHERE id = :otherId', {
+				replacements: { liveId, otherId },
+			}),
+		).rejects.toThrow();
 	});
 
 	it('aborts without deleting an orphaned legacy warranty', async () => {

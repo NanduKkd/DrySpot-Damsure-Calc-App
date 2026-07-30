@@ -7,7 +7,7 @@ class PdfListItem extends StatelessWidget {
   final String title;
   final String subtitle;
   final String pdfUrl;
-  final VoidCallback onDelete;
+  final VoidCallback? onDelete;
   final VoidCallback onShare;
 
   const PdfListItem({

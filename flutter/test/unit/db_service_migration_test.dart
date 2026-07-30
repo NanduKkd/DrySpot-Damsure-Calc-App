@@ -35,7 +35,7 @@ void main() {
     });
 
     test(
-        'v9 adds warranty versions and tombstones while discarding legacy offline deletes',
+        'v10 adds warranty deletion state idempotently while discarding legacy offline deletes',
         () async {
       final database = await openDatabase(
         inMemoryDatabasePath,
@@ -81,7 +81,8 @@ void main() {
       );
       addTearDown(database.close);
 
-      await DbService.migrateSchema(database, 8, 9);
+      await DbService.migrateSchema(database, 8, 10);
+      await DbService.migrateSchema(database, 9, 10);
 
       final columns = await database.rawQuery('PRAGMA table_info(warranties)');
       expect(
@@ -97,6 +98,12 @@ void main() {
       expect(
         await database.rawQuery(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'warranty_deletion_tombstones'",
+        ),
+        isNotEmpty,
+      );
+      expect(
+        await database.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_state'",
         ),
         isNotEmpty,
       );

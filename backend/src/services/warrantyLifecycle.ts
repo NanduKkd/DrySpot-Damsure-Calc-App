@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { Op, Transaction } from 'sequelize';
 import {
 	Client,
@@ -18,6 +19,8 @@ export type WarrantyConfirmation = {
 	irreversibleConfirmation: string;
 };
 
+export type WarrantyIdempotencyAction = 'delete' | 'replace';
+
 export type NewWarrantyValues = {
 	id: string;
 	clientId: string;
@@ -27,6 +30,50 @@ export type NewWarrantyValues = {
 	pdfUrl: string;
 	pdfFileName: string;
 };
+
+export const warrantyRequestDigest = ({
+	action,
+	confirmation,
+	replacement,
+}: {
+	action: WarrantyIdempotencyAction;
+	confirmation: WarrantyConfirmation;
+	replacement?: {
+		clientId: string;
+		warrantyCardNumber: string;
+		startDate: Date;
+		durationYears: number;
+		pdfSha256: string;
+		targetWarrantyId?: string;
+	};
+}) =>
+	createHash('sha256')
+		.update(
+			JSON.stringify({
+				action,
+				source: {
+					warrantyId: confirmation.warrantyId,
+					warrantyVersion: confirmation.warrantyVersion,
+					warrantyCardNumber: confirmation.warrantyCardNumber,
+					irreversibleConfirmation: confirmation.irreversibleConfirmation,
+				},
+				...(replacement
+					? {
+							replacement: {
+								clientId: replacement.clientId,
+								warrantyCardNumber: replacement.warrantyCardNumber,
+								startDate: replacement.startDate.toISOString(),
+								durationYears: replacement.durationYears,
+								pdfSha256: replacement.pdfSha256,
+								...(replacement.targetWarrantyId
+									? { targetWarrantyId: replacement.targetWarrantyId }
+									: {}),
+							},
+						}
+					: {}),
+			}),
+		)
+		.digest('hex');
 
 export class WarrantyLifecycleError extends Error {
 	constructor(
@@ -96,6 +143,29 @@ const findIdempotencyReplay = (
 		lock: transaction.LOCK.UPDATE,
 	});
 
+const assertIdempotencyIdentity = ({
+	tombstone,
+	action,
+	requestDigest,
+	warrantyId,
+}: {
+	tombstone: WarrantyDeletionTombstone;
+	action: WarrantyIdempotencyAction;
+	requestDigest: string;
+	warrantyId: string;
+}) => {
+	if (
+		tombstone.warrantyId !== warrantyId ||
+		tombstone.idempotencyAction !== action ||
+		tombstone.requestDigest !== requestDigest
+	) {
+		throw new WarrantyLifecycleError(
+			'idempotency_conflict',
+			'The idempotency key was already used for a different warranty mutation.',
+		);
+	}
+};
+
 export const findReservedWarrantyId = (warrantyId: string, transaction?: Transaction) =>
 	WarrantyDeletionTombstone.findByPk(warrantyId, {
 		transaction,
@@ -106,6 +176,8 @@ const createWarrantyTombstone = async ({
 	warrantyId,
 	franchiseeId,
 	idempotencyKey,
+	idempotencyAction,
+	requestDigest,
 	replacementWarrantyId,
 	deletedAt,
 	transaction,
@@ -113,6 +185,8 @@ const createWarrantyTombstone = async ({
 	warrantyId: string;
 	franchiseeId: string;
 	idempotencyKey?: string | null;
+	idempotencyAction?: WarrantyIdempotencyAction | null;
+	requestDigest?: string | null;
 	replacementWarrantyId?: string | null;
 	deletedAt?: Date;
 	transaction: Transaction;
@@ -144,6 +218,8 @@ const createWarrantyTombstone = async ({
 			franchiseeId,
 			deletionSequence: await allocateDeletionSequence(transaction),
 			idempotencyKey: idempotencyKey ?? null,
+			idempotencyAction: idempotencyAction ?? null,
+			requestDigest: requestDigest ?? null,
 			replacementWarrantyId: replacementWarrantyId ?? null,
 			deletedAt: deletedAt ?? new Date(),
 		},
@@ -155,12 +231,16 @@ const tombstoneAndHardDelete = async ({
 	warranty,
 	franchiseeId,
 	idempotencyKey,
+	idempotencyAction,
+	requestDigest,
 	replacementWarrantyId,
 	transaction,
 }: {
 	warranty: Warranty;
 	franchiseeId: string;
 	idempotencyKey?: string | null;
+	idempotencyAction?: WarrantyIdempotencyAction | null;
+	requestDigest?: string | null;
 	replacementWarrantyId?: string | null;
 	transaction: Transaction;
 }) => {
@@ -168,6 +248,8 @@ const tombstoneAndHardDelete = async ({
 		warrantyId: warranty.id,
 		franchiseeId,
 		idempotencyKey,
+		idempotencyAction,
+		requestDigest,
 		replacementWarrantyId,
 		transaction,
 	});
@@ -252,21 +334,23 @@ export const deleteConfirmedWarranty = async ({
 	franchiseeId,
 	idempotencyKey,
 	confirmation,
+	requestDigest,
 }: {
 	warrantyId: string;
 	franchiseeId: string;
 	idempotencyKey: string;
 	confirmation: WarrantyConfirmation;
+	requestDigest: string;
 }) =>
 	sequelize.transaction(async (transaction) => {
 		const replay = await findIdempotencyReplay(franchiseeId, idempotencyKey, transaction);
 		if (replay) {
-			if (replay.warrantyId !== warrantyId) {
-				throw new WarrantyLifecycleError(
-					'idempotency_conflict',
-					'The idempotency key was already used for another warranty mutation.',
-				);
-			}
+			assertIdempotencyIdentity({
+				tombstone: replay,
+				action: 'delete',
+				requestDigest,
+				warrantyId,
+			});
 			return { storageKey: null, replayed: true, tombstone: replay };
 		}
 
@@ -275,7 +359,10 @@ export const deleteConfirmedWarranty = async ({
 			if (reserved.franchiseeId !== franchiseeId) {
 				throw new WarrantyLifecycleError('not_found', 'Warranty not found.');
 			}
-			return { storageKey: null, replayed: true, tombstone: reserved };
+			throw new WarrantyLifecycleError(
+				'stale_confirmation',
+				'The confirmed warranty is no longer active.',
+			);
 		}
 
 		const candidate = await Warranty.findByPk(warrantyId, {
@@ -296,13 +383,17 @@ export const deleteConfirmedWarranty = async ({
 			if (!legacy) {
 				throw new WarrantyLifecycleError('not_found', 'Warranty not found.');
 			}
+			assertConfirmation(legacy, confirmation);
 			const storageKey = legacy.pdfFileName;
 			const tombstone = await tombstoneAndHardDelete({
 				warranty: legacy,
 				franchiseeId,
+				idempotencyKey,
+				idempotencyAction: 'delete',
+				requestDigest,
 				transaction,
 			});
-			return { storageKey, replayed: true, tombstone };
+			return { storageKey, replayed: false, tombstone };
 		}
 		const warranty = await Warranty.findByPk(warrantyId, {
 			transaction,
@@ -320,6 +411,8 @@ export const deleteConfirmedWarranty = async ({
 			warranty,
 			franchiseeId,
 			idempotencyKey,
+			idempotencyAction: 'delete',
+			requestDigest,
 			transaction,
 		});
 		return { storageKey, replayed: false, tombstone };
@@ -330,13 +423,33 @@ export const createOrReplaceConfirmedWarranty = async ({
 	values,
 	idempotencyKey,
 	confirmation,
+	requestDigest,
 }: {
 	franchiseeId: string;
 	values: NewWarrantyValues;
 	idempotencyKey?: string;
 	confirmation?: WarrantyConfirmation;
+	requestDigest?: string;
 }) =>
 	sequelize.transaction(async (transaction) => {
+		if (confirmation && idempotencyKey && requestDigest) {
+			const keyedReplay = await findIdempotencyReplay(
+				franchiseeId,
+				idempotencyKey,
+				transaction,
+			);
+			if (keyedReplay) {
+				// Bind the key before trusting any changed request parent. A replay
+				// with a different client or other business field is a 409 identity
+				// conflict, not a fresh authorization/not-found probe.
+				assertIdempotencyIdentity({
+					tombstone: keyedReplay,
+					action: 'replace',
+					requestDigest,
+					warrantyId: confirmation.warrantyId,
+				});
+			}
+		}
 		await findOwnedClientForUpdate(values.clientId, franchiseeId, transaction);
 		const legacyStorageKeys = await backfillLegacySoftDeletedWarranties({
 			franchiseeId,
@@ -344,7 +457,46 @@ export const createOrReplaceConfirmedWarranty = async ({
 			transaction,
 		});
 
-		if (confirmation && idempotencyKey) {
+		if (confirmation && idempotencyKey && requestDigest) {
+			const keyedReplay = await findIdempotencyReplay(
+				franchiseeId,
+				idempotencyKey,
+				transaction,
+			);
+			if (keyedReplay) {
+				assertIdempotencyIdentity({
+					tombstone: keyedReplay,
+					action: 'replace',
+					requestDigest,
+					warrantyId: confirmation.warrantyId,
+				});
+				if (!keyedReplay.replacementWarrantyId) {
+					throw new WarrantyLifecycleError(
+						'idempotency_conflict',
+						'The original replacement result is no longer available.',
+					);
+				}
+				const replacement = await Warranty.findOne({
+					where: {
+						id: keyedReplay.replacementWarrantyId,
+						clientId: values.clientId,
+					},
+					transaction,
+					lock: transaction.LOCK.UPDATE,
+				});
+				if (!replacement) {
+					throw new WarrantyLifecycleError(
+						'idempotency_conflict',
+						'The original replacement result is no longer available.',
+					);
+				}
+				return {
+					warranty: replacement,
+					cleanupStorageKeys: legacyStorageKeys,
+					replayed: true,
+				};
+			}
+
 			const replay = await findReservedWarrantyId(confirmation.warrantyId, transaction);
 			if (replay) {
 				if (
@@ -357,6 +509,12 @@ export const createOrReplaceConfirmedWarranty = async ({
 						'The confirmed warranty is no longer the active warranty.',
 					);
 				}
+				assertIdempotencyIdentity({
+					tombstone: replay,
+					action: 'replace',
+					requestDigest,
+					warrantyId: confirmation.warrantyId,
+				});
 				const replacement = await Warranty.findOne({
 					where: {
 						id: replay.replacementWarrantyId,
@@ -424,6 +582,12 @@ export const createOrReplaceConfirmedWarranty = async ({
 				'Replacement requires an idempotency key and named, version-bound confirmation.',
 			);
 		}
+		if (!requestDigest) {
+			throw new WarrantyLifecycleError(
+				'confirmation_required',
+				'Replacement requires a request identity digest.',
+			);
+		}
 		const current = active[0];
 		assertConfirmation(current, confirmation);
 		const replacedStorageKey = current.pdfFileName;
@@ -431,6 +595,8 @@ export const createOrReplaceConfirmedWarranty = async ({
 			warranty: current,
 			franchiseeId,
 			idempotencyKey,
+			idempotencyAction: 'replace',
+			requestDigest,
 			replacementWarrantyId: values.id,
 			transaction,
 		});

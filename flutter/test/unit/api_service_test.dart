@@ -97,14 +97,21 @@ void main() {
       idempotencyKey = request.headers.value('Idempotency-Key');
       body = jsonDecode(await utf8.decoder.bind(request).join())
           as Map<String, dynamic>;
-      request.response.statusCode = HttpStatus.noContent;
+      request.response.statusCode = HttpStatus.ok;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'status': 'deleted',
+        'warranty_id': 'warranty-1',
+        'deletion_sequence': '42',
+        'replayed': false,
+      }));
       await request.response.close();
     });
 
     final apiService = ApiService(
       serverUrl: 'http://${server.address.host}:${server.port}',
     );
-    await apiService.deleteWarranty(
+    final result = await apiService.deleteWarranty(
       id: 'warranty-1',
       warrantyCardNumber: 'CARD-1',
       warrantyVersion: 3,
@@ -113,6 +120,7 @@ void main() {
     );
 
     expect(idempotencyKey, 'delete-request-key-001');
+    expect(result['deletion_sequence'], '42');
     expect(body, {
       'confirmed_warranty_id': 'warranty-1',
       'confirmed_warranty_card_number': 'CARD-1',

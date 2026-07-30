@@ -121,8 +121,28 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		const warranty = await createWarranty(id);
 		const key = 'idempotent-delete-key-001';
 
-		expect((await deleteRequest(warranty, token, key)).status).toBe(204);
-		expect((await deleteRequest(warranty, token, key)).status).toBe(204);
+		const deleted = await deleteRequest(warranty, token, key);
+		expect(deleted.status).toBe(200);
+		expect(deleted.body).toEqual({
+			status: 'deleted',
+			warranty_id: id,
+			deletion_sequence: expect.any(String),
+			replayed: false,
+		});
+		const replay = await deleteRequest(warranty, token, key);
+		expect(replay.status).toBe(200);
+		expect(replay.body).toEqual({
+			...deleted.body,
+			replayed: true,
+		});
+		const changedConfirmation = await deleteRequest(warranty, token, key, {
+			...confirmationFor(warranty),
+			irreversible_confirmation: `${irreversibleWarrantyConfirmation(
+				warranty.warrantyCardNumber,
+			)}!`,
+		});
+		expect(changedConfirmation.status).toBe(409);
+		expect(changedConfirmation.body.code).toBe('idempotency_conflict');
 		expect(await Warranty.findByPk(id, { paranoid: false })).toBeNull();
 		expect(await WarrantyDeletionTombstone.count({ where: { warrantyId: id } })).toBe(1);
 		const otherId = '10000000-0000-0000-0000-000000000014';
@@ -181,7 +201,13 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 				},
 			});
 		expect(crossTenantReuse.status).toBe(200);
-		expect(crossTenantReuse.body.outcomes.warranties[0].status).toBe('tombstoned');
+		expect(crossTenantReuse.body.outcomes.warranties).toEqual([
+			{
+				remote_id: id,
+				status: 'rejected',
+				code: 'warranty_conflict',
+			},
+		]);
 		expect(crossTenantReuse.body.updates.warranty_tombstones).toEqual([]);
 		expect(await Warranty.findByPk(id, { paranoid: false })).toBeNull();
 	});
@@ -197,7 +223,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 
 		expect(
 			(await deleteRequest(failureWarranty, token, 'file-failure-delete-key')).status,
-		).toBe(204);
+		).toBe(200);
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(await Warranty.findByPk(failureId, { paranoid: false })).toBeNull();
 		expect(
@@ -214,7 +240,7 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			pdfFileName: '../outside-managed-storage.pdf',
 		});
 		expect((await deleteRequest(unsafeWarranty, token, 'unsafe-path-delete-key')).status).toBe(
-			204,
+			200,
 		);
 		expect(
 			await ManagedFileCleanup.count({
@@ -233,30 +259,42 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		});
 		const old = await createWarranty(oldId, replacementClientId);
 		const key = 'replacement-idempotency-key-001';
-		const upload = () =>
+		const upload = ({
+			card = 'CARD-REPLACEMENT',
+			pdf = samplePdf,
+			version = old.version,
+			targetClientId = replacementClientId,
+		}: {
+			card?: string;
+			pdf?: Buffer;
+			version?: number;
+			targetClientId?: string;
+		} = {}) =>
 			request(app)
 				.post('/api/warranty/upload')
 				.set('Authorization', `Bearer ${token}`)
 				.set('Idempotency-Key', key)
-				.field('client_id', replacementClientId)
+				.field('client_id', targetClientId)
 				.field('start_date', '2026-07-30T00:00:00.000Z')
 				.field('duration_years', '10')
-				.field('warranty_card_number', 'CARD-REPLACEMENT')
+				.field('warranty_card_number', card)
 				.field('confirmed_warranty_id', old.id)
 				.field('confirmed_warranty_card_number', old.warrantyCardNumber)
-				.field('confirmed_warranty_version', old.version.toString())
+				.field('confirmed_warranty_version', version.toString())
 				.field(
 					'irreversible_confirmation',
 					irreversibleWarrantyConfirmation(old.warrantyCardNumber),
 				)
-				.attach('file', samplePdf, {
-					filename: 'replacement.pdf',
+				.attach('file', pdf, {
+					filename: 'replacement.PDF',
 					contentType: 'application/pdf',
 				});
 
 		const first = await upload();
 		expect(first.status).toBe(201);
 		expect(first.body.replayed).toBe(false);
+		expect(first.body.pdfFileName).toMatch(/\.pdf$/);
+		expect(first.body.pdfFileName).not.toMatch(/\.PDF$/);
 		expect(await Warranty.findByPk(old.id, { paranoid: false })).toBeNull();
 		expect((await WarrantyDeletionTombstone.findByPk(old.id))?.replacementWarrantyId).toBe(
 			first.body.id,
@@ -268,6 +306,28 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 		expect(replay.body.id).toBe(first.body.id);
 		expect(replay.body.replayed).toBe(true);
 		expect(await Warranty.count({ where: { clientId: replacementClientId } })).toBe(1);
+		const replacementWarranty = (await Warranty.findByPk(first.body.id))!;
+		const changedAction = await deleteRequest(replacementWarranty, token, key);
+		expect(changedAction.status).toBe(409);
+		expect(changedAction.body.code).toBe('idempotency_conflict');
+
+		const changedPayload = await upload({ card: 'CHANGED-PAYLOAD' });
+		expect(changedPayload.status).toBe(409);
+		expect(changedPayload.body.code).toBe('idempotency_conflict');
+
+		const changedFile = await upload({
+			pdf: Buffer.from('%PDF-1.4\nchanged content\n%%EOF'),
+		});
+		expect(changedFile.status).toBe(409);
+		expect(changedFile.body.code).toBe('idempotency_conflict');
+
+		const changedConfirmation = await upload({ version: old.version + 1 });
+		expect(changedConfirmation.status).toBe(409);
+		expect(changedConfirmation.body.code).toBe('idempotency_conflict');
+
+		const changedParent = await upload({ targetClientId: otherClientId });
+		expect(changedParent.status).toBe(409);
+		expect(changedParent.body.code).toBe('idempotency_conflict');
 
 		const stale = await request(app)
 			.post('/api/warranty/upload')
@@ -370,5 +430,95 @@ describe('APP-110 sync-safe permanent warranty deletion', () => {
 			expect.objectContaining({ warranty_id: deletedWarrantyId }),
 		);
 		expect(await Warranty.findByPk(deletedWarrantyId, { paranoid: false })).toBeNull();
+	});
+
+	it('rejects a warranty create whose client was deleted earlier in the same batch', async () => {
+		const deletedClientId = '10000000-0000-0000-0000-000000000050';
+		const attemptedWarrantyId = '10000000-0000-0000-0000-000000000051';
+		await Client.create({
+			id: deletedClientId,
+			name: 'Same-batch deleted client',
+			franchiseeId: tenantId,
+		});
+
+		const response = await request(app)
+			.post('/api/sync')
+			.set('Authorization', `Bearer ${token}`)
+			.send({
+				warranty_tombstone_cursor: '0',
+				changes: {
+					clients: [
+						{
+							remote_id: deletedClientId,
+							deleted_at: '2026-07-30T00:00:00.000Z',
+						},
+					],
+					warranties: [
+						{
+							remote_id: attemptedWarrantyId,
+							client_id: deletedClientId,
+							warranty_card_number: 'MUST-NOT-CREATE',
+							start_date: '2026-07-30T00:00:00.000Z',
+							duration_years: 5,
+						},
+					],
+				},
+			});
+
+		expect(response.status).toBe(200);
+		expect(response.body.outcomes.clients).toEqual([
+			expect.objectContaining({ remote_id: deletedClientId, status: 'applied' }),
+		]);
+		expect(response.body.outcomes.warranties).toEqual([
+			{
+				remote_id: attemptedWarrantyId,
+				status: 'rejected',
+				code: 'warranty_conflict',
+			},
+		]);
+		expect(await Client.findByPk(deletedClientId)).toBeNull();
+		expect(await Warranty.findByPk(attemptedWarrantyId, { paranoid: false })).toBeNull();
+	});
+
+	it('rejects oversized cursors before committing any mutation', async () => {
+		const cursorClientId = '10000000-0000-0000-0000-000000000060';
+		const cursorWarrantyId = '10000000-0000-0000-0000-000000000061';
+		const cursorClient = await Client.create({
+			id: cursorClientId,
+			name: 'Cursor unchanged',
+			franchiseeId: tenantId,
+		});
+		const cursorWarranty = await createWarranty(cursorWarrantyId, cursorClientId);
+
+		const response = await request(app)
+			.post('/api/sync')
+			.set('Authorization', `Bearer ${token}`)
+			.send({
+				warranty_tombstone_cursor: '9'.repeat(200),
+				changes: {
+					clients: [
+						{
+							remote_id: cursorClientId,
+							name: 'MUST NOT COMMIT',
+						},
+					],
+					warranties: [
+						{
+							remote_id: cursorWarrantyId,
+							client_id: cursorClientId,
+							warranty_card_number: 'MUST-NOT-COMMIT',
+							start_date: '2026-07-30T00:00:00.000Z',
+							duration_years: 50,
+						},
+					],
+				},
+			});
+
+		expect(response.status).toBe(400);
+		await cursorClient.reload();
+		await cursorWarranty.reload();
+		expect(cursorClient.name).toBe('Cursor unchanged');
+		expect(cursorWarranty.version).toBe(1);
+		expect(cursorWarranty.warrantyCardNumber).not.toBe('MUST-NOT-COMMIT');
 	});
 });

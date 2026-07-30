@@ -22,6 +22,7 @@ class PdfManagementScreen extends StatefulWidget {
 
 class _PdfManagementScreenState extends State<PdfManagementScreen> {
   bool _isGenerating = false;
+  bool _isWarrantyMutationInFlight = false;
   late final PdfService _pdfService;
 
   @override
@@ -105,84 +106,90 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
   }
 
   Future<void> _createWarranty() async {
-    if (!mounted) return;
+    if (!mounted || _isWarrantyMutationInFlight) return;
+    setState(() => _isWarrantyMutationInFlight = true);
+    try {
+      final activeWarranties =
+          context.read<ClientProvider>().currentClientWarranties;
+      final activeWarranty =
+          activeWarranties.isEmpty ? null : activeWarranties.first;
+      String? idempotencyKey;
+      if (activeWarranty != null) {
+        final replace = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Permanently replace warranty?'),
+            content: Text(
+              'Warranty "${activeWarranty.warrantyCardNumber}" '
+              '(server version ${activeWarranty.version}) will be permanently deleted. '
+              'Its record and stored PDF cannot be recovered. Continue only if you '
+              'intend to replace this exact warranty.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Permanently replace'),
+              ),
+            ],
+          ),
+        );
+        if (replace != true || !mounted) return;
+        idempotencyKey = const Uuid().v4();
+      }
 
-    final activeWarranties =
-        context.read<ClientProvider>().currentClientWarranties;
-    final activeWarranty =
-        activeWarranties.isEmpty ? null : activeWarranties.first;
-    String? idempotencyKey;
-    if (activeWarranty != null) {
-      final replace = await showDialog<bool>(
+      final result = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+          builder: (context) => WarrantyFormScreen(
+            client: widget.client,
+            warrantyToReplace: activeWarranty,
+            replacementIdempotencyKey: idempotencyKey,
+          ),
+        ),
+      );
+
+      if (result == true) {
+        await _loadData();
+      }
+    } finally {
+      if (mounted) setState(() => _isWarrantyMutationInFlight = false);
+    }
+  }
+
+  Future<void> _deleteWarranty(Warranty warranty) async {
+    if (!mounted || _isWarrantyMutationInFlight) return;
+    setState(() => _isWarrantyMutationInFlight = true);
+    try {
+      final confirm = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
-          title: const Text('Permanently replace warranty?'),
+          title: const Text('Permanently delete warranty?'),
           content: Text(
-            'Warranty "${activeWarranty.warrantyCardNumber}" '
-            '(server version ${activeWarranty.version}) will be permanently deleted. '
-            'Its record and stored PDF cannot be recovered. Continue only if you '
-            'intend to replace this exact warranty.',
+            'Warranty "${warranty.warrantyCardNumber}" '
+            '(server version ${warranty.version}) and its stored PDF will be '
+            'permanently deleted and cannot be recovered.',
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context, false),
               child: const Text('Cancel'),
             ),
-            ElevatedButton(
+            TextButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('Permanently replace'),
+              child: const Text(
+                'Permanently delete',
+                style: TextStyle(color: Colors.red),
+              ),
             ),
           ],
         ),
       );
-      if (replace != true || !mounted) return;
-      idempotencyKey = const Uuid().v4();
-    }
 
-    final result = await Navigator.push<bool>(
-      context,
-      MaterialPageRoute(
-        builder: (context) => WarrantyFormScreen(
-          client: widget.client,
-          warrantyToReplace: activeWarranty,
-          replacementIdempotencyKey: idempotencyKey,
-        ),
-      ),
-    );
-
-    if (result == true) {
-      _loadData();
-    }
-  }
-
-  Future<void> _deleteWarranty(Warranty warranty) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Permanently delete warranty?'),
-        content: Text(
-          'Warranty "${warranty.warrantyCardNumber}" '
-          '(server version ${warranty.version}) and its stored PDF will be '
-          'permanently deleted and cannot be recovered.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text(
-              'Permanently delete',
-              style: TextStyle(color: Colors.red),
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true && mounted) {
-      try {
+      if (confirm == true && mounted) {
         if (warranty.remoteId.isEmpty) {
           throw const ApiException(
             'This warranty has no server ID. Sync and try again.',
@@ -201,12 +208,14 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
         await context
             .read<ClientProvider>()
             .deleteWarranty(warranty.localId!, widget.client.localId!);
-      } catch (e) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error deleting warranty: $e')),
-        );
       }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error deleting warranty: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _isWarrantyMutationInFlight = false);
     }
   }
 
@@ -291,7 +300,9 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
             Padding(
               padding: const EdgeInsets.all(16.0),
               child: ElevatedButton.icon(
-                onPressed: _isGenerating ? null : _createWarranty,
+                onPressed: _isGenerating || _isWarrantyMutationInFlight
+                    ? null
+                    : _createWarranty,
                 icon: const Icon(Icons.add),
                 label: const Text('Create Warranty'),
               ),
@@ -309,7 +320,9 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
                           subtitle:
                               'Created: ${warranty.updatedAt.toLocal().toString().split('.')[0]}',
                           pdfUrl: warranty.pdfUrl,
-                          onDelete: () => _deleteWarranty(warranty),
+                          onDelete: _isWarrantyMutationInFlight
+                              ? null
+                              : () => _deleteWarranty(warranty),
                           onShare: () {
                             _sharePdf(
                               pdfUrl: warranty.pdfUrl,

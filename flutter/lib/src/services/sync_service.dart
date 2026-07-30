@@ -23,9 +23,6 @@ class SyncService {
     return 'last_sync_time_$franchiseeId';
   }
 
-  String _warrantyTombstoneCursorKey(String franchiseeId) =>
-      'warranty_tombstone_cursor_$franchiseeId';
-
   Set<String> _outcomeIds(
     dynamic outcomes,
     String collection,
@@ -50,10 +47,7 @@ class SyncService {
     final lastSyncTime =
         prefs.getString(syncTimeKey) ?? prefs.getString('last_sync_time');
     final warrantyTombstoneCursor = shouldFilterByFranchise
-        ? prefs.getString(
-              _warrantyTombstoneCursorKey(activeFranchiseeId),
-            ) ??
-            '0'
+        ? await dbService.getWarrantyTombstoneCursor(activeFranchiseeId)
         : '0';
 
     // Build active-session maps once so all payloads resolve IDs consistently.
@@ -216,13 +210,15 @@ class SyncService {
         continue;
       }
 
+      final photosChanged =
+          canonicalPhotos.join('|') != client.photos.join('|');
       final clientForPayload = client.copyWith(
         photos: canonicalPhotos,
         isDirty: true,
-        updatedAt: DateTime.now(),
+        updatedAt: photosChanged ? DateTime.now() : client.updatedAt,
       );
       if (canonicalPhotos.length == client.photos.length) {
-        if (canonicalPhotos.join('|') != client.photos.join('|')) {
+        if (photosChanged) {
           await dbService.updateClient(clientForPayload);
         }
         clientsToMarkSynced.add(clientForPayload);
@@ -261,20 +257,39 @@ class SyncService {
         _outcomeIds(outcomes, 'warranties', 'tombstoned');
     final appliedProposals = _outcomeIds(outcomes, 'proposals', 'applied');
 
-    // 3. Apply updates to local DB
-    if (updates != null) {
-      // Permanent warranty tombstones are applied before any live warranty.
-      // Their sequence cursor is independent of wall-clock sync timestamps.
-      if (shouldFilterByFranchise) {
+    if (shouldFilterByFranchise) {
+      final nextCursor = response['warranty_tombstone_cursor']?.toString();
+      final parsedCursor =
+          nextCursor == null ? null : BigInt.tryParse(nextCursor);
+      if (parsedCursor == null ||
+          parsedCursor.isNegative ||
+          parsedCursor > BigInt.parse('9223372036854775807')) {
+        throw const ApiException(
+          'Sync returned an invalid warranty tombstone cursor.',
+        );
+      }
+      final tombstones = <WarrantyDeletionTombstone>[];
+      if (updates is Map) {
         for (final rawTombstone in updates['warranty_tombstones'] ?? const []) {
-          final tombstone = WarrantyDeletionTombstone.fromServer(
-            Map<String, dynamic>.from(rawTombstone as Map),
-            franchiseeId: activeFranchiseeId,
+          tombstones.add(
+            WarrantyDeletionTombstone.fromServer(
+              Map<String, dynamic>.from(rawTombstone as Map),
+              franchiseeId: activeFranchiseeId,
+            ),
           );
-          await dbService.applyWarrantyTombstone(tombstone);
         }
       }
+      // Deletions and their acknowledgement cursor are one durable SQLite
+      // commit, so a crash cannot advance past an unapplied tombstone.
+      await dbService.applyWarrantyTombstonesAndCursor(
+        tombstones,
+        franchiseeId: activeFranchiseeId,
+        cursor: parsedCursor.toString(),
+      );
+    }
 
+    // 3. Apply updates to local DB
+    if (updates != null) {
       // Clients
       for (var clientMap in updates['clients']) {
         final remoteId = clientMap['remote_id'];
@@ -373,11 +388,6 @@ class SyncService {
                 existing.localId!,
                 franchiseeId: activeFranchiseeId,
               );
-              await dbService.markAsSynced(
-                'default_prices',
-                remoteId,
-                franchiseeId: activeFranchiseeId,
-              );
             }
             continue;
           }
@@ -463,17 +473,29 @@ class SyncService {
     // 4. Clear dirty flags for records we just sent
     for (var c in clientsToMarkSynced) {
       if (appliedClients.contains(c.remoteId)) {
-        await dbService.markAsSynced('clients', c.remoteId);
+        await dbService.markAsSynced(
+          'clients',
+          c.remoteId,
+          submittedUpdatedAt: c.updatedAt.toIso8601String(),
+        );
       }
     }
     for (var i in itemsToSync) {
       if (appliedItems.contains(i.remoteId)) {
-        await dbService.markAsSynced('items', i.remoteId);
+        await dbService.markAsSynced(
+          'items',
+          i.remoteId,
+          submittedUpdatedAt: i.updatedAt.toIso8601String(),
+        );
       }
     }
     for (var r in rectanglesToSync) {
       if (appliedRectangles.contains(r.remoteId)) {
-        await dbService.markAsSynced('rectangles', r.remoteId);
+        await dbService.markAsSynced(
+          'rectangles',
+          r.remoteId,
+          submittedUpdatedAt: r.updatedAt.toIso8601String(),
+        );
       }
     }
     for (final price in dirtyDefaultPrices) {
@@ -482,6 +504,7 @@ class SyncService {
           'default_prices',
           price.remoteId,
           franchiseeId: activeFranchiseeId,
+          submittedUpdatedAt: price.updatedAt.toIso8601String(),
         );
       }
     }
@@ -489,12 +512,20 @@ class SyncService {
       if (tombstonedWarranties.contains(w.remoteId)) {
         await dbService.hardDeleteWarrantyByRemoteId(w.remoteId);
       } else if (appliedWarranties.contains(w.remoteId)) {
-        await dbService.markAsSynced('warranties', w.remoteId);
+        await dbService.markAsSynced(
+          'warranties',
+          w.remoteId,
+          submittedUpdatedAt: w.updatedAt.toIso8601String(),
+        );
       }
     }
     for (var p in proposalsToSync) {
       if (appliedProposals.contains(p.remoteId)) {
-        await dbService.markAsSynced('proposals', p.remoteId);
+        await dbService.markAsSynced(
+          'proposals',
+          p.remoteId,
+          submittedUpdatedAt: p.updatedAt.toIso8601String(),
+        );
       }
     }
 
@@ -502,15 +533,6 @@ class SyncService {
     await prefs.setString(syncTimeKey, serverTime);
     if (syncTimeKey != 'last_sync_time') {
       await prefs.remove('last_sync_time');
-    }
-    if (shouldFilterByFranchise) {
-      final nextCursor = response['warranty_tombstone_cursor']?.toString();
-      if (nextCursor != null && RegExp(r'^\d+$').hasMatch(nextCursor)) {
-        await prefs.setString(
-          _warrantyTombstoneCursorKey(activeFranchiseeId),
-          nextCursor,
-        );
-      }
     }
   }
 }

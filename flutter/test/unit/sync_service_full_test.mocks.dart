@@ -174,7 +174,7 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
       ) as _i5.Future<Map<String, dynamic>>);
 
   @override
-  _i5.Future<void> deleteWarranty({
+  _i5.Future<Map<String, dynamic>> deleteWarranty({
     required String? id,
     required String? warrantyCardNumber,
     required int? warrantyVersion,
@@ -193,9 +193,9 @@ class MockApiService extends _i1.Mock implements _i3.ApiService {
             #idempotencyKey: idempotencyKey,
           },
         ),
-        returnValue: _i5.Future<void>.value(),
-        returnValueForMissingStub: _i5.Future<void>.value(),
-      ) as _i5.Future<void>);
+        returnValue:
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
 
   @override
   _i5.Future<Map<String, dynamic>> uploadProposal(
@@ -574,6 +574,41 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<void>);
 
   @override
+  _i5.Future<String> getWarrantyTombstoneCursor(String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getWarrantyTombstoneCursor,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<String>.value(_i4.dummyValue<String>(
+          this,
+          Invocation.method(
+            #getWarrantyTombstoneCursor,
+            [franchiseeId],
+          ),
+        )),
+      ) as _i5.Future<String>);
+
+  @override
+  _i5.Future<void> applyWarrantyTombstonesAndCursor(
+    List<_i12.WarrantyDeletionTombstone>? tombstones, {
+    required String? franchiseeId,
+    required String? cursor,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #applyWarrantyTombstonesAndCursor,
+          [tombstones],
+          {
+            #franchiseeId: franchiseeId,
+            #cursor: cursor,
+          },
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
   _i5.Future<bool> hasWarrantyTombstone(
     String? warrantyId, {
     required String? franchiseeId,
@@ -710,10 +745,11 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<List<_i13.Proposal>>);
 
   @override
-  _i5.Future<void> markAsSynced(
+  _i5.Future<int> markAsSynced(
     String? table,
     String? remoteId, {
     String? franchiseeId,
+    required String? submittedUpdatedAt,
   }) =>
       (super.noSuchMethod(
         Invocation.method(
@@ -722,9 +758,11 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
             table,
             remoteId,
           ],
-          {#franchiseeId: franchiseeId},
+          {
+            #franchiseeId: franchiseeId,
+            #submittedUpdatedAt: submittedUpdatedAt,
+          },
         ),
-        returnValue: _i5.Future<void>.value(),
-        returnValueForMissingStub: _i5.Future<void>.value(),
-      ) as _i5.Future<void>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 }
