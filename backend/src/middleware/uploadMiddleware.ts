@@ -33,3 +33,30 @@ export const upload = multer({
 		}
 	},
 });
+
+/** Remove an already-written multer file when the request cannot be persisted. */
+export const removeUploadedFile = async (file?: Express.Multer.File) => {
+	if (!file?.path) return;
+	try {
+		await fs.promises.unlink(file.path);
+	} catch (error: any) {
+		if (error?.code !== 'ENOENT') {
+			console.error(`Unable to remove rejected upload ${file.path}:`, error);
+		}
+	}
+};
+
+export const removeStoredPdf = async (pdfUrl: string, pdfFileName?: string | null) => {
+	const filename = pdfFileName || path.basename(new URL(pdfUrl, 'http://localhost').pathname);
+	if (!filename || filename === '.' || filename === path.sep) return;
+	const uploadPath = path.join(__dirname, '../../uploads');
+	const filePath = path.join(uploadPath, filename);
+	if (path.dirname(filePath) !== uploadPath) return;
+	try {
+		await fs.promises.unlink(filePath);
+	} catch (error: any) {
+		if (error?.code !== 'ENOENT') {
+			console.error(`Unable to remove stored PDF ${filePath}:`, error);
+		}
+	}
+};

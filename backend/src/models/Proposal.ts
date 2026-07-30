@@ -5,6 +5,7 @@ export class Proposal extends Model {
   public id!: string;
   public clientId!: string;
   public pdfUrl!: string;
+  public pdfFileName!: string;
   public readonly createdAt!: Date;
   public readonly updatedAt!: Date;
   public readonly deletedAt!: Date;
@@ -24,6 +25,10 @@ Proposal.init(
     pdfUrl: {
       type: DataTypes.STRING,
       allowNull: false,
+    },
+    pdfFileName: {
+      type: DataTypes.STRING,
+      allowNull: true,
     },
     deletedAt: {
       type: DataTypes.DATE,

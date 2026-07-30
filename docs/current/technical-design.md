@@ -1,5 +1,20 @@
 # Technical Design: Warranty & Proposal PDF Update
 
+## Current integrated design notes (2026-07)
+
+The original feature design below remains the historical contract. The following implemented controls refine it:
+
+- Authentication is database-backed after JWT verification: the user must exist, be active, retain the token's franchisee binding, and match its token-version revocation state. Public self-registration is not routed.
+- Every sync mutation/deletion is tenant-authorized in a transaction. Child resources are authorized through their complete parent chain, and hostile cross-tenant UUID reuse is rejected.
+- Warranty sync cannot set server-managed PDF URL/file metadata or active state. It enforces one active warranty per client; a conflicting offline change receives 409 unless `replace_existing: true`. Replaced/deleted managed files are cleaned after commit on a best-effort basis.
+- Proposal sync likewise ignores caller-supplied PDF storage metadata. Download endpoints authorize via the owning client rather than a public static URL.
+- Client photos use authenticated canonical paths only: `/api/photos/client/{clientId}/{opaque-uuid}.{jpg|png|webp}`. Upload is the only way to add a path; sync can only retain already-owned paths and removes dropped files after commit. Photo download/delete verifies both tenant/client ownership and metadata membership.
+- Backend schema changes use a versioned delta migration; application startup no longer runs `sequelize.sync({ alter: true })`. The migration has been rehearsed against a disposable PostgreSQL restore of production, including undo/reapply, idempotency, and compatibility with writes from the pre-migration application.
+- The migration creates both an `active_client_id` unique index for the new application and a partial `client_id` unique index for non-deleted warranties. The latter closes the deployment window in which the old PM2 process could otherwise create a second active warranty before restart.
+- Both new-server replacement paths query every non-deleted warranty by `client_id`, not only rows with `active_client_id` populated. Before insertion they also clear `active_client_id` across the client's paranoid history, because the old process can retain that marker on a migrated row it soft-deletes during the migration-to-restart window.
+- Flutter SQLite v8 leaves legacy default-price ownership nullable at schema-upgrade time, then atomically assigns unscoped rows to the first authenticated franchisee. Other tenants cannot read or reclaim those rows.
+- If any local client-photo upload fails, Flutter omits that client mutation from the sync request and keeps it dirty. This prevents a partially uploaded list from deleting canonical server photos.
+
 ## 1. Architecture Summary
 The feature centralizes PDF management for clients into a dedicated screen. It introduces persistence and synchronization for Warranty and Proposal PDFs, allowing them to be shared across devices.
 - **Backend**: New `Proposal` model, updated `syncController` to handle `Warranty` and `Proposal` syncing, and updated upload controllers to handle actual file storage.
@@ -86,8 +101,9 @@ The feature centralizes PDF management for clients into a dedicated screen. It i
 - **Proposal**: `POST /api/proposal/upload` (Multipart/form-data)
   - Fields: `file` (File), `client_id` (String).
 
-### Static Assets
-- PDFs will be served from `GET /uploads/:filename`.
+### Managed assets (implemented refinement)
+- PDFs are accessed through authenticated warranty/proposal download endpoints, not a public `GET /uploads/:filename` contract.
+- Client photos are accessed through authenticated canonical photo URLs described above.
 
 ## 6. Test Targets
 - `backend/src/controllers/syncController.test.ts`: Verify `Warranty` and `Proposal` syncing logic.
@@ -113,4 +129,4 @@ The feature centralizes PDF management for clients into a dedicated screen. It i
 - **Backend**: Use relative imports (e.g., `import { Client } from '../models';`).
 - **Naming**: Use `PascalCase` for model classes (e.g., `class Proposal`) and `snake_case` for database fields/JSON keys (e.g., `client_id`).
 
-READY_FOR_TESTS_AND_DEV
+Historical status: **READY_FOR_TESTS_AND_DEV**. Current verification and release gates are in `implementation-status.md` and `test-results.md`.

@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../../models/client.dart';
 import '../../providers/client_provider.dart';
 import '../../services/client_photo_service.dart';
+import '../../services/api_service.dart';
 import 'client_photo_preview_screen.dart';
 
 class ClientPhotoGalleryScreen extends StatefulWidget {
@@ -151,6 +152,13 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
       final client = _currentClient;
       if (!mounted) return false;
 
+      if (widget.photoService.isRemotePhotoPath(photoPath)) {
+        await context.read<ApiService>().deleteClientPhoto(photoPath);
+      } else {
+        await widget.photoService.deletePhoto(photoPath);
+      }
+
+      if (!mounted) return false;
       await context.read<ClientProvider>().updateClient(
             client.copyWith(
               photos:
@@ -159,7 +167,6 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
               updatedAt: DateTime.now(),
             ),
           );
-      await widget.photoService.deletePhoto(photoPath);
 
       if (!mounted) return true;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -277,8 +284,11 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(16),
                                   child: Image(
-                                    image: widget.photoService
-                                        .buildImageProvider(photoPath),
+                                    image:
+                                        widget.photoService.buildImageProvider(
+                                      photoPath,
+                                      apiService: context.read<ApiService?>(),
+                                    ),
                                     fit: BoxFit.cover,
                                     errorBuilder: (context, error, stackTrace) {
                                       return const Center(

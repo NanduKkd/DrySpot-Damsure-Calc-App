@@ -29,6 +29,8 @@ class MockClientProvider extends ChangeNotifier implements ClientProvider {
   @override
   bool get isLoading => false;
   @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
+  @override
   Future<void> loadClients() async {}
   @override
   Future<void> addClient(Client client) async {}
@@ -83,6 +85,8 @@ class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
 
   @override
   Future<void> loadSettings() async {}
+  @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
   @override
   double get firstDefaultPrice => 45.0;
   @override

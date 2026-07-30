@@ -31,6 +31,8 @@ class MockClientProvider extends ChangeNotifier implements ClientProvider {
   @override
   bool get isLoading => false;
   @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
+  @override
   Future<void> loadClients() async {}
   @override
   Future<void> deleteClient(int localId) async {}
@@ -80,6 +82,8 @@ class MockAuthProvider extends ChangeNotifier implements AuthProvider {
 
   @override
   bool get isAuthenticated => true;
+  @override
+  bool get isRestoringSession => false;
   @override
   Future<void> login(String email, String password) async {}
   @override

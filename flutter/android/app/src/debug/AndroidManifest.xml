@@ -4,4 +4,7 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Debug-only override for local HTTP development servers. Release inherits
+         the main manifest's cleartext=false setting. -->
+    <application android:usesCleartextTraffic="true" />
 </manifest>

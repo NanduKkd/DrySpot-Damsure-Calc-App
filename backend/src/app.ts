@@ -4,9 +4,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import morgan from 'morgan';
 import routes from './routes';
-import { sequelize } from './models';
 
-import path from 'path';
 
 const app: Application = express();
 const requestBodyLimit = process.env.REQUEST_BODY_LIMIT || '20mb';
@@ -21,7 +19,6 @@ app.use(morgan('dev'));
 app.use(express.json({ limit: requestBodyLimit }));
 app.use(express.urlencoded({ extended: true, limit: requestBodyLimit }));
 
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/api', routes);
 
 app.get('/health', (_req: Request, res: Response) => {
@@ -60,17 +57,5 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 
 	res.status(500).json({ error: 'Something went wrong!' });
 });
-
-// Sync database (in production, use migrations)
-if (process.env.NODE_ENV !== 'test') {
-	sequelize
-		.sync({ alter: true })
-		.then(() => {
-			console.log('Database synced');
-		})
-		.catch((err) => {
-			console.error('Error syncing database:', err);
-		});
-}
 
 export default app;

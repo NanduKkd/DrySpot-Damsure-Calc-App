@@ -2,6 +2,7 @@ import request from 'supertest';
 import app from '../app';
 import { User, Franchisee } from '../models';
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 
 describe('authController', () => {
   let franchisee: any;
@@ -57,5 +58,28 @@ describe('authController', () => {
       expect(response.status).toBe(401);
       expect(response.body).toEqual({ error: 'Invalid email or password' });
     });
+  });
+
+  it('does not expose public self-registration', async () => {
+    const response = await request(app).post('/api/auth/register').send({
+      name: 'Attacker', email: 'attacker@example.com', password: 'password', franchiseeId: franchisee.id,
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it('rejects tokens for deactivated or revoked users', async () => {
+    const password = await bcrypt.hash('password123', 10);
+    const user = await User.create({
+      name: 'Disabled user', email: 'disabled@example.com', password, franchiseeId: franchisee.id,
+    });
+    const token = jwt.sign(
+      { id: user.id, franchiseeId: franchisee.id, tokenVersion: 0 }, process.env.JWT_SECRET!,
+    );
+
+    await user.update({ isActive: false });
+    expect((await request(app).post('/api/sync').set('Authorization', `Bearer ${token}`).send({})).status).toBe(401);
+
+    await user.update({ isActive: true, tokenVersion: 1 });
+    expect((await request(app).post('/api/sync').set('Authorization', `Bearer ${token}`).send({})).status).toBe(401);
   });
 });

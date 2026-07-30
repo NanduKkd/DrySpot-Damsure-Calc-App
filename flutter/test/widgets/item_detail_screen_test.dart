@@ -33,6 +33,8 @@ class MockSettingsProvider extends ChangeNotifier implements SettingsProvider {
   @override
   Future<void> loadSettings() async {}
   @override
+  void updateSession({required bool isAuthenticated, String? franchiseeId}) {}
+  @override
   double get firstDefaultPrice => 45.0;
   @override
   Future<void> addDefaultPrice(double price) async {}

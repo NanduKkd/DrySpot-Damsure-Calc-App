@@ -42,8 +42,9 @@ class AuthProvider extends ChangeNotifier {
     await prefs.setString('token', _token!);
     await prefs.setString('user_name', _userName!);
     await prefs.setString('franchisee_id', _franchiseeId!);
-    if (_franchiseeName != null)
+    if (_franchiseeName != null) {
       await prefs.setString('franchisee_name', _franchiseeName!);
+    }
     await prefs.remove('last_sync_time');
 
     if (previousFranchiseeId != null &&

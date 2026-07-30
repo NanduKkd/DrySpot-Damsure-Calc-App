@@ -7,6 +7,8 @@ export class User extends Model {
   public email!: string;
   public password!: string;
   public franchiseeId!: string;
+  public isActive!: boolean;
+  public tokenVersion!: number;
   public readonly createdAt!: Date;
   public readonly updatedAt!: Date;
 }
@@ -37,6 +39,16 @@ User.init(
     franchiseeId: {
       type: DataTypes.UUID,
       allowNull: false,
+    },
+    isActive: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
+    tokenVersion: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
     },
   },
   {

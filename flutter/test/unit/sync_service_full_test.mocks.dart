@@ -3,18 +3,19 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i6;
+import 'dart:async' as _i5;
 
-import 'package:app_client/src/models/client.dart' as _i8;
-import 'package:app_client/src/models/default_price.dart' as _i11;
-import 'package:app_client/src/models/item.dart' as _i9;
-import 'package:app_client/src/models/rectangle.dart' as _i10;
-import 'package:app_client/src/models/warranty.dart' as _i2;
-import 'package:app_client/src/services/api_service.dart' as _i4;
-import 'package:app_client/src/services/db_service.dart' as _i7;
+import 'package:app_client/src/models/client.dart' as _i7;
+import 'package:app_client/src/models/default_price.dart' as _i10;
+import 'package:app_client/src/models/item.dart' as _i8;
+import 'package:app_client/src/models/proposal.dart' as _i12;
+import 'package:app_client/src/models/rectangle.dart' as _i9;
+import 'package:app_client/src/models/warranty.dart' as _i11;
+import 'package:app_client/src/services/api_service.dart' as _i3;
+import 'package:app_client/src/services/db_service.dart' as _i6;
 import 'package:mockito/mockito.dart' as _i1;
-import 'package:mockito/src/dummies.dart' as _i5;
-import 'package:sqflite/sqflite.dart' as _i3;
+import 'package:mockito/src/dummies.dart' as _i4;
+import 'package:sqflite/sqflite.dart' as _i2;
 
 // ignore_for_file: type=lint
 // ignore_for_file: avoid_redundant_argument_values
@@ -31,18 +32,8 @@ import 'package:sqflite/sqflite.dart' as _i3;
 // ignore_for_file: subtype_of_sealed_class
 // ignore_for_file: invalid_use_of_internal_member
 
-class _FakeWarranty_0 extends _i1.SmartFake implements _i2.Warranty {
-  _FakeWarranty_0(
-    Object parent,
-    Invocation parentInvocation,
-  ) : super(
-          parent,
-          parentInvocation,
-        );
-}
-
-class _FakeDatabase_1 extends _i1.SmartFake implements _i3.Database {
-  _FakeDatabase_1(
+class _FakeDatabase_0 extends _i1.SmartFake implements _i2.Database {
+  _FakeDatabase_0(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -54,19 +45,34 @@ class _FakeDatabase_1 extends _i1.SmartFake implements _i3.Database {
 /// A class which mocks [ApiService].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockApiService extends _i1.Mock implements _i4.ApiService {
+class MockApiService extends _i1.Mock implements _i3.ApiService {
   MockApiService() {
     _i1.throwOnMissingStub(this);
   }
 
   @override
+  String get serverUrl => (super.noSuchMethod(
+        Invocation.getter(#serverUrl),
+        returnValue: _i4.dummyValue<String>(
+          this,
+          Invocation.getter(#serverUrl),
+        ),
+      ) as String);
+
+  @override
   String get baseUrl => (super.noSuchMethod(
         Invocation.getter(#baseUrl),
-        returnValue: _i5.dummyValue<String>(
+        returnValue: _i4.dummyValue<String>(
           this,
           Invocation.getter(#baseUrl),
         ),
       ) as String);
+
+  @override
+  Map<String, String> get authenticatedHeaders => (super.noSuchMethod(
+        Invocation.getter(#authenticatedHeaders),
+        returnValue: <String, String>{},
+      ) as Map<String, String>);
 
   @override
   void setToken(String? token) => super.noSuchMethod(
@@ -78,7 +84,49 @@ class MockApiService extends _i1.Mock implements _i4.ApiService {
       );
 
   @override
-  _i6.Future<Map<String, dynamic>> login(
+  _i5.Future<void> loadServerUrl() => (super.noSuchMethod(
+        Invocation.method(
+          #loadServerUrl,
+          [],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
+  _i5.Future<void> setServerUrl(String? serverUrl) => (super.noSuchMethod(
+        Invocation.method(
+          #setServerUrl,
+          [serverUrl],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
+  String resolveUrl(String? pathOrUrl) => (super.noSuchMethod(
+        Invocation.method(
+          #resolveUrl,
+          [pathOrUrl],
+        ),
+        returnValue: _i4.dummyValue<String>(
+          this,
+          Invocation.method(
+            #resolveUrl,
+            [pathOrUrl],
+          ),
+        ),
+      ) as String);
+
+  @override
+  String? resolveProtectedClientPhotoUrl(String? photoUrl) =>
+      (super.noSuchMethod(Invocation.method(
+        #resolveProtectedClientPhotoUrl,
+        [photoUrl],
+      )) as String?);
+
+  @override
+  _i5.Future<Map<String, dynamic>> login(
     String? email,
     String? password,
   ) =>
@@ -91,297 +139,508 @@ class MockApiService extends _i1.Mock implements _i4.ApiService {
           ],
         ),
         returnValue:
-            _i6.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
-      ) as _i6.Future<Map<String, dynamic>>);
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
 
   @override
-  _i6.Future<Map<String, dynamic>> sync(Map<String, dynamic>? data) =>
+  _i5.Future<Map<String, dynamic>> sync(Map<String, dynamic>? data) =>
       (super.noSuchMethod(
         Invocation.method(
           #sync,
           [data],
         ),
         returnValue:
-            _i6.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
-      ) as _i6.Future<Map<String, dynamic>>);
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
 
   @override
-  _i6.Future<_i2.Warranty> uploadWarranty(Map<String, dynamic>? data) =>
+  _i5.Future<Map<String, dynamic>> uploadWarranty(
+    String? filePath,
+    Map<String, String>? fields,
+  ) =>
       (super.noSuchMethod(
         Invocation.method(
           #uploadWarranty,
-          [data],
+          [
+            filePath,
+            fields,
+          ],
         ),
-        returnValue: _i6.Future<_i2.Warranty>.value(_FakeWarranty_0(
-          this,
-          Invocation.method(
-            #uploadWarranty,
-            [data],
-          ),
-        )),
-      ) as _i6.Future<_i2.Warranty>);
+        returnValue:
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
 
   @override
-  _i6.Future<List<_i2.Warranty>> getWarranties(String? clientId) =>
+  _i5.Future<Map<String, dynamic>> uploadProposal(
+    String? filePath,
+    Map<String, String>? fields,
+  ) =>
       (super.noSuchMethod(
         Invocation.method(
-          #getWarranties,
-          [clientId],
+          #uploadProposal,
+          [
+            filePath,
+            fields,
+          ],
         ),
-        returnValue: _i6.Future<List<_i2.Warranty>>.value(<_i2.Warranty>[]),
-      ) as _i6.Future<List<_i2.Warranty>>);
+        returnValue:
+            _i5.Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+      ) as _i5.Future<Map<String, dynamic>>);
+
+  @override
+  _i5.Future<void> deleteProposal(String? id) => (super.noSuchMethod(
+        Invocation.method(
+          #deleteProposal,
+          [id],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
+  _i5.Future<String> uploadClientPhoto(
+    String? clientId,
+    String? filePath,
+  ) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #uploadClientPhoto,
+          [
+            clientId,
+            filePath,
+          ],
+        ),
+        returnValue: _i5.Future<String>.value(_i4.dummyValue<String>(
+          this,
+          Invocation.method(
+            #uploadClientPhoto,
+            [
+              clientId,
+              filePath,
+            ],
+          ),
+        )),
+      ) as _i5.Future<String>);
+
+  @override
+  _i5.Future<void> deleteClientPhoto(String? photoUrl) => (super.noSuchMethod(
+        Invocation.method(
+          #deleteClientPhoto,
+          [photoUrl],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
 }
 
 /// A class which mocks [DbService].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockDbService extends _i1.Mock implements _i7.DbService {
+class MockDbService extends _i1.Mock implements _i6.DbService {
   MockDbService() {
     _i1.throwOnMissingStub(this);
   }
 
   @override
-  _i6.Future<_i3.Database> get database => (super.noSuchMethod(
+  _i5.Future<_i2.Database> get database => (super.noSuchMethod(
         Invocation.getter(#database),
-        returnValue: _i6.Future<_i3.Database>.value(_FakeDatabase_1(
+        returnValue: _i5.Future<_i2.Database>.value(_FakeDatabase_0(
           this,
           Invocation.getter(#database),
         )),
-      ) as _i6.Future<_i3.Database>);
+      ) as _i5.Future<_i2.Database>);
 
   @override
-  _i6.Future<int> insertClient(_i8.Client? client) => (super.noSuchMethod(
+  _i5.Future<int> insertClient(_i7.Client? client) => (super.noSuchMethod(
         Invocation.method(
           #insertClient,
           [client],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<List<_i8.Client>> getClients() => (super.noSuchMethod(
+  _i5.Future<List<_i7.Client>> getClients() => (super.noSuchMethod(
         Invocation.method(
           #getClients,
           [],
         ),
-        returnValue: _i6.Future<List<_i8.Client>>.value(<_i8.Client>[]),
-      ) as _i6.Future<List<_i8.Client>>);
+        returnValue: _i5.Future<List<_i7.Client>>.value(<_i7.Client>[]),
+      ) as _i5.Future<List<_i7.Client>>);
 
   @override
-  _i6.Future<_i8.Client?> getClientByRemoteId(String? remoteId) =>
+  _i5.Future<_i7.Client?> getClientByRemoteId(String? remoteId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getClientByRemoteId,
           [remoteId],
         ),
-        returnValue: _i6.Future<_i8.Client?>.value(),
-      ) as _i6.Future<_i8.Client?>);
+        returnValue: _i5.Future<_i7.Client?>.value(),
+      ) as _i5.Future<_i7.Client?>);
 
   @override
-  _i6.Future<int> updateClient(_i8.Client? client) => (super.noSuchMethod(
+  _i5.Future<int> updateClient(_i7.Client? client) => (super.noSuchMethod(
         Invocation.method(
           #updateClient,
           [client],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> softDeleteClient(int? localId) => (super.noSuchMethod(
+  _i5.Future<int> softDeleteClient(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #softDeleteClient,
           [localId],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> insertItem(_i9.Item? item) => (super.noSuchMethod(
+  _i5.Future<int> insertItem(_i8.Item? item) => (super.noSuchMethod(
         Invocation.method(
           #insertItem,
           [item],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<List<_i9.Item>> getItemsByClientId(int? clientId) =>
+  _i5.Future<List<_i8.Item>> getItemsByClientId(int? clientId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getItemsByClientId,
           [clientId],
         ),
-        returnValue: _i6.Future<List<_i9.Item>>.value(<_i9.Item>[]),
-      ) as _i6.Future<List<_i9.Item>>);
+        returnValue: _i5.Future<List<_i8.Item>>.value(<_i8.Item>[]),
+      ) as _i5.Future<List<_i8.Item>>);
 
   @override
-  _i6.Future<_i9.Item?> getItemByRemoteId(String? remoteId) =>
+  _i5.Future<_i8.Item?> getItemByRemoteId(String? remoteId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getItemByRemoteId,
           [remoteId],
         ),
-        returnValue: _i6.Future<_i9.Item?>.value(),
-      ) as _i6.Future<_i9.Item?>);
+        returnValue: _i5.Future<_i8.Item?>.value(),
+      ) as _i5.Future<_i8.Item?>);
 
   @override
-  _i6.Future<_i9.Item?> getItemByLocalId(int? localId) => (super.noSuchMethod(
+  _i5.Future<_i8.Item?> getItemByLocalId(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #getItemByLocalId,
           [localId],
         ),
-        returnValue: _i6.Future<_i9.Item?>.value(),
-      ) as _i6.Future<_i9.Item?>);
+        returnValue: _i5.Future<_i8.Item?>.value(),
+      ) as _i5.Future<_i8.Item?>);
 
   @override
-  _i6.Future<int> updateItem(_i9.Item? item) => (super.noSuchMethod(
+  _i5.Future<int> updateItem(_i8.Item? item) => (super.noSuchMethod(
         Invocation.method(
           #updateItem,
           [item],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> softDeleteItem(int? localId) => (super.noSuchMethod(
+  _i5.Future<int> softDeleteItem(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #softDeleteItem,
           [localId],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> insertRectangle(_i10.Rectangle? rectangle) =>
+  _i5.Future<int> insertRectangle(_i9.Rectangle? rectangle) =>
       (super.noSuchMethod(
         Invocation.method(
           #insertRectangle,
           [rectangle],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<List<_i10.Rectangle>> getRectanglesByItemId(int? itemId) =>
+  _i5.Future<List<_i9.Rectangle>> getRectanglesByItemId(int? itemId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getRectanglesByItemId,
           [itemId],
         ),
-        returnValue: _i6.Future<List<_i10.Rectangle>>.value(<_i10.Rectangle>[]),
-      ) as _i6.Future<List<_i10.Rectangle>>);
+        returnValue: _i5.Future<List<_i9.Rectangle>>.value(<_i9.Rectangle>[]),
+      ) as _i5.Future<List<_i9.Rectangle>>);
 
   @override
-  _i6.Future<_i10.Rectangle?> getRectangleByRemoteId(String? remoteId) =>
+  _i5.Future<_i9.Rectangle?> getRectangleByRemoteId(String? remoteId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getRectangleByRemoteId,
           [remoteId],
         ),
-        returnValue: _i6.Future<_i10.Rectangle?>.value(),
-      ) as _i6.Future<_i10.Rectangle?>);
+        returnValue: _i5.Future<_i9.Rectangle?>.value(),
+      ) as _i5.Future<_i9.Rectangle?>);
 
   @override
-  _i6.Future<int> updateRectangle(_i10.Rectangle? rectangle) =>
+  _i5.Future<int> updateRectangle(_i9.Rectangle? rectangle) =>
       (super.noSuchMethod(
         Invocation.method(
           #updateRectangle,
           [rectangle],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> softDeleteRectangle(int? localId) => (super.noSuchMethod(
+  _i5.Future<int> softDeleteRectangle(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #softDeleteRectangle,
           [localId],
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> insertDefaultPrice(_i11.DefaultPrice? defaultPrice) =>
+  _i5.Future<int> claimLegacyDefaultPrices(String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #claimLegacyDefaultPrices,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<int> insertDefaultPrice(
+    _i10.DefaultPrice? defaultPrice, {
+    required String? franchiseeId,
+  }) =>
       (super.noSuchMethod(
         Invocation.method(
           #insertDefaultPrice,
           [defaultPrice],
+          {#franchiseeId: franchiseeId},
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<List<_i11.DefaultPrice>> getDefaultPrices() => (super.noSuchMethod(
+  _i5.Future<List<_i10.DefaultPrice>> getDefaultPrices(String? franchiseeId) =>
+      (super.noSuchMethod(
         Invocation.method(
           #getDefaultPrices,
-          [],
+          [franchiseeId],
         ),
         returnValue:
-            _i6.Future<List<_i11.DefaultPrice>>.value(<_i11.DefaultPrice>[]),
-      ) as _i6.Future<List<_i11.DefaultPrice>>);
+            _i5.Future<List<_i10.DefaultPrice>>.value(<_i10.DefaultPrice>[]),
+      ) as _i5.Future<List<_i10.DefaultPrice>>);
 
   @override
-  _i6.Future<int> updateDefaultPrice(_i11.DefaultPrice? defaultPrice) =>
+  _i5.Future<int> updateDefaultPrice(
+    _i10.DefaultPrice? defaultPrice, {
+    required String? franchiseeId,
+  }) =>
       (super.noSuchMethod(
         Invocation.method(
           #updateDefaultPrice,
           [defaultPrice],
+          {#franchiseeId: franchiseeId},
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<int> deleteDefaultPrice(int? localId) => (super.noSuchMethod(
+  _i5.Future<int> deleteDefaultPrice(
+    int? localId, {
+    required String? franchiseeId,
+  }) =>
+      (super.noSuchMethod(
         Invocation.method(
           #deleteDefaultPrice,
           [localId],
+          {#franchiseeId: franchiseeId},
         ),
-        returnValue: _i6.Future<int>.value(0),
-      ) as _i6.Future<int>);
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
 
   @override
-  _i6.Future<List<_i8.Client>> getDirtyClients() => (super.noSuchMethod(
+  _i5.Future<int> insertWarranty(_i11.Warranty? warranty) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #insertWarranty,
+          [warranty],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<List<_i11.Warranty>> getWarrantiesByClientId(int? clientId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getWarrantiesByClientId,
+          [clientId],
+        ),
+        returnValue: _i5.Future<List<_i11.Warranty>>.value(<_i11.Warranty>[]),
+      ) as _i5.Future<List<_i11.Warranty>>);
+
+  @override
+  _i5.Future<_i11.Warranty?> getWarrantyByRemoteId(String? remoteId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getWarrantyByRemoteId,
+          [remoteId],
+        ),
+        returnValue: _i5.Future<_i11.Warranty?>.value(),
+      ) as _i5.Future<_i11.Warranty?>);
+
+  @override
+  _i5.Future<int> updateWarranty(_i11.Warranty? warranty) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #updateWarranty,
+          [warranty],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<int> softDeleteWarranty(int? localId) => (super.noSuchMethod(
+        Invocation.method(
+          #softDeleteWarranty,
+          [localId],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<int> insertProposal(_i12.Proposal? proposal) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #insertProposal,
+          [proposal],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<List<_i12.Proposal>> getProposalsByClientId(int? clientId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getProposalsByClientId,
+          [clientId],
+        ),
+        returnValue: _i5.Future<List<_i12.Proposal>>.value(<_i12.Proposal>[]),
+      ) as _i5.Future<List<_i12.Proposal>>);
+
+  @override
+  _i5.Future<_i12.Proposal?> getProposalByRemoteId(String? remoteId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getProposalByRemoteId,
+          [remoteId],
+        ),
+        returnValue: _i5.Future<_i12.Proposal?>.value(),
+      ) as _i5.Future<_i12.Proposal?>);
+
+  @override
+  _i5.Future<int> updateProposal(_i12.Proposal? proposal) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #updateProposal,
+          [proposal],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<int> softDeleteProposal(int? localId) => (super.noSuchMethod(
+        Invocation.method(
+          #softDeleteProposal,
+          [localId],
+        ),
+        returnValue: _i5.Future<int>.value(0),
+      ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<List<_i7.Client>> getDirtyClients() => (super.noSuchMethod(
         Invocation.method(
           #getDirtyClients,
           [],
         ),
-        returnValue: _i6.Future<List<_i8.Client>>.value(<_i8.Client>[]),
-      ) as _i6.Future<List<_i8.Client>>);
+        returnValue: _i5.Future<List<_i7.Client>>.value(<_i7.Client>[]),
+      ) as _i5.Future<List<_i7.Client>>);
 
   @override
-  _i6.Future<List<_i9.Item>> getDirtyItems() => (super.noSuchMethod(
+  _i5.Future<List<_i8.Item>> getDirtyItems() => (super.noSuchMethod(
         Invocation.method(
           #getDirtyItems,
           [],
         ),
-        returnValue: _i6.Future<List<_i9.Item>>.value(<_i9.Item>[]),
-      ) as _i6.Future<List<_i9.Item>>);
+        returnValue: _i5.Future<List<_i8.Item>>.value(<_i8.Item>[]),
+      ) as _i5.Future<List<_i8.Item>>);
 
   @override
-  _i6.Future<List<_i10.Rectangle>> getDirtyRectangles() => (super.noSuchMethod(
+  _i5.Future<List<_i9.Rectangle>> getDirtyRectangles() => (super.noSuchMethod(
         Invocation.method(
           #getDirtyRectangles,
           [],
         ),
-        returnValue: _i6.Future<List<_i10.Rectangle>>.value(<_i10.Rectangle>[]),
-      ) as _i6.Future<List<_i10.Rectangle>>);
+        returnValue: _i5.Future<List<_i9.Rectangle>>.value(<_i9.Rectangle>[]),
+      ) as _i5.Future<List<_i9.Rectangle>>);
 
   @override
-  _i6.Future<List<_i11.DefaultPrice>> getDirtyDefaultPrices() =>
+  _i5.Future<List<_i10.DefaultPrice>> getDirtyDefaultPrices(
+          String? franchiseeId) =>
       (super.noSuchMethod(
         Invocation.method(
           #getDirtyDefaultPrices,
-          [],
+          [franchiseeId],
         ),
         returnValue:
-            _i6.Future<List<_i11.DefaultPrice>>.value(<_i11.DefaultPrice>[]),
-      ) as _i6.Future<List<_i11.DefaultPrice>>);
+            _i5.Future<List<_i10.DefaultPrice>>.value(<_i10.DefaultPrice>[]),
+      ) as _i5.Future<List<_i10.DefaultPrice>>);
 
   @override
-  _i6.Future<void> markAsSynced(
-    String? table,
+  _i5.Future<_i10.DefaultPrice?> getDefaultPriceByRemoteId(
     String? remoteId,
+    String? franchiseeId,
   ) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #getDefaultPriceByRemoteId,
+          [
+            remoteId,
+            franchiseeId,
+          ],
+        ),
+        returnValue: _i5.Future<_i10.DefaultPrice?>.value(),
+      ) as _i5.Future<_i10.DefaultPrice?>);
+
+  @override
+  _i5.Future<List<_i11.Warranty>> getDirtyWarranties() => (super.noSuchMethod(
+        Invocation.method(
+          #getDirtyWarranties,
+          [],
+        ),
+        returnValue: _i5.Future<List<_i11.Warranty>>.value(<_i11.Warranty>[]),
+      ) as _i5.Future<List<_i11.Warranty>>);
+
+  @override
+  _i5.Future<List<_i12.Proposal>> getDirtyProposals() => (super.noSuchMethod(
+        Invocation.method(
+          #getDirtyProposals,
+          [],
+        ),
+        returnValue: _i5.Future<List<_i12.Proposal>>.value(<_i12.Proposal>[]),
+      ) as _i5.Future<List<_i12.Proposal>>);
+
+  @override
+  _i5.Future<void> markAsSynced(
+    String? table,
+    String? remoteId, {
+    String? franchiseeId,
+  }) =>
       (super.noSuchMethod(
         Invocation.method(
           #markAsSynced,
@@ -389,8 +648,9 @@ class MockDbService extends _i1.Mock implements _i7.DbService {
             table,
             remoteId,
           ],
+          {#franchiseeId: franchiseeId},
         ),
-        returnValue: _i6.Future<void>.value(),
-        returnValueForMissingStub: _i6.Future<void>.value(),
-      ) as _i6.Future<void>);
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
 }

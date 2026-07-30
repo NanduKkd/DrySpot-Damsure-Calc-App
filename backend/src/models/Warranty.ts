@@ -8,6 +8,9 @@ export class Warranty extends Model {
   public startDate!: Date;
   public durationYears!: number;
   public pdfUrl!: string;
+  public pdfFileName!: string;
+  /** Non-null only for the one currently active warranty for a client. */
+  public activeClientId!: string | null;
   public readonly createdAt!: Date;
   public readonly updatedAt!: Date;
   public readonly deletedAt!: Date;
@@ -39,6 +42,15 @@ Warranty.init(
     pdfUrl: {
       type: DataTypes.STRING,
       allowNull: false,
+    },
+    pdfFileName: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    activeClientId: {
+      type: DataTypes.UUID,
+      allowNull: true,
+      unique: true,
     },
     deletedAt: {
       type: DataTypes.DATE,

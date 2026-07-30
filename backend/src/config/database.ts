@@ -1,25 +1,20 @@
 import { Sequelize } from 'sequelize';
 import dotenv from 'dotenv';
 
+// Shared CommonJS resolver is also consumed by sequelize-cli from backend/config.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { resolveDatabaseConfig } = require('../../config/database.config.js');
+
 dotenv.config();
 
-const isTest = process.env.NODE_ENV === 'test';
+const config = resolveDatabaseConfig(process.env.NODE_ENV);
+const options = {
+  ...config,
+  define: { underscored: true, timestamps: true },
+};
 
-const sequelize = isTest 
-  ? new Sequelize('sqlite::memory:', { logging: false, define: { underscored: true, timestamps: true } })
-  : new Sequelize(
-      process.env.DB_NAME || 'damsure_db',
-      process.env.DB_USER || 'postgres',
-      process.env.DB_PASSWORD || 'password',
-      {
-        host: process.env.DB_HOST || 'localhost',
-        dialect: 'postgres',
-        logging: false,
-        define: {
-          underscored: true,
-          timestamps: true,
-        },
-      }
-    );
+const sequelize = config.url
+  ? new Sequelize(config.url, options)
+  : new Sequelize(options);
 
 export default sequelize;

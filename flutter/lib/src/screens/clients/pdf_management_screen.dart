@@ -21,11 +21,12 @@ class PdfManagementScreen extends StatefulWidget {
 
 class _PdfManagementScreenState extends State<PdfManagementScreen> {
   bool _isGenerating = false;
-  final PdfService _pdfService = PdfService();
+  late final PdfService _pdfService;
 
   @override
   void initState() {
     super.initState();
+    _pdfService = PdfService(apiService: context.read<ApiService>());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadData();
     });
@@ -105,10 +106,38 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
   Future<void> _createWarranty() async {
     if (!mounted) return;
 
+    final hasActiveWarranty =
+        context.read<ClientProvider>().currentClientWarranties.isNotEmpty;
+    if (hasActiveWarranty) {
+      final replace = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Replace active warranty?'),
+          content: const Text(
+            'This client already has an active warranty. Creating a new one will replace it permanently.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Replace'),
+            ),
+          ],
+        ),
+      );
+      if (replace != true || !mounted) return;
+    }
+
     final result = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
-        builder: (context) => WarrantyFormScreen(client: widget.client),
+        builder: (context) => WarrantyFormScreen(
+          client: widget.client,
+          replaceExisting: hasActiveWarranty,
+        ),
       ),
     );
 
@@ -137,9 +166,20 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
     );
 
     if (confirm == true && mounted) {
-      await context
-          .read<ClientProvider>()
-          .deleteWarranty(warranty.localId!, widget.client.localId!);
+      try {
+        if (warranty.remoteId.isNotEmpty) {
+          await _pdfService.deleteRemotePdf(warranty.pdfUrl);
+        }
+        if (!mounted) return;
+        await context
+            .read<ClientProvider>()
+            .deleteWarranty(warranty.localId!, widget.client.localId!);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error deleting warranty: $e')),
+        );
+      }
     }
   }
 

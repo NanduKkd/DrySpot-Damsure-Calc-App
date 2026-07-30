@@ -10,8 +10,13 @@ import '../../utils/warranty_date_utils.dart';
 
 class WarrantyFormScreen extends StatefulWidget {
   final Client client;
+  final bool replaceExisting;
 
-  const WarrantyFormScreen({super.key, required this.client});
+  const WarrantyFormScreen({
+    super.key,
+    required this.client,
+    this.replaceExisting = false,
+  });
 
   @override
   State<WarrantyFormScreen> createState() => _WarrantyFormScreenState();
@@ -142,6 +147,7 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         'start_date': startDate.toIso8601String(),
         'duration_years': _durationYears.toString(),
         'warranty_card_number': _cardNumberController.text,
+        'replace_existing': widget.replaceExisting.toString(),
       });
 
       // Save to local DB
@@ -255,7 +261,7 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
                   ),
                   const SizedBox(height: 16),
                   DropdownButtonFormField<int>(
-                    value: _durationYears,
+                    initialValue: _durationYears,
                     decoration: const InputDecoration(
                         labelText: 'Warranty Duration (Years)'),
                     items: [5, 10, 15, 20, 25]
