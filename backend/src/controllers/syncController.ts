@@ -1,7 +1,16 @@
 import { Response } from 'express';
 import { Op } from 'sequelize';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { Client, Item, Rectangle, DefaultPrice, Warranty, Proposal, sequelize } from '../models';
+import {
+	Client,
+	Item,
+	Rectangle,
+	DefaultPrice,
+	Warranty,
+	WarrantyDeletionSequence,
+	Proposal,
+	sequelize,
+} from '../models';
 import {
 	queueManagedFileCleanup,
 	reconcileManagedFileCleanupByStorageKeys,
@@ -13,6 +22,7 @@ import {
 	warrantyTombstonesAfter,
 } from '../services/warrantyLifecycle';
 import { stampLegacySyncChanges } from '../services/lwwSync';
+import { lockTenantSyncState } from '../services/tenantSyncCursor';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
@@ -125,6 +135,13 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			error: 'warranty_tombstone_cursor exceeds the PostgreSQL BIGINT range',
 		});
 	}
+	const authoritativeWarrantySequence = await WarrantyDeletionSequence.findByPk(1);
+	if (parsedTombstoneCursor > BigInt(authoritativeWarrantySequence?.lastValue ?? '0')) {
+		return res.status(409).json({
+			error: 'warranty_tombstone_cursor is ahead of the authoritative sequence',
+			code: 'future_warranty_tombstone_cursor',
+		});
+	}
 	const normalizedTombstoneCursor = parsedTombstoneCursor.toString();
 	const syncTime =
 		last_sync_time === undefined || last_sync_time === null
@@ -147,14 +164,16 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		warranties: [],
 		proposals: [],
 	};
-	const legacyLwwAppliedIds: Record<
-		'clients' | 'items' | 'rectangles' | 'default_prices',
+	const legacySyncVisibleAppliedIds: Record<
+		'clients' | 'items' | 'rectangles' | 'default_prices' | 'warranties' | 'proposals',
 		string[]
 	> = {
 		clients: [],
 		items: [],
 		rectangles: [],
 		default_prices: [],
+		warranties: [],
+		proposals: [],
 	};
 	const recordOutcome = (
 		collection: string,
@@ -169,11 +188,11 @@ export const sync = async (req: AuthRequest, res: Response) => {
 		});
 		if (
 			status === 'applied' &&
-			collection in legacyLwwAppliedIds &&
+			collection in legacySyncVisibleAppliedIds &&
 			typeof remoteId === 'string'
 		) {
-			legacyLwwAppliedIds[
-				collection as keyof typeof legacyLwwAppliedIds
+			legacySyncVisibleAppliedIds[
+				collection as keyof typeof legacySyncVisibleAppliedIds
 			].push(remoteId);
 		}
 	};
@@ -190,6 +209,9 @@ export const sync = async (req: AuthRequest, res: Response) => {
 	};
 
 	try {
+		// Protocol v1 uses the same PostgreSQL order as v2: tenant cursor first,
+		// then entity/parent rows. This prevents v1/v2 lock inversion.
+		await lockTenantSyncState(franchiseeId, transaction);
 		const serverTime = new Date().toISOString();
 
 		// 1. Process incoming changes from client
@@ -244,6 +266,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							for (const proposal of proposals) {
 								queueStoredPdfRemoval(proposal.pdfFileName);
 								await proposal.destroy({ transaction });
+								legacySyncVisibleAppliedIds.proposals.push(proposal.id);
 							}
 							await existing.destroy({ transaction });
 						}
@@ -422,12 +445,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						} else {
 							// Do not disclose whether the opaque UUID is reserved, deleted,
 							// or owned by another tenant.
-							recordOutcome(
-								'warranties',
-								remote_id,
-								'rejected',
-								'warranty_conflict',
-							);
+							recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
 						}
 						continue;
 					}
@@ -540,7 +558,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 				transaction,
 			})),
 		);
-		await stampLegacySyncChanges(franchiseeId, legacyLwwAppliedIds, transaction);
+		await stampLegacySyncChanges(franchiseeId, legacySyncVisibleAppliedIds, transaction);
 		await transaction.commit();
 		committed = true;
 		void reconcileManagedFileCleanupByStorageKeys([

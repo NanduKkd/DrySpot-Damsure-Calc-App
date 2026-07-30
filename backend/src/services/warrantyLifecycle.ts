@@ -11,6 +11,7 @@ import {
 	queueManagedFileCleanup,
 	reconcileManagedFileCleanupByStorageKeys,
 } from './managedFileCleanup';
+import { lockTenantSyncState, nextTenantSyncCursor } from './tenantSyncCursor';
 
 export type WarrantyConfirmation = {
 	warrantyId: string;
@@ -372,6 +373,7 @@ export const deleteConfirmedWarranty = async ({
 	requestDigest: string;
 }) =>
 	sequelize.transaction(async (transaction) => {
+		const tenantState = await lockTenantSyncState(franchiseeId, transaction);
 		const replay = await findIdempotencyReplay(franchiseeId, idempotencyKey, transaction);
 		if (replay) {
 			assertIdempotencyIdentity({
@@ -439,6 +441,8 @@ export const deleteConfirmedWarranty = async ({
 				requestDigest,
 				transaction,
 			});
+			const cursor = nextTenantSyncCursor(tenantState.cursor);
+			await tenantState.update({ cursor: cursor.toString() }, { transaction });
 			return { storageKey, replayed: false, tombstone };
 		}
 		const warranty = await Warranty.findByPk(warrantyId, {
@@ -461,6 +465,8 @@ export const deleteConfirmedWarranty = async ({
 			requestDigest,
 			transaction,
 		});
+		const cursor = nextTenantSyncCursor(tenantState.cursor);
+		await tenantState.update({ cursor: cursor.toString() }, { transaction });
 		return { storageKey, replayed: false, tombstone };
 	});
 
@@ -478,6 +484,7 @@ export const createOrReplaceConfirmedWarranty = async ({
 	requestDigest?: string;
 }) =>
 	sequelize.transaction(async (transaction) => {
+		const tenantState = await lockTenantSyncState(franchiseeId, transaction);
 		if (confirmation && idempotencyKey && requestDigest) {
 			const keyedReplay = await findIdempotencyReplay(
 				franchiseeId,
@@ -616,15 +623,19 @@ export const createOrReplaceConfirmedWarranty = async ({
 					'The confirmed warranty is no longer the active warranty.',
 				);
 			}
+			const cursor = nextTenantSyncCursor(tenantState.cursor);
+			const warranty = await Warranty.create(
+				{
+					...values,
+					version: 1,
+					activeClientId: values.clientId,
+					syncCursor: cursor.toString(),
+				},
+				{ transaction },
+			);
+			await tenantState.update({ cursor: cursor.toString() }, { transaction });
 			return {
-				warranty: await Warranty.create(
-					{
-						...values,
-						version: 1,
-						activeClientId: values.clientId,
-					},
-					{ transaction },
-				),
+				warranty,
 				cleanupStorageKeys: legacyStorageKeys,
 				replayed: false,
 			};
@@ -659,9 +670,11 @@ export const createOrReplaceConfirmedWarranty = async ({
 				...values,
 				version: 1,
 				activeClientId: values.clientId,
+				syncCursor: nextTenantSyncCursor(tenantState.cursor).toString(),
 			},
 			{ transaction },
 		);
+		await tenantState.update({ cursor: warranty.syncCursor.toString() }, { transaction });
 		return {
 			warranty,
 			cleanupStorageKeys: [

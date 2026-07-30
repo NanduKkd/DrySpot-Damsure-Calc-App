@@ -20,6 +20,8 @@ export class SyncV2ChangeReceipt extends Model<
 	declare operationRank: number;
 	declare writerId: string;
 	declare payloadHash: string;
+	declare changeHash: string | null;
+	declare outcomeJson: string | null;
 	declare createdAt: CreationOptional<Date>;
 	declare updatedAt: CreationOptional<Date>;
 }
@@ -63,6 +65,14 @@ SyncV2ChangeReceipt.init(
 		payloadHash: {
 			type: DataTypes.STRING(64),
 			allowNull: false,
+		},
+		changeHash: {
+			type: DataTypes.STRING(64),
+			allowNull: true,
+		},
+		outcomeJson: {
+			type: DataTypes.TEXT,
+			allowNull: true,
 		},
 		createdAt: DataTypes.DATE,
 		updatedAt: DataTypes.DATE,

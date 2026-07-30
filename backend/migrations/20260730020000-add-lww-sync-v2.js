@@ -4,7 +4,12 @@ const { createHash } = require('crypto');
 const { QueryTypes } = require('sequelize');
 
 const entityTables = ['clients', 'items', 'rectangles', 'default_prices'];
+const auxiliaryTables = ['warranties', 'proposals'];
+const syncVisibleTables = [...entityTables, ...auxiliaryTables];
 const maxBigint = 9223372036854775807n;
+const maxBranchSequence = 1000000;
+const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const sha256Hex = /^[0-9a-f]{64}$/;
 
 const stableValue = (value) => {
 	if (Array.isArray(value)) return value.map(stableValue);
@@ -38,26 +43,14 @@ const hasTable = async (queryInterface, table, transaction) =>
 const describe = async (queryInterface, table, transaction) =>
 	queryInterface.describeTable(table, { transaction });
 
-const ensureColumn = async (
-	queryInterface,
-	table,
-	column,
-	definition,
-	transaction,
-) => {
+const ensureColumn = async (queryInterface, table, column, definition, transaction) => {
 	const columns = await describe(queryInterface, table, transaction);
 	if (!columns[column]) {
 		await queryInterface.addColumn(table, column, definition, { transaction });
 	}
 };
 
-const ensureIndex = async (
-	queryInterface,
-	table,
-	fields,
-	options,
-	transaction,
-) => {
+const ensureIndex = async (queryInterface, table, fields, options, transaction) => {
 	const indexes = await queryInterface.showIndex(table, { transaction });
 	if (!indexes.some((index) => index.name === options.name)) {
 		await queryInterface.addIndex(table, fields, { ...options, transaction });
@@ -215,10 +208,27 @@ const createProtocolTables = async (queryInterface, Sequelize, transaction) => {
 				operation_rank: { type: Sequelize.SMALLINT, allowNull: false },
 				writer_id: { type: Sequelize.UUID, allowNull: false },
 				payload_hash: { type: Sequelize.STRING(64), allowNull: false },
+				change_hash: { type: Sequelize.STRING(64), allowNull: true },
+				outcome_json: { type: Sequelize.TEXT, allowNull: true },
 				created_at: { type: Sequelize.DATE, allowNull: false },
 				updated_at: { type: Sequelize.DATE, allowNull: false },
 			},
 			{ transaction },
+		);
+	} else {
+		await ensureColumn(
+			queryInterface,
+			'sync_v2_change_receipts',
+			'change_hash',
+			{ type: Sequelize.STRING(64), allowNull: true },
+			transaction,
+		);
+		await ensureColumn(
+			queryInterface,
+			'sync_v2_change_receipts',
+			'outcome_json',
+			{ type: Sequelize.TEXT, allowNull: true },
+			transaction,
 		);
 	}
 };
@@ -226,10 +236,12 @@ const createProtocolTables = async (queryInterface, Sequelize, transaction) => {
 module.exports = {
 	async up(queryInterface, Sequelize) {
 		await queryInterface.sequelize.transaction(async (transaction) => {
-			for (const table of entityTables) {
+			for (const table of syncVisibleTables) {
 				if (!(await hasTable(queryInterface, table, transaction))) {
 					throw new Error(`APP-111 requires the existing ${table} table.`);
 				}
+			}
+			for (const table of entityTables) {
 				await ensureColumn(
 					queryInterface,
 					table,
@@ -280,6 +292,15 @@ module.exports = {
 					transaction,
 				);
 			}
+			for (const table of auxiliaryTables) {
+				await ensureColumn(
+					queryInterface,
+					table,
+					'sync_cursor',
+					{ type: Sequelize.BIGINT, allowNull: true },
+					transaction,
+				);
+			}
 
 			await createProtocolTables(queryInterface, Sequelize, transaction);
 
@@ -307,7 +328,10 @@ module.exports = {
 					const presentLogicalValues = logicalValues.filter(
 						(value) => value !== null && value !== undefined,
 					).length;
-					if (presentLogicalValues !== 0 && presentLogicalValues !== logicalValues.length) {
+					if (
+						presentLogicalValues !== 0 &&
+						presentLogicalValues !== logicalValues.length
+					) {
 						throw new Error(
 							`Cannot backfill APP-111 because ${entity} row ${row.id} has partial logical state.`,
 						);
@@ -316,11 +340,22 @@ module.exports = {
 					if (alreadyBackfilled) {
 						const generation = BigInt(row.lww_generation);
 						const cursor = BigInt(row.sync_cursor);
+						const deleted = row.deleted_at !== null && row.deleted_at !== undefined;
+						const expectedRank = deleted ? 1 : 0;
+						const expectedHash = sha256(deleted ? {} : payloadFor(entity, row));
 						if (
 							generation < 1n ||
 							generation > maxBigint ||
 							cursor < 1n ||
-							cursor > maxBigint
+							cursor > maxBigint ||
+							!Number.isInteger(Number(row.lww_branch_seq)) ||
+							Number(row.lww_branch_seq) < 1 ||
+							Number(row.lww_branch_seq) > maxBranchSequence ||
+							Number(row.lww_operation_rank) !== expectedRank ||
+							!uuidV4.test(String(row.lww_writer_id)) ||
+							!uuidV4.test(String(row.lww_change_id)) ||
+							!sha256Hex.test(String(row.lww_payload_hash)) ||
+							String(row.lww_payload_hash) !== expectedHash
 						) {
 							throw new Error(
 								`Cannot reapply APP-111 because ${entity} row ${row.id} has invalid logical state.`,
@@ -333,16 +368,40 @@ module.exports = {
 						lww_generation: '1',
 						lww_branch_seq: 1,
 						lww_operation_rank: deleted ? 1 : 0,
-						lww_writer_id: deterministicUuidV4(
-							`app-111:${entity}:${row.id}:writer`,
-						),
-						lww_change_id: deterministicUuidV4(
-							`app-111:${entity}:${row.id}:change`,
-						),
+						lww_writer_id: deterministicUuidV4(`app-111:${entity}:${row.id}:writer`),
+						lww_change_id: deterministicUuidV4(`app-111:${entity}:${row.id}:change`),
 						lww_payload_hash: sha256(deleted ? {} : payloadFor(entity, row)),
 						sync_cursor: '1',
 					};
-					await queryInterface.bulkUpdate(entity, values, { id: row.id }, { transaction });
+					await queryInterface.bulkUpdate(
+						entity,
+						values,
+						{ id: row.id },
+						{ transaction },
+					);
+				}
+			}
+			for (const table of auxiliaryTables) {
+				const rows = await queryInterface.sequelize.query(
+					`SELECT id, sync_cursor FROM ${table}`,
+					{ type: QueryTypes.SELECT, transaction },
+				);
+				for (const row of rows) {
+					if (row.sync_cursor === null || row.sync_cursor === undefined) {
+						await queryInterface.bulkUpdate(
+							table,
+							{ sync_cursor: '1' },
+							{ id: row.id },
+							{ transaction },
+						);
+						continue;
+					}
+					const cursor = BigInt(row.sync_cursor);
+					if (cursor < 1n || cursor > maxBigint) {
+						throw new Error(
+							`Cannot reapply APP-111 because ${table} row ${row.id} has an invalid sync cursor.`,
+						);
+					}
 				}
 			}
 
@@ -385,6 +444,63 @@ module.exports = {
 					throw new Error(
 						`Cannot backfill APP-111 because tenant ${franchiseeId} has an invalid cursor.`,
 					);
+				}
+			}
+
+			const tenantCursorRows = await queryInterface.sequelize.query(
+				'SELECT franchisee_id, cursor FROM tenant_sync_state',
+				{ type: QueryTypes.SELECT, transaction },
+			);
+			const tenantCursors = new Map(
+				tenantCursorRows.map((row) => [row.franchisee_id, BigInt(row.cursor)]),
+			);
+			const requestRows = await queryInterface.sequelize.query(
+				`SELECT franchisee_id, request_id, response_cursor
+				 FROM sync_v2_requests`,
+				{ type: QueryTypes.SELECT, transaction },
+			);
+			for (const row of requestRows) {
+				const tenantCursor = tenantCursors.get(row.franchisee_id);
+				const responseCursor = BigInt(row.response_cursor);
+				if (
+					tenantCursor === undefined ||
+					responseCursor < 0n ||
+					responseCursor > tenantCursor
+				) {
+					throw new Error(
+						`Cannot reapply APP-111 because request ${row.request_id} has inconsistent tenant cursor state.`,
+					);
+				}
+			}
+			for (const table of entityTables) {
+				const rows = await entityRows(queryInterface, table, transaction);
+				for (const row of rows) {
+					const tenantCursor = tenantCursors.get(row.resolved_franchisee_id);
+					if (tenantCursor === undefined || BigInt(row.sync_cursor) > tenantCursor) {
+						throw new Error(
+							`Cannot reapply APP-111 because ${table} row ${row.id} is ahead of its tenant cursor.`,
+						);
+					}
+				}
+			}
+			for (const table of auxiliaryTables) {
+				const rows = await queryInterface.sequelize.query(
+					`SELECT a.id, a.sync_cursor, c.franchisee_id AS resolved_franchisee_id
+					 FROM ${table} a
+					 LEFT JOIN clients c ON c.id = a.client_id`,
+					{ type: QueryTypes.SELECT, transaction },
+				);
+				for (const row of rows) {
+					const tenantCursor = tenantCursors.get(row.resolved_franchisee_id);
+					if (
+						!row.resolved_franchisee_id ||
+						tenantCursor === undefined ||
+						BigInt(row.sync_cursor) > tenantCursor
+					) {
+						throw new Error(
+							`Cannot reapply APP-111 because ${table} row ${row.id} has inconsistent tenant cursor state.`,
+						);
+					}
 				}
 			}
 
@@ -435,6 +551,21 @@ module.exports = {
 					}
 				}
 			}
+			for (const table of auxiliaryTables) {
+				const columns = await describe(queryInterface, table, transaction);
+				if (columns.sync_cursor.allowNull) {
+					await queryInterface.changeColumn(
+						table,
+						'sync_cursor',
+						{
+							type: Sequelize.BIGINT,
+							allowNull: false,
+							defaultValue: '1',
+						},
+						{ transaction },
+					);
+				}
+			}
 
 			await ensureIndex(
 				queryInterface,
@@ -462,6 +593,20 @@ module.exports = {
 				'default_prices',
 				['franchisee_id', 'sync_cursor'],
 				{ name: 'default_prices_tenant_sync_cursor' },
+				transaction,
+			);
+			await ensureIndex(
+				queryInterface,
+				'warranties',
+				['client_id', 'sync_cursor'],
+				{ name: 'warranties_parent_sync_cursor' },
+				transaction,
+			);
+			await ensureIndex(
+				queryInterface,
+				'proposals',
+				['client_id', 'sync_cursor'],
+				{ name: 'proposals_parent_sync_cursor' },
 				transaction,
 			);
 		});

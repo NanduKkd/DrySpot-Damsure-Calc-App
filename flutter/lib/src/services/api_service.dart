@@ -7,9 +7,17 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
 
 class ApiException implements Exception {
-  const ApiException(this.message);
+  const ApiException(
+    this.message, {
+    this.statusCode,
+    this.code,
+    this.endpointMissing = false,
+  });
 
   final String message;
+  final int? statusCode;
+  final String? code;
+  final bool endpointMissing;
 
   @override
   String toString() => message;
@@ -19,7 +27,8 @@ class ApiService {
   static const _serverUrlKey = 'server_url';
 
   ApiService({String? serverUrl})
-    : _serverUrl = normalizeServerUrl(serverUrl ?? AppConfig.defaultServerUrl);
+      : _serverUrl =
+            normalizeServerUrl(serverUrl ?? AppConfig.defaultServerUrl);
 
   String _serverUrl;
   String? _token;
@@ -69,9 +78,8 @@ class ApiService {
       );
     }
 
-    final segments = uri.pathSegments
-        .where((segment) => segment.isNotEmpty)
-        .toList();
+    final segments =
+        uri.pathSegments.where((segment) => segment.isNotEmpty).toList();
     if (segments.isNotEmpty && segments.last == 'api') {
       segments.removeLast();
     }
@@ -85,13 +93,13 @@ class ApiService {
   }
 
   Map<String, String> get _headers => {
-    'Content-Type': 'application/json',
-    if (_hasToken) 'Authorization': 'Bearer $_token',
-  };
+        'Content-Type': 'application/json',
+        if (_hasToken) 'Authorization': 'Bearer $_token',
+      };
 
   Map<String, String> get authenticatedHeaders => {
-    if (_hasToken) 'Authorization': 'Bearer $_token',
-  };
+        if (_hasToken) 'Authorization': 'Bearer $_token',
+      };
 
   String resolveUrl(String pathOrUrl) {
     final uri = Uri.tryParse(pathOrUrl);
@@ -161,6 +169,39 @@ class ApiService {
     return trimmed;
   }
 
+  ApiException _exceptionFor(
+    http.Response response,
+    String fallbackMessage,
+  ) {
+    var message = _extractErrorMessage(response, fallbackMessage);
+    String? code;
+    var structuredResponse = false;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map) {
+        structuredResponse = true;
+        final rawError = decoded['error'];
+        if (rawError is Map) {
+          final nestedMessage = rawError['message'];
+          if (nestedMessage is String && nestedMessage.trim().isNotEmpty) {
+            message = nestedMessage.trim();
+          }
+          code = rawError['code']?.toString();
+        } else {
+          code = decoded['code']?.toString();
+        }
+      }
+    } on FormatException {
+      // The HTTP status remains sufficient to identify an absent old endpoint.
+    }
+    return ApiException(
+      message,
+      statusCode: response.statusCode,
+      code: code,
+      endpointMissing: response.statusCode == 404 && !structuredResponse,
+    );
+  }
+
   Future<Map<String, dynamic>> login(String email, String password) async {
     final response = await http.post(
       Uri.parse('$baseUrl/auth/login'),
@@ -191,7 +232,7 @@ class ApiService {
         fallbackMessage: 'Sync succeeded but the server response was invalid.',
       );
     } else {
-      throw ApiException(_extractErrorMessage(response, 'Failed to sync'));
+      throw _exceptionFor(response, 'Failed to sync');
     }
   }
 
@@ -209,7 +250,7 @@ class ApiService {
             'Sync v2 succeeded but the server response was invalid.',
       );
     }
-    throw ApiException(_extractErrorMessage(response, 'Failed to sync'));
+    throw _exceptionFor(response, 'Failed to sync');
   }
 
   Future<Map<String, dynamic>> uploadWarranty(

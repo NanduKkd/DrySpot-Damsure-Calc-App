@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
@@ -474,6 +476,46 @@ class DbService {
     });
   }
 
+  Future<void> replaceClientPhotoPath({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+  }) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      final rows = await transaction.query(
+        'clients',
+        columns: ['local_id', 'photos'],
+        where: 'remote_id = ? AND franchisee_id = ?',
+        whereArgs: [remoteId, franchiseeId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        throw StateError('The uploaded photo client is no longer local.');
+      }
+      final rawPhotos = jsonDecode(rows.first['photos']?.toString() ?? '[]');
+      if (rawPhotos is! List || rawPhotos.any((photo) => photo is! String)) {
+        throw const FormatException('Local client photo metadata is invalid.');
+      }
+      final nextPhotos = rawPhotos
+          .cast<String>()
+          .map((photo) => photo == localPath ? canonicalPath : photo)
+          .toSet()
+          .toList();
+      if (!nextPhotos.contains(canonicalPath)) {
+        throw StateError(
+            'The uploaded local photo changed before acknowledgement.');
+      }
+      await transaction.update(
+        'clients',
+        {'photos': jsonEncode(nextPhotos)},
+        where: 'local_id = ?',
+        whereArgs: [rows.first['local_id']],
+      );
+    });
+  }
+
   Future<int> softDeleteClient(int localId) async {
     final db = await database;
     return db.transaction((transaction) async {
@@ -655,6 +697,55 @@ class DbService {
           'is_dirty': 1,
         },
         where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''");
+  }
+
+  Future<void> claimLegacyLwwChanges(String franchiseeId) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      final tableQueries = <String, String>{
+        'clients': '''
+          SELECT c.local_id
+          FROM clients c
+          WHERE c.franchisee_id = ?
+            AND c.is_dirty = 1
+            AND c.pending_change_id IS NULL
+        ''',
+        'items': '''
+          SELECT i.local_id
+          FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ?
+            AND i.is_dirty = 1
+            AND i.pending_change_id IS NULL
+        ''',
+        'rectangles': '''
+          SELECT r.local_id
+          FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ?
+            AND r.is_dirty = 1
+            AND r.pending_change_id IS NULL
+        ''',
+        'default_prices': '''
+          SELECT d.local_id
+          FROM default_prices d
+          WHERE d.franchisee_id = ?
+            AND d.is_dirty = 1
+            AND d.pending_change_id IS NULL
+        ''',
+      };
+      for (final entry in tableQueries.entries) {
+        final rows = await transaction.rawQuery(entry.value, [franchiseeId]);
+        for (final row in rows) {
+          await _markLocalLwwMutation(
+            transaction,
+            entry.key,
+            row['local_id'] as int,
+          );
+        }
+      }
+    });
   }
 
   Future<int> insertDefaultPrice(
@@ -1041,6 +1132,8 @@ class DbService {
       'change_id': row['pending_change_id'],
       if (row['parent_remote_id'] != null) 'parent_id': row['parent_remote_id'],
       'payload': payload,
+      if (collection == 'rectangles' && operation == 'upsert')
+        'media': {'image_data': row['image_data']},
       'device_timestamp': row['updated_at'],
     };
   }
@@ -1147,7 +1240,7 @@ class DbService {
       final parents = await executor.query(
         'clients',
         columns: ['local_id'],
-        where: 'remote_id = ? AND franchisee_id = ?',
+        where: 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
         whereArgs: [parentRemoteId, franchiseeId],
         limit: 1,
       );
@@ -1162,6 +1255,7 @@ class DbService {
       FROM items i
       JOIN clients c ON c.local_id = i.client_id
       WHERE i.remote_id = ? AND c.franchisee_id = ?
+        AND i.deleted_at IS NULL AND c.deleted_at IS NULL
       LIMIT 1
       ''',
       [parentRemoteId, franchiseeId],
@@ -1170,6 +1264,47 @@ class DbService {
       throw const FormatException('V2 rectangle parent is unavailable.');
     }
     return parents.first['local_id'] as int;
+  }
+
+  int _compareV2Tuple(
+    Map<String, dynamic> incoming,
+    Map<String, Object?> existing,
+  ) {
+    final incomingGeneration = BigInt.parse(incoming['generation'].toString());
+    final currentGeneration =
+        BigInt.tryParse(existing['server_generation']?.toString() ?? '0') ??
+            BigInt.zero;
+    if (incomingGeneration != currentGeneration) {
+      return incomingGeneration < currentGeneration ? -1 : 1;
+    }
+    final incomingBranch = incoming['branch_seq'] as int;
+    final currentBranch = existing['server_branch_seq'] as int? ?? 0;
+    if (incomingBranch != currentBranch) {
+      return incomingBranch < currentBranch ? -1 : 1;
+    }
+    final incomingRank = incoming['operation'] == 'delete' ? 1 : 0;
+    final currentRank = existing['server_operation_rank'] as int? ?? 0;
+    if (incomingRank != currentRank) {
+      return incomingRank < currentRank ? -1 : 1;
+    }
+    for (final pair in [
+      [
+        incoming['writer_id'].toString(),
+        existing['server_writer_id']?.toString() ?? ''
+      ],
+      [
+        incoming['change_id'].toString(),
+        existing['server_change_id']?.toString() ?? ''
+      ],
+    ]) {
+      if (pair[0] != pair[1]) return pair[0].compareTo(pair[1]);
+    }
+    return 0;
+  }
+
+  List<String> _serverPhotos(Map<String, dynamic> record) {
+    final media = Map<String, dynamic>.from(record['media'] as Map);
+    return List<String>.from(media['photos'] as List);
   }
 
   Future<void> _applyV2Record(
@@ -1198,11 +1333,58 @@ class DbService {
     final localDirty = existing?['is_dirty'] == 1;
     final replaceMutable =
         existing == null || !localDirty || (exactSubmitted && terminal);
-    final incomingGeneration = BigInt.parse(record['generation'].toString());
-    final currentGeneration =
-        BigInt.tryParse(existing?['server_generation']?.toString() ?? '0') ??
+    final tupleComparison =
+        existing == null ? 1 : _compareV2Tuple(record, existing);
+    if (tupleComparison < 0) return;
+    final incomingCursor = BigInt.parse(record['row_cursor'].toString());
+    final currentRowCursor =
+        BigInt.tryParse(existing?['server_cursor']?.toString() ?? '0') ??
             BigInt.zero;
-    if (existing != null && incomingGeneration < currentGeneration) return;
+    if (existing != null &&
+        tupleComparison > 0 &&
+        incomingCursor < currentRowCursor) {
+      throw const FormatException(
+        'V2 response advanced a tuple behind the stored row cursor.',
+      );
+    }
+    if (existing != null && tupleComparison == 0) {
+      if (record['payload_hash'] != existing['server_payload_hash']) {
+        throw const FormatException(
+          'V2 response reused an authoritative tuple with another payload.',
+        );
+      }
+      if (incomingCursor < currentRowCursor) return;
+      final values = <String, Object?>{
+        ..._serverMetadata(record),
+        'updated_at': record['server_timestamp'],
+      };
+      if (collection == 'clients') {
+        final serverPhotos = _serverPhotos(record);
+        if (localDirty) {
+          final localPhotos = List<String>.from(
+              jsonDecode(existing['photos']?.toString() ?? '[]'));
+          values['photos'] = jsonEncode([
+            ...serverPhotos,
+            for (final photo in localPhotos)
+              if (!serverPhotos.contains(photo) &&
+                  !photo.startsWith('/api/photos/client/'))
+                photo,
+          ]);
+        } else {
+          values['photos'] = jsonEncode(serverPhotos);
+        }
+      } else if (collection == 'rectangles' && !localDirty) {
+        final media = Map<String, dynamic>.from(record['media'] as Map);
+        values['image_data'] = media['image_data'];
+      }
+      await executor.update(
+        table,
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+      return;
+    }
 
     int? parentLocalId;
     if (collection == 'items' || collection == 'rectangles') {
@@ -1225,9 +1407,23 @@ class DbService {
 
     final metadata = _serverMetadata(record);
     if (!replaceMutable) {
+      final dirtyMetadata = <String, Object?>{...metadata};
+      if (collection == 'clients') {
+        final serverPhotos = _serverPhotos(record);
+        final localPhotos = List<String>.from(
+          jsonDecode(existing['photos']?.toString() ?? '[]'),
+        );
+        dirtyMetadata['photos'] = jsonEncode([
+          ...serverPhotos,
+          for (final photo in localPhotos)
+            if (!serverPhotos.contains(photo) &&
+                !photo.startsWith('/api/photos/client/'))
+              photo,
+        ]);
+      }
       await executor.update(
         table,
-        metadata,
+        dirtyMetadata,
         where: 'local_id = ?',
         whereArgs: [existing['local_id']],
       );
@@ -1247,6 +1443,12 @@ class DbService {
     };
     switch (collection) {
       case 'clients':
+        final serverPhotos = _serverPhotos(record);
+        final localPhotos = existing == null
+            ? const <String>[]
+            : List<String>.from(
+                jsonDecode(existing['photos']?.toString() ?? '[]'),
+              );
         values.addAll({
           'franchisee_id': franchiseeId,
           'name': payload['name'] ?? '',
@@ -1257,7 +1459,15 @@ class DbService {
           'latitude': payload['latitude'],
           'longitude': payload['longitude'],
           'discounted_price': payload['discounted_price'],
-          if (existing == null) 'photos': '[]',
+          'photos': jsonEncode(record['operation'] == 'delete'
+              ? const <String>[]
+              : [
+                  ...serverPhotos,
+                  for (final photo in localPhotos)
+                    if (!serverPhotos.contains(photo) &&
+                        !photo.startsWith('/api/photos/client/'))
+                      photo,
+                ]),
         });
       case 'items':
         values.addAll({
@@ -1271,7 +1481,8 @@ class DbService {
           'item_id': parentLocalId,
           'length': payload['length'] ?? 1,
           'width': payload['width'] ?? 1,
-          if (existing == null) 'image_data': null,
+          'image_data':
+              (record['media'] as Map<dynamic, dynamic>)['image_data'],
         });
       case 'default_prices':
         values.addAll({
@@ -1292,11 +1503,170 @@ class DbService {
     }
   }
 
+  Future<void> _applyV2Warranty(
+    DatabaseExecutor executor,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+  }) async {
+    final parentRows = await executor.query(
+      'clients',
+      columns: ['local_id'],
+      where: 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
+      whereArgs: [record['client_id'], franchiseeId],
+      limit: 1,
+    );
+    if (parentRows.isEmpty) {
+      throw const FormatException('V2 warranty parent is unavailable.');
+    }
+    final tombstones = await executor.query(
+      'warranty_deletion_tombstones',
+      columns: ['warranty_id'],
+      where: 'franchisee_id = ? AND warranty_id = ?',
+      whereArgs: [franchiseeId, record['remote_id']],
+      limit: 1,
+    );
+    if (tombstones.isNotEmpty) return;
+    final existing = await _existingRemoteRow(
+      executor,
+      'warranties',
+      record['remote_id'] as String,
+    );
+    if (existing != null &&
+        existing['client_id'] != parentRows.first['local_id']) {
+      throw const FormatException('V2 warranty changed an immutable parent.');
+    }
+    final values = <String, Object?>{
+      'remote_id': record['remote_id'],
+      'client_id': parentRows.first['local_id'],
+      'warranty_card_number': record['warranty_card_number'],
+      'start_date': record['start_date'],
+      'duration_years': record['duration_years'],
+      'pdf_url': record['pdf_url'],
+      'server_version': record['version'],
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': null,
+    };
+    if (existing == null) {
+      await executor.insert('warranties', values);
+    } else {
+      await executor.update(
+        'warranties',
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> _applyV2Proposal(
+    DatabaseExecutor executor,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+  }) async {
+    final parentRows = await executor.query(
+      'clients',
+      columns: ['local_id'],
+      where: record['deleted_at'] == null
+          ? 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL'
+          : 'remote_id = ? AND franchisee_id = ?',
+      whereArgs: [record['client_id'], franchiseeId],
+      limit: 1,
+    );
+    if (parentRows.isEmpty) {
+      throw const FormatException('V2 proposal parent is unavailable.');
+    }
+    final existing = await _existingRemoteRow(
+      executor,
+      'proposals',
+      record['remote_id'] as String,
+    );
+    if (existing != null &&
+        existing['client_id'] != parentRows.first['local_id']) {
+      throw const FormatException('V2 proposal changed an immutable parent.');
+    }
+    if (existing != null &&
+        existing['is_dirty'] == 1 &&
+        existing['deleted_at'] != null &&
+        record['deleted_at'] == null) {
+      return;
+    }
+    final values = <String, Object?>{
+      'remote_id': record['remote_id'],
+      'client_id': parentRows.first['local_id'],
+      'pdf_url': record['pdf_url'],
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': record['deleted_at'],
+    };
+    if (existing == null) {
+      await executor.insert('proposals', values);
+    } else {
+      await executor.update(
+        'proposals',
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> _assertSyncStateCursor(
+    DatabaseExecutor executor,
+    String key,
+    String expected,
+  ) async {
+    final rows = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    final current = rows.isEmpty ? '0' : rows.first['value'] as String;
+    if (current != expected) {
+      throw StateError(
+          'A delayed sync response lost its cursor compare-and-set.');
+    }
+  }
+
+  Future<void> _casSyncStateCursor(
+    DatabaseExecutor executor,
+    String key,
+    String expected,
+    String next,
+  ) async {
+    if (BigInt.parse(next) < BigInt.parse(expected)) {
+      throw StateError('A sync response cursor cannot move backwards.');
+    }
+    if (expected == '0') {
+      await executor.insert(
+        'sync_state',
+        {'key': key, 'value': '0'},
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
+    final changed = await executor.update(
+      'sync_state',
+      {'value': next},
+      where: 'key = ? AND value = ?',
+      whereArgs: [key, expected],
+    );
+    if (changed != 1) {
+      throw StateError(
+          'A delayed sync response lost its cursor compare-and-set.');
+    }
+  }
+
   Future<void> applySyncV2Response({
     required String franchiseeId,
+    required String requestCursor,
     required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
     required String warrantyTombstoneCursor,
     required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
     required List<WarrantyDeletionTombstone> warrantyTombstones,
     required Map<String, Map<String, String>> submittedChangeIds,
     required Map<String, String> outcomeStatuses,
@@ -1304,19 +1674,16 @@ class DbService {
   }) async {
     final db = await database;
     await db.transaction((transaction) async {
-      for (final collection in _lwwTables) {
-        for (final record in records[collection] ?? const []) {
-          await _applyV2Record(
-            transaction,
-            collection,
-            record,
-            franchiseeId: franchiseeId,
-            submittedChangeIds:
-                submittedChangeIds[collection] ?? const <String, String>{},
-            outcomeStatuses: outcomeStatuses,
-          );
-        }
-      }
+      await _assertSyncStateCursor(
+        transaction,
+        _syncV2CursorKey(franchiseeId),
+        requestCursor,
+      );
+      await _assertSyncStateCursor(
+        transaction,
+        _warrantyTombstoneCursorKey(franchiseeId),
+        requestWarrantyTombstoneCursor,
+      );
       for (final tombstone in warrantyTombstones) {
         if (tombstone.franchiseeId != franchiseeId) {
           throw ArgumentError('A tombstone cannot cross the active franchisee');
@@ -1332,20 +1699,45 @@ class DbService {
           whereArgs: [tombstone.warrantyId],
         );
       }
-      await transaction.insert(
-          'sync_state',
-          {
-            'key': _syncV2CursorKey(franchiseeId),
-            'value': responseCursor,
-          },
-          conflictAlgorithm: ConflictAlgorithm.replace);
-      await transaction.insert(
-          'sync_state',
-          {
-            'key': _warrantyTombstoneCursorKey(franchiseeId),
-            'value': warrantyTombstoneCursor,
-          },
-          conflictAlgorithm: ConflictAlgorithm.replace);
+      for (final collection in _lwwTables) {
+        for (final record in records[collection] ?? const []) {
+          await _applyV2Record(
+            transaction,
+            collection,
+            record,
+            franchiseeId: franchiseeId,
+            submittedChangeIds:
+                submittedChangeIds[collection] ?? const <String, String>{},
+            outcomeStatuses: outcomeStatuses,
+          );
+        }
+      }
+      for (final warranty in warranties) {
+        await _applyV2Warranty(
+          transaction,
+          warranty,
+          franchiseeId: franchiseeId,
+        );
+      }
+      for (final proposal in proposals) {
+        await _applyV2Proposal(
+          transaction,
+          proposal,
+          franchiseeId: franchiseeId,
+        );
+      }
+      await _casSyncStateCursor(
+        transaction,
+        _syncV2CursorKey(franchiseeId),
+        requestCursor,
+        responseCursor,
+      );
+      await _casSyncStateCursor(
+        transaction,
+        _warrantyTombstoneCursorKey(franchiseeId),
+        requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor,
+      );
       if (activateProtocol) {
         await transaction.insert(
             'sync_state',

@@ -8,9 +8,11 @@ import {
 	Franchisee,
 	Item,
 	Rectangle,
+	SyncV2ChangeReceipt,
 	TenantSyncState,
 	User,
 } from '../models';
+import { irreversibleWarrantyConfirmation } from '../services/warrantyLifecycle';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const writerA = '10000000-0000-4000-8000-000000000001';
@@ -118,6 +120,7 @@ describe('APP-111 sync protocol v2', () => {
 		changeId = randomUUID(),
 		payload = operation === 'delete' ? {} : payloads[collection],
 		parentId = parentFor(collection),
+		media,
 		deviceTimestamp,
 	}: {
 		collection: Collection;
@@ -130,6 +133,7 @@ describe('APP-111 sync protocol v2', () => {
 		changeId?: string;
 		payload?: Record<string, unknown>;
 		parentId?: string;
+		media?: Record<string, unknown>;
 		deviceTimestamp?: unknown;
 	}) => ({
 		remote_id: remoteId,
@@ -141,6 +145,7 @@ describe('APP-111 sync protocol v2', () => {
 		change_id: changeId,
 		...(parentId ? { parent_id: parentId } : {}),
 		payload,
+		...(media !== undefined ? { media } : {}),
 		...(deviceTimestamp !== undefined ? { device_timestamp: deviceTimestamp } : {}),
 	});
 
@@ -182,12 +187,7 @@ describe('APP-111 sync protocol v2', () => {
 		return model.findByPk(id, { paranoid: false });
 	};
 
-	for (const collection of [
-		'clients',
-		'items',
-		'rectangles',
-		'default_prices',
-	] as const) {
+	for (const collection of ['clients', 'items', 'rectangles', 'default_prices'] as const) {
 		it(`${collection}: deterministically resolves opposite arrival order, delete ties, restore, retry, and older changes`, async () => {
 			const firstId = randomUUID();
 			const secondId = randomUUID();
@@ -271,15 +271,13 @@ describe('APP-111 sync protocol v2', () => {
 				},
 			});
 			expect(
-				(await send({ [collection]: [restore] })).body.outcomes[collection][0]
-					.status,
+				(await send({ [collection]: [restore] })).body.outcomes[collection][0].status,
 			).toBe('applied');
 			expect((await modelRecord(collection, firstId)).deletedAt).toBeNull();
 
 			expect(
-				(await send({ [collection]: [restore] })).body.outcomes[collection][0]
-					.status,
-			).toBe('already_applied');
+				(await send({ [collection]: [restore] })).body.outcomes[collection][0].status,
+			).toBe('applied');
 			const reused = {
 				...restore,
 				payload: {
@@ -346,6 +344,222 @@ describe('APP-111 sync protocol v2', () => {
 		});
 		expect(invalid.body.outcomes.clients[0].status).toBe('applied');
 		expect(invalid.body.warnings[0].reason).toBe('invalid');
+
+		const sameChangeId = randomUUID();
+		const diagnosticRetry = change({
+			collection: 'clients',
+			remoteId: randomUUID(),
+			changeId: sameChangeId,
+			deviceTimestamp: 'not-a-date',
+		});
+		const first = await send({ clients: [diagnosticRetry] });
+		const retry = await send({
+			clients: [
+				{
+					...diagnosticRetry,
+					device_timestamp: new Date(Date.now() + 4 * 60 * 1000).toISOString(),
+				},
+			],
+		});
+		expect(first.body.outcomes.clients[0].status).toBe('applied');
+		expect(retry.body.outcomes.clients[0]).toEqual(first.body.outcomes.clients[0]);
+		expect(retry.body.warnings).toEqual([]);
+	});
+
+	it('returns deterministic invalid_payload outcomes for PostgreSQL-aligned bounds', async () => {
+		const invalidCases: Array<{
+			collection: Collection;
+			payload: Record<string, unknown>;
+			media?: Record<string, unknown>;
+		}> = [
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, name: 'x'.repeat(256) },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, address: 'x'.repeat(256) },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, site_address: 'x'.repeat(256) },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, phone: 'x'.repeat(256) },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, email: 'invalid-email' },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, latitude: 90.0001 },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, longitude: -180.0001 },
+			},
+			{
+				collection: 'clients',
+				payload: { ...payloads.clients, discounted_price: 1.001 },
+			},
+			{
+				collection: 'items',
+				payload: { ...payloads.items, name: 'x'.repeat(256) },
+			},
+			{
+				collection: 'items',
+				payload: { ...payloads.items, price: 100000000 },
+			},
+			{
+				collection: 'items',
+				payload: { ...payloads.items, price: 1.001 },
+			},
+			{
+				collection: 'rectangles',
+				payload: { length: 0, width: 1 },
+			},
+			{
+				collection: 'rectangles',
+				payload: { length: 1, width: 10000.0001 },
+			},
+			{
+				collection: 'rectangles',
+				payload: payloads.rectangles,
+				media: { image_data: 'data:image/png;base64,not-valid***' },
+			},
+			{
+				collection: 'default_prices',
+				payload: { ...payloads.default_prices, price: 100000000 },
+			},
+			{
+				collection: 'default_prices',
+				payload: { ...payloads.default_prices, price: 1.001 },
+			},
+		];
+		for (const invalidCase of invalidCases) {
+			const remoteId = randomUUID();
+			const response = await send({
+				[invalidCase.collection]: [
+					change({
+						collection: invalidCase.collection,
+						remoteId,
+						payload: invalidCase.payload,
+						media: invalidCase.media,
+					}),
+				],
+			});
+			expect(response.status).toBe(200);
+			expect(response.body.outcomes[invalidCase.collection][0]).toMatchObject({
+				status: 'rejected',
+				reason_code: 'invalid_payload',
+			});
+			expect(await modelRecord(invalidCase.collection, remoteId)).toBeNull();
+		}
+	});
+
+	it('durably replays rejected and superseded change outcomes by full fingerprint', async () => {
+		const rejectedId = randomUUID();
+		const rejectedChangeId = randomUUID();
+		const rejectedChange = change({
+			collection: 'clients',
+			remoteId: rejectedId,
+			changeId: rejectedChangeId,
+			payload: { ...payloads.clients, email: 'bad' },
+		});
+		const rejected = await send({ clients: [rejectedChange] });
+		expect(rejected.body.outcomes.clients[0]).toMatchObject({
+			status: 'rejected',
+			reason_code: 'invalid_payload',
+		});
+		expect(
+			await SyncV2ChangeReceipt.findOne({
+				where: { franchiseeId: tenantA, changeId: rejectedChangeId },
+			}),
+		).toMatchObject({
+			changeHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+			outcomeJson: expect.stringContaining('"status":"rejected"'),
+		});
+		expect((await send({ clients: [rejectedChange] })).body.outcomes.clients[0]).toEqual(
+			rejected.body.outcomes.clients[0],
+		);
+		expect(
+			(
+				await send({
+					clients: [
+						{
+							...rejectedChange,
+							payload: { ...payloads.clients, name: 'Changed reuse' },
+						},
+					],
+				})
+			).body.outcomes.clients[0],
+		).toMatchObject({ status: 'rejected', reason_code: 'change_id_reused' });
+
+		const remoteId = randomUUID();
+		await send({
+			clients: [
+				change({
+					collection: 'clients',
+					remoteId,
+					writerId: writerB,
+				}),
+			],
+		});
+		const loser = change({
+			collection: 'clients',
+			remoteId,
+			writerId: writerA,
+			changeId: randomUUID(),
+		});
+		const superseded = await send({ clients: [loser] });
+		expect(superseded.body.outcomes.clients[0].status).toBe('superseded');
+		await send({
+			clients: [
+				change({
+					collection: 'clients',
+					remoteId,
+					base: '1',
+					generation: '2',
+				}),
+			],
+		});
+		expect((await send({ clients: [loser] })).body.outcomes.clients[0]).toEqual(
+			superseded.body.outcomes.clients[0],
+		);
+	});
+
+	it('rejects a future warranty tombstone cursor before any mutation', async () => {
+		const remoteId = randomUUID();
+		const body = envelope({
+			clients: [change({ collection: 'clients', remoteId })],
+		});
+		body.warranty_tombstone_cursor = '9223372036854775807';
+		const response = await request(app)
+			.post('/api/sync/v2')
+			.set('Authorization', `Bearer ${tokenA}`)
+			.send(body);
+		expect(response.status).toBe(409);
+		expect(response.body.error.code).toBe('future_warranty_tombstone_cursor');
+		expect(await Client.findByPk(remoteId)).toBeNull();
+	});
+
+	it('rejects a future v1 warranty tombstone cursor before any mutation', async () => {
+		const remoteId = randomUUID();
+		const response = await request(app)
+			.post('/api/sync')
+			.set('Authorization', `Bearer ${tokenA}`)
+			.send({
+				last_sync_time: null,
+				warranty_tombstone_cursor: '1',
+				changes: {
+					clients: [{ remote_id: remoteId, name: 'Must not write' }],
+				},
+			});
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe('future_warranty_tombstone_cursor');
+		expect(await Client.findByPk(remoteId)).toBeNull();
 	});
 
 	it('rolls back the whole request for hostile record IDs and parents without disclosure', async () => {
@@ -381,9 +595,7 @@ describe('APP-111 sync protocol v2', () => {
 
 		for (const collection of Object.keys(hostileIds) as Collection[]) {
 			const localId = randomUUID();
-			const hostileBatch: Partial<
-				Record<Collection, Array<Record<string, unknown>>>
-			> = {
+			const hostileBatch: Partial<Record<Collection, Array<Record<string, unknown>>>> = {
 				clients: [
 					change({
 						collection: 'clients',
@@ -483,16 +695,11 @@ describe('APP-111 sync protocol v2', () => {
 		expect(restoreThenChild.body.outcomes.clients[0].status).toBe('applied');
 		expect(restoreThenChild.body.outcomes.items[0].status).toBe('applied');
 
-		const forbiddenFields: Array<
-			[Collection, Record<string, unknown>]
-		> = [
+		const forbiddenFields: Array<[Collection, Record<string, unknown>]> = [
 			['clients', { ...payloads.clients, photos: ['/foreign.jpg'] }],
 			['items', { ...payloads.items, client_id: parentClientA }],
 			['rectangles', { ...payloads.rectangles, image_data: 'forged' }],
-			[
-				'default_prices',
-				{ ...payloads.default_prices, franchisee_id: tenantB },
-			],
+			['default_prices', { ...payloads.default_prices, franchisee_id: tenantB }],
 		];
 		for (const [collection, payload] of forbiddenFields) {
 			const forbidden = await send({
@@ -512,23 +719,16 @@ describe('APP-111 sync protocol v2', () => {
 	});
 
 	it('orders tenant commits with monotonic decimal-string cursors', async () => {
-		await TenantSyncState.update(
-			{ cursor: '100' },
-			{ where: { franchiseeId: tenantA } },
-		);
+		await TenantSyncState.update({ cursor: '100' }, { where: { franchiseeId: tenantA } });
 		const first = await send(
 			{
-				clients: [
-					change({ collection: 'clients', remoteId: randomUUID() }),
-				],
+				clients: [change({ collection: 'clients', remoteId: randomUUID() })],
 			},
 			'100',
 		);
 		const second = await send(
 			{
-				default_prices: [
-					change({ collection: 'default_prices', remoteId: randomUUID() }),
-				],
+				default_prices: [change({ collection: 'default_prices', remoteId: randomUUID() })],
 			},
 			first.body.response_cursor,
 		);
@@ -576,6 +776,164 @@ describe('APP-111 sync protocol v2', () => {
 		else process.env.SYNC_MIN_PROTOCOL_VERSION = oldMinimum;
 		expect(v1.status).toBe(426);
 		expect(await Client.findByPk(v1Id)).toBeNull();
+	});
+
+	it('propagates photo/image media plus live, replacement, and deleted PDF resources by cursor', async () => {
+		const clientId = randomUUID();
+		const itemId = randomUUID();
+		const rectangleId = randomUUID();
+		const imageData = 'data:image/png;base64,iVBORw0KGgo=';
+		const core = await send({
+			clients: [
+				change({
+					collection: 'clients',
+					remoteId: clientId,
+					payload: { ...payloads.clients, name: 'Media client' },
+				}),
+			],
+			items: [
+				change({
+					collection: 'items',
+					remoteId: itemId,
+					parentId: clientId,
+				}),
+			],
+			rectangles: [
+				change({
+					collection: 'rectangles',
+					remoteId: rectangleId,
+					parentId: itemId,
+					media: { image_data: imageData },
+				}),
+			],
+		});
+		expect(core.status).toBe(200);
+		const coreCursor = core.body.response_cursor as string;
+
+		const photo = await request(app)
+			.post(`/api/photos/client/${clientId}`)
+			.set('Authorization', `Bearer ${tokenA}`)
+			.attach('file', Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]), {
+				filename: 'camera.jpg',
+				contentType: 'image/jpeg',
+			});
+		expect(photo.status).toBe(201);
+		expect(BigInt(photo.body.response_cursor)).toBeGreaterThan(BigInt(coreCursor));
+
+		const samplePdf = Buffer.from('%PDF-1.4\nAPP-111\n%%EOF');
+		const warranty = await request(app)
+			.post('/api/warranty/upload')
+			.set('Authorization', `Bearer ${tokenA}`)
+			.field('client_id', clientId)
+			.field('start_date', '2026-07-30T00:00:00.000Z')
+			.field('duration_years', '5')
+			.field('warranty_card_number', 'APP-111-W1')
+			.attach('file', samplePdf, {
+				filename: 'warranty.pdf',
+				contentType: 'application/pdf',
+			});
+		expect(warranty.status).toBe(201);
+		const proposal = await request(app)
+			.post('/api/proposal/upload')
+			.set('Authorization', `Bearer ${tokenA}`)
+			.field('client_id', clientId)
+			.attach('file', samplePdf, {
+				filename: 'proposal.pdf',
+				contentType: 'application/pdf',
+			});
+		expect(proposal.status).toBe(201);
+
+		const fresh = await send({}, '0');
+		const freshClient = fresh.body.updates.clients.find(
+			(record: any) => record.remote_id === clientId,
+		);
+		expect(freshClient.media.photos).toEqual([photo.body.url]);
+		expect(
+			fresh.body.updates.rectangles.find((record: any) => record.remote_id === rectangleId)
+				.media.image_data,
+		).toBe(imageData);
+		expect(
+			fresh.body.updates.warranties.find(
+				(record: any) => record.remote_id === warranty.body.id,
+			),
+		).toMatchObject({
+			client_id: clientId,
+			pdf_url: `/api/warranty/${warranty.body.id}/download`,
+		});
+		expect(
+			fresh.body.updates.proposals.find(
+				(record: any) => record.remote_id === proposal.body.id,
+			),
+		).toMatchObject({
+			client_id: clientId,
+			pdf_url: `/api/proposal/${proposal.body.id}/download`,
+		});
+
+		const secondDevice = await send({}, coreCursor);
+		expect(
+			secondDevice.body.updates.clients.find((record: any) => record.remote_id === clientId)
+				.media.photos,
+		).toEqual([photo.body.url]);
+		expect(
+			secondDevice.body.updates.warranties.some(
+				(record: any) => record.remote_id === warranty.body.id,
+			),
+		).toBe(true);
+		expect(
+			secondDevice.body.updates.proposals.some(
+				(record: any) => record.remote_id === proposal.body.id,
+			),
+		).toBe(true);
+
+		const beforeReplacementCursor = secondDevice.body.response_cursor as string;
+		const replacementId = randomUUID();
+		const replacement = await request(app)
+			.post('/api/warranty/upload')
+			.set('Authorization', `Bearer ${tokenA}`)
+			.set('Idempotency-Key', 'app-111-replacement-proof')
+			.field('client_id', clientId)
+			.field('start_date', '2026-08-01T00:00:00.000Z')
+			.field('duration_years', '7')
+			.field('warranty_card_number', 'APP-111-W2')
+			.field('replacement_warranty_id', replacementId)
+			.field('confirmed_warranty_id', warranty.body.id)
+			.field('confirmed_warranty_card_number', warranty.body.warrantyCardNumber)
+			.field('confirmed_warranty_version', warranty.body.version.toString())
+			.field(
+				'irreversible_confirmation',
+				irreversibleWarrantyConfirmation(warranty.body.warrantyCardNumber),
+			)
+			.attach('file', samplePdf, {
+				filename: 'replacement.pdf',
+				contentType: 'application/pdf',
+			});
+		expect(replacement.status).toBe(201);
+		expect(replacement.body.id).toBe(replacementId);
+		expect(
+			(
+				await request(app)
+					.delete(`/api/proposal/${proposal.body.id}`)
+					.set('Authorization', `Bearer ${tokenA}`)
+			).status,
+		).toBe(204);
+
+		const replacementPull = await send({}, beforeReplacementCursor);
+		expect(replacementPull.body.updates.warranty_tombstones).toEqual([
+			expect.objectContaining({ warranty_id: warranty.body.id }),
+		]);
+		expect(
+			replacementPull.body.updates.warranties.find(
+				(record: any) => record.remote_id === replacementId,
+			),
+		).toMatchObject({
+			client_id: clientId,
+			warranty_card_number: 'APP-111-W2',
+		});
+		expect(
+			replacementPull.body.updates.proposals.find(
+				(record: any) => record.remote_id === proposal.body.id,
+			).deleted_at,
+		).not.toBeNull();
 	});
 
 	it('isolates tenant snapshots and rejects malformed protocol values before mutation', async () => {

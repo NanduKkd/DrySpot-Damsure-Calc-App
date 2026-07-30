@@ -8,28 +8,36 @@ import {
 	Rectangle,
 	SyncV2ChangeReceipt,
 	SyncV2Request,
-	TenantSyncState,
+	Warranty,
+	WarrantyDeletionSequence,
 } from '../models';
 import {
 	queueManagedFileCleanup,
 	reconcileManagedFileCleanupByStorageKeys,
 } from './managedFileCleanup';
+import { tombstoneClientWarranties, warrantyTombstonesAfter } from './warrantyLifecycle';
 import {
-	tombstoneClientWarranties,
-	warrantyTombstonesAfter,
-} from './warrantyLifecycle';
+	lockTenantSyncState,
+	MAX_TENANT_SYNC_CURSOR,
+	nextTenantSyncCursor,
+	TenantCursorExhaustedError,
+} from './tenantSyncCursor';
 
-export const MAX_SYNC_BIGINT = 9223372036854775807n;
+export const MAX_SYNC_BIGINT = MAX_TENANT_SYNC_CURSOR;
 export const MAX_BRANCH_SEQUENCE = 1_000_000;
+export const MAX_PRICE = 99_999_999.99;
+export const MAX_IMAGE_DATA_BYTES = 15 * 1024 * 1024;
+export const MAX_CLIENT_PHOTOS = 100;
+export const MAX_SYNC_RESPONSE_RECORDS = 1_000;
 const MAX_CHANGES_PER_COLLECTION = 100;
 const MAX_CHANGES_PER_REQUEST = 300;
+const MAX_SYNC_REQUEST_BYTES = 20 * 1024 * 1024;
 const COLLECTIONS = ['clients', 'items', 'rectangles', 'default_prices'] as const;
-const UUID_V4 =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MANAGED_PHOTO =
-	/^\/api\/photos\/client\/[0-9a-f-]{36}\/([0-9a-f-]{36}\.(?:jpg|png|webp))$/i;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MANAGED_PHOTO = /^\/api\/photos\/client\/[0-9a-f-]{36}\/([0-9a-f-]{36}\.(?:jpg|png|webp))$/i;
 
 type Collection = (typeof COLLECTIONS)[number];
+type SyncVisibleCollection = Collection | 'warranties' | 'proposals';
 type Operation = 'upsert' | 'delete';
 type OutcomeStatus =
 	| 'applied'
@@ -53,6 +61,8 @@ export interface ParsedChange {
 	parentId?: string;
 	payload: JsonObject;
 	payloadHash: string;
+	changeHash: string;
+	media?: JsonObject;
 	deviceTimestamp?: string;
 }
 
@@ -128,11 +138,7 @@ const exactKeys = (
 	}
 };
 
-export const parseDecimalBigint = (
-	value: unknown,
-	label: string,
-	allowZero: boolean,
-) => {
+export const parseDecimalBigint = (value: unknown, label: string, allowZero: boolean) => {
 	if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
 		throw new SyncEnvelopeError(
 			'invalid_integer',
@@ -191,10 +197,10 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 	if (!isObject(body)) {
 		throw new SyncEnvelopeError('malformed_envelope', 'The request body must be an object.');
 	}
-	if (Buffer.byteLength(canonicalJson(body), 'utf8') > 2 * 1024 * 1024) {
+	if (Buffer.byteLength(canonicalJson(body), 'utf8') > MAX_SYNC_REQUEST_BYTES) {
 		throw new SyncEnvelopeError(
 			'request_too_large',
-			'Sync protocol v2 requests are limited to 2 MiB.',
+			'Sync protocol v2 requests are limited to 20 MiB.',
 			413,
 		);
 	}
@@ -211,10 +217,7 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 		'request',
 	);
 	if (body.protocol_version !== 2) {
-		throw new SyncEnvelopeError(
-			'unsupported_protocol',
-			'protocol_version must be exactly 2.',
-		);
+		throw new SyncEnvelopeError('unsupported_protocol', 'protocol_version must be exactly 2.');
 	}
 	const requestId = canonicalUuidV4(body.request_id, 'request_id');
 	const requestCursor = parseDecimalBigint(body.request_cursor, 'request_cursor', true);
@@ -241,10 +244,7 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 	for (const collection of COLLECTIONS) {
 		const rawCollection = body.changes[collection] ?? [];
 		if (!Array.isArray(rawCollection)) {
-			throw new SyncEnvelopeError(
-				'malformed_envelope',
-				`${collection} must be an array.`,
-			);
+			throw new SyncEnvelopeError('malformed_envelope', `${collection} must be an array.`);
 		}
 		if (rawCollection.length > MAX_CHANGES_PER_COLLECTION) {
 			throw new SyncEnvelopeError(
@@ -273,6 +273,7 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 					'change_id',
 					'parent_id',
 					'payload',
+					'media',
 					'device_timestamp',
 				],
 				[
@@ -333,19 +334,26 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 				throw new SyncEnvelopeError('invalid_payload', 'payload must be an object.');
 			}
 			if (raw.operation === 'delete' && Object.keys(raw.payload).length !== 0) {
+				throw new SyncEnvelopeError('invalid_payload', 'A delete payload must be empty.');
+			}
+			if (raw.media !== undefined && !isObject(raw.media)) {
+				throw new SyncEnvelopeError('invalid_payload', 'media must be an object.');
+			}
+			if (
+				raw.operation === 'delete' &&
+				raw.media !== undefined &&
+				Object.keys(raw.media).length !== 0
+			) {
 				throw new SyncEnvelopeError(
 					'invalid_payload',
-					'A delete payload must be empty.',
+					'A delete media payload must be empty.',
 				);
 			}
 			const parentId =
 				raw.parent_id === undefined || raw.parent_id === null
 					? undefined
 					: canonicalUuidV4(raw.parent_id, `${collection}.parent_id`);
-			if (
-				(collection === 'clients' || collection === 'default_prices') &&
-				parentId
-			) {
+			if ((collection === 'clients' || collection === 'default_prices') && parentId) {
 				throw new SyncEnvelopeError(
 					'invalid_parent',
 					`${collection} changes cannot carry parent_id.`,
@@ -365,6 +373,20 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 				parentId,
 				payload: raw.payload,
 				payloadHash: payloadHash(raw.payload),
+				changeHash: payloadHash({
+					collection,
+					remote_id: remoteId,
+					operation: raw.operation,
+					base_generation: baseGeneration.toString(),
+					generation: generation.toString(),
+					branch_seq: raw.branch_seq,
+					writer_id: writerId,
+					change_id: changeId,
+					parent_id: parentId ?? null,
+					payload: raw.payload,
+					media: raw.media ?? null,
+				}),
+				media: raw.media,
 				deviceTimestamp: warning ? undefined : (raw.device_timestamp as string | undefined),
 			});
 		}
@@ -386,11 +408,7 @@ export const parseSyncV2Envelope = (body: unknown, now = new Date()): ParsedEnve
 	};
 };
 
-const nullableString = (
-	payload: JsonObject,
-	key: string,
-	maxLength: number,
-): string | null => {
+const nullableString = (payload: JsonObject, key: string, maxLength: number): string | null => {
 	const value = payload[key];
 	if (value === null || value === undefined) return null;
 	if (typeof value !== 'string' || value.length > maxLength) {
@@ -414,6 +432,15 @@ const finiteNumber = (
 		value < minimum ||
 		value > maximum
 	) {
+		throw new BusinessRejection('invalid_payload');
+	}
+	return value;
+};
+
+const currencyNumber = (payload: JsonObject, key: string, nullable = false): number | null => {
+	const value = finiteNumber(payload, key, 0, MAX_PRICE, nullable);
+	if (value === null) return null;
+	if (Math.round(value * 100) / 100 !== value) {
 		throw new BusinessRejection('invalid_payload');
 	}
 	return value;
@@ -472,8 +499,8 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 		case 'clients': {
 			assertPayloadKeys(
 				payload,
-				['name'],
 				[
+					'name',
 					'address',
 					'site_address',
 					'email',
@@ -482,6 +509,7 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 					'longitude',
 					'discounted_price',
 				],
+				[],
 			);
 			if (
 				typeof payload.name !== 'string' ||
@@ -490,25 +518,20 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 			) {
 				throw new BusinessRejection('invalid_payload');
 			}
-			const email = nullableString(payload, 'email', 254);
+			let email = nullableString(payload, 'email', 255);
+			if (email === '') email = null;
 			if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
 				throw new BusinessRejection('invalid_payload');
 			}
 			return {
-				address: nullableString(payload, 'address', 1000),
-				discounted_price: finiteNumber(
-					payload,
-					'discounted_price',
-					0,
-					1_000_000_000,
-					true,
-				),
+				address: nullableString(payload, 'address', 255),
+				discounted_price: currencyNumber(payload, 'discounted_price', true),
 				email,
 				latitude: finiteNumber(payload, 'latitude', -90, 90, true),
 				longitude: finiteNumber(payload, 'longitude', -180, 180, true),
 				name: payload.name,
-				phone: nullableString(payload, 'phone', 64),
-				site_address: nullableString(payload, 'site_address', 1000),
+				phone: nullableString(payload, 'phone', 255),
+				site_address: nullableString(payload, 'site_address', 255),
 			};
 		}
 		case 'items':
@@ -524,7 +547,7 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 			return {
 				enabled: payload.enabled,
 				name: payload.name,
-				price: finiteNumber(payload, 'price', 0, 1_000_000_000),
+				price: currencyNumber(payload, 'price'),
 			};
 		case 'rectangles':
 			assertPayloadKeys(payload, ['length', 'width'], []);
@@ -539,15 +562,37 @@ const validatePayload = (change: ParsedChange): JsonObject => {
 			}
 			return {
 				enabled: payload.enabled,
-				price: finiteNumber(payload, 'price', 0, 1_000_000_000),
+				price: currencyNumber(payload, 'price'),
 			};
 	}
 };
 
+const validateMedia = (change: ParsedChange): JsonObject | undefined => {
+	if (change.operation === 'delete') return undefined;
+	const media = change.media;
+	if (change.collection !== 'rectangles') {
+		if (media !== undefined && Object.keys(media).length) {
+			throw new BusinessRejection('server_field_forbidden');
+		}
+		return undefined;
+	}
+	if (media === undefined) return undefined;
+	assertPayloadKeys(media, ['image_data'], []);
+	const imageData = media.image_data;
+	if (imageData === null) return { image_data: null };
+	if (
+		typeof imageData !== 'string' ||
+		Buffer.byteLength(imageData, 'utf8') > MAX_IMAGE_DATA_BYTES ||
+		!/^data:image\/(?:jpeg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/.test(imageData)
+	) {
+		throw new BusinessRejection('invalid_payload');
+	}
+	return { image_data: imageData };
+};
+
 const operationRank = (operation: Operation) => (operation === 'delete' ? 1 : 0);
 
-const compareText = (left: string, right: string) =>
-	left < right ? -1 : left > right ? 1 : 0;
+const compareText = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 
 const compareCandidate = (change: ParsedChange, existing: any) => {
 	const generation = BigInt(existing.lwwGeneration);
@@ -656,7 +701,44 @@ const modelFor = (collection: Collection): any => {
 	}
 };
 
-const serializeRecord = (collection: Collection, record: any) => {
+const canonicalClientPhotos = (record: any): string[] => {
+	let raw: unknown = record.photos;
+	if (typeof raw === 'string') {
+		try {
+			raw = JSON.parse(raw);
+		} catch {
+			throw new SyncEnvelopeError(
+				'invalid_authoritative_state',
+				'Stored client photo metadata is malformed.',
+				500,
+			);
+		}
+	}
+	if (!Array.isArray(raw) || raw.length > MAX_CLIENT_PHOTOS) {
+		throw new SyncEnvelopeError(
+			'invalid_authoritative_state',
+			'Stored client photo metadata exceeds protocol bounds.',
+			500,
+		);
+	}
+	const pattern = new RegExp(
+		`^/api/photos/client/${record.id}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(?:jpg|png|webp)$`,
+		'i',
+	);
+	const photos = raw.filter(
+		(value): value is string => typeof value === 'string' && pattern.test(value),
+	);
+	if (photos.length !== raw.length || new Set(photos).size !== photos.length) {
+		throw new SyncEnvelopeError(
+			'invalid_authoritative_state',
+			'Stored client photo metadata is not canonical.',
+			500,
+		);
+	}
+	return photos;
+};
+
+export const serializeLwwRecord = (collection: Collection, record: any) => {
 	const common = {
 		remote_id: record.id,
 		generation: record.lwwGeneration.toString(),
@@ -674,82 +756,81 @@ const serializeRecord = (collection: Collection, record: any) => {
 			return {
 				...common,
 				franchisee_id: record.franchiseeId,
-				payload: {
-					address: record.address ?? null,
-					discounted_price:
-						record.discountedPrice === null ? null : Number(record.discountedPrice),
-					email: record.email ?? null,
-					latitude: record.latitude === null ? null : Number(record.latitude),
-					longitude: record.longitude === null ? null : Number(record.longitude),
-					name: record.name,
-					phone: record.phone ?? null,
-					site_address: record.siteAddress ?? null,
+				payload: record.deletedAt
+					? {}
+					: {
+							address: record.address ?? null,
+							discounted_price:
+								record.discountedPrice === null
+									? null
+									: Number(record.discountedPrice),
+							email: record.email ?? null,
+							latitude: record.latitude === null ? null : Number(record.latitude),
+							longitude: record.longitude === null ? null : Number(record.longitude),
+							name: record.name,
+							phone: record.phone ?? null,
+							site_address: record.siteAddress ?? null,
+						},
+				media: {
+					photos: record.deletedAt ? [] : canonicalClientPhotos(record),
 				},
 			};
 		case 'items':
 			return {
 				...common,
 				parent_id: record.clientId,
-				payload: {
-					enabled: Boolean(record.enabled),
-					name: record.name,
-					price: Number(record.price),
-				},
+				payload: record.deletedAt
+					? {}
+					: {
+							enabled: Boolean(record.enabled),
+							name: record.name,
+							price: Number(record.price),
+						},
 			};
 		case 'rectangles':
+			if (
+				record.imageData !== null &&
+				Buffer.byteLength(String(record.imageData), 'utf8') > MAX_IMAGE_DATA_BYTES
+			) {
+				throw new SyncEnvelopeError(
+					'invalid_authoritative_state',
+					'Stored rectangle image data exceeds protocol bounds.',
+					500,
+				);
+			}
 			return {
 				...common,
 				parent_id: record.itemId,
-				payload: {
-					length: Number(record.length),
-					width: Number(record.width),
+				payload: record.deletedAt
+					? {}
+					: {
+							length: Number(record.length),
+							width: Number(record.width),
+						},
+				media: {
+					image_data: record.deletedAt ? null : (record.imageData ?? null),
 				},
 			};
 		case 'default_prices':
 			return {
 				...common,
 				franchisee_id: record.franchiseeId,
-				payload: {
-					enabled: Boolean(record.enabled),
-					price: Number(record.price),
-				},
+				payload: record.deletedAt
+					? {}
+					: {
+							enabled: Boolean(record.enabled),
+							price: Number(record.price),
+						},
 			};
 	}
 };
 
-const findExisting = async (
-	change: ParsedChange,
-	transaction: Transaction,
-	lock = true,
-) =>
+const findExisting = async (change: ParsedChange, transaction: Transaction, lock = true) =>
 	modelFor(change.collection).findByPk(change.remoteId, {
 		paranoid: false,
 		transaction,
 		...(lock ? { lock: transaction.LOCK.UPDATE } : {}),
 	});
-
-const ensureTenantState = async (
-	franchiseeId: string,
-	transaction: Transaction,
-) => {
-	let state = await TenantSyncState.findByPk(franchiseeId, {
-		transaction,
-		lock: transaction.LOCK.UPDATE,
-	});
-	if (!state) {
-		await TenantSyncState.findOrCreate({
-			where: { franchiseeId },
-			defaults: { franchiseeId, cursor: '1' },
-			transaction,
-		});
-		state = await TenantSyncState.findByPk(franchiseeId, {
-			transaction,
-			lock: transaction.LOCK.UPDATE,
-		});
-	}
-	if (!state) throw new Error('Unable to establish tenant sync state.');
-	return state;
-};
 
 const unauthorizedOutcomes = (envelope: ParsedEnvelope) => {
 	const outcomes: Record<Collection, Array<Record<string, unknown>>> = {
@@ -810,6 +891,7 @@ const preflightTenant = async (
 const applyRecord = async (
 	change: ParsedChange,
 	normalizedPayload: JsonObject,
+	normalizedMedia: JsonObject | undefined,
 	existing: any,
 	franchiseeId: string,
 	nextCursor: bigint,
@@ -883,6 +965,7 @@ const applyRecord = async (
 					await queueManagedFileCleanup('pdf', proposal.pdfFileName, transaction);
 					cleanupKeys.push(proposal.pdfFileName);
 				}
+				await proposal.update({ syncCursor: nextCursor.toString() }, { transaction });
 				await proposal.destroy({ transaction });
 			}
 		}
@@ -890,6 +973,8 @@ const applyRecord = async (
 		const deleteValues: JsonObject = {
 			...metadata,
 			deletedAt: now,
+			...(change.collection === 'clients' ? { photos: '[]' } : {}),
+			...(change.collection === 'rectangles' ? { imageData: null } : {}),
 		};
 		if (existing) {
 			await modelFor(change.collection).update(deleteValues, {
@@ -979,6 +1064,7 @@ const applyRecord = async (
 					itemId: parentId,
 					length: normalizedPayload.length,
 					width: normalizedPayload.width,
+					...(normalizedMedia ? { imageData: normalizedMedia.image_data } : {}),
 				});
 				break;
 			case 'default_prices':
@@ -999,9 +1085,7 @@ const applyRecord = async (
 			await modelFor(change.collection).create(
 				{
 					id: change.remoteId,
-					...(change.collection === 'clients'
-						? { franchiseeId, photos: '[]' }
-						: {}),
+					...(change.collection === 'clients' ? { franchiseeId, photos: '[]' } : {}),
 					...upsertValues,
 				},
 				{ transaction },
@@ -1027,7 +1111,8 @@ const processChange = async (
 		lock: transaction.LOCK.UPDATE,
 	});
 	if (receipt) {
-		const same =
+		const legacySame =
+			receipt.changeHash === null &&
 			receipt.entityType === change.collection &&
 			receipt.entityId === change.remoteId &&
 			BigInt(receipt.generation) === change.generation &&
@@ -1035,81 +1120,35 @@ const processChange = async (
 			receipt.operationRank === operationRank(change.operation) &&
 			receipt.writerId === change.writerId &&
 			receipt.payloadHash === change.payloadHash;
+		const same = receipt.changeHash === change.changeHash || legacySame;
+		if (!same) {
+			return {
+				applied: false,
+				outcome: outcome(change, 'rejected', 'change_id_reused'),
+			};
+		}
+		if (receipt.outcomeJson) {
+			return {
+				applied: false,
+				outcome: JSON.parse(receipt.outcomeJson) as Record<string, unknown>,
+			};
+		}
 		const current = await findExisting(change, transaction);
 		return {
 			applied: false,
-			outcome: same
-				? outcome(
-						change,
-						'already_applied',
-						'already_applied',
-						current ? serializeRecord(change.collection, current) : undefined,
-					)
-				: outcome(change, 'rejected', 'change_id_reused'),
+			outcome: outcome(
+				change,
+				'applied',
+				change.operation === 'delete' ? 'delete_applied' : 'upsert_applied',
+				current ? serializeLwwRecord(change.collection, current) : undefined,
+			),
 		};
 	}
 
-	const existing = await findExisting(change, transaction);
-	const authoritativeGeneration = existing ? BigInt(existing.lwwGeneration) : 0n;
-	if (change.baseGeneration > authoritativeGeneration) {
-		return {
-			applied: false,
-			outcome: outcome(change, 'rejected', 'future_base_version'),
-		};
-	}
-	if (existing?.deletedAt && change.operation === 'upsert') {
-		if (change.generation <= authoritativeGeneration) {
-			return {
-				applied: false,
-				outcome: outcome(
-					change,
-					'superseded',
-					'delete_wins',
-					serializeRecord(change.collection, existing),
-				),
-			};
-		}
-	}
-	if (existing) {
-		const comparison = compareCandidate(change, existing);
-		if (comparison === 0) {
-			return {
-				applied: false,
-				outcome:
-					existing.lwwPayloadHash === change.payloadHash
-						? outcome(
-								change,
-								'already_applied',
-								'already_applied',
-								serializeRecord(change.collection, existing),
-							)
-						: outcome(change, 'rejected', 'change_id_reused'),
-			};
-		}
-		if (comparison < 0) {
-			return {
-				applied: false,
-				outcome: outcome(
-					change,
-					'superseded',
-					'version_superseded',
-					serializeRecord(change.collection, existing),
-				),
-			};
-		}
-	}
-
-	try {
-		const normalizedPayload = validatePayload(change);
-		const record = await applyRecord(
-			change,
-			normalizedPayload,
-			existing,
-			franchiseeId,
-			nextCursor,
-			transaction,
-			cleanupKeys,
-		);
+	const persistTerminal = async (
+		result: Record<string, unknown>,
+		effectivePayloadHash: string,
+	) => {
 		await SyncV2ChangeReceipt.create(
 			{
 				franchiseeId,
@@ -1120,33 +1159,159 @@ const processChange = async (
 				branchSeq: change.branchSeq,
 				operationRank: operationRank(change.operation),
 				writerId: change.writerId,
-				payloadHash: change.payloadHash,
+				payloadHash: effectivePayloadHash,
+				changeHash: change.changeHash,
+				outcomeJson: JSON.stringify(result),
 			},
 			{ transaction },
 		);
+		return result;
+	};
+
+	try {
+		const normalizedPayload = validatePayload(change);
+		const normalizedMedia = validateMedia(change);
+		const candidate = {
+			...change,
+			payload: normalizedPayload,
+			payloadHash: payloadHash(normalizedPayload),
+			media: normalizedMedia,
+		};
+		const existing = await findExisting(candidate, transaction);
+		const authoritativeGeneration = existing ? BigInt(existing.lwwGeneration) : 0n;
+		if (candidate.baseGeneration > authoritativeGeneration) {
+			return {
+				applied: false,
+				outcome: await persistTerminal(
+					outcome(candidate, 'rejected', 'future_base_version'),
+					candidate.payloadHash,
+				),
+			};
+		}
+		if (
+			existing?.deletedAt &&
+			candidate.operation === 'upsert' &&
+			candidate.generation <= authoritativeGeneration
+		) {
+			return {
+				applied: false,
+				outcome: await persistTerminal(
+					outcome(
+						candidate,
+						'superseded',
+						'delete_wins',
+						serializeLwwRecord(candidate.collection, existing),
+					),
+					candidate.payloadHash,
+				),
+			};
+		}
+		if (existing) {
+			const comparison = compareCandidate(candidate, existing);
+			if (comparison === 0) {
+				const result =
+					existing.lwwPayloadHash === candidate.payloadHash
+						? outcome(
+								candidate,
+								'already_applied',
+								'already_applied',
+								serializeLwwRecord(candidate.collection, existing),
+							)
+						: outcome(candidate, 'rejected', 'change_id_reused');
+				return {
+					applied: false,
+					outcome: await persistTerminal(result, candidate.payloadHash),
+				};
+			}
+			if (comparison < 0) {
+				return {
+					applied: false,
+					outcome: await persistTerminal(
+						outcome(
+							candidate,
+							'superseded',
+							'version_superseded',
+							serializeLwwRecord(candidate.collection, existing),
+						),
+						candidate.payloadHash,
+					),
+				};
+			}
+		}
+		const record = await applyRecord(
+			candidate,
+			normalizedPayload,
+			normalizedMedia,
+			existing,
+			franchiseeId,
+			nextCursor,
+			transaction,
+			cleanupKeys,
+		);
+		const appliedOutcome = outcome(
+			candidate,
+			'applied',
+			candidate.operation === 'delete' ? 'delete_applied' : 'upsert_applied',
+			serializeLwwRecord(candidate.collection, record),
+		);
 		return {
 			applied: true,
-			outcome: outcome(
-				change,
-				'applied',
-				change.operation === 'delete' ? 'delete_applied' : 'upsert_applied',
-				serializeRecord(change.collection, record),
-			),
+			outcome: await persistTerminal(appliedOutcome, candidate.payloadHash),
 		};
 	} catch (error) {
 		if (error instanceof BusinessRejection) {
 			return {
 				applied: false,
-				outcome: outcome(change, 'rejected', error.reasonCode),
+				outcome: await persistTerminal(
+					outcome(change, 'rejected', error.reasonCode),
+					change.payloadHash,
+				),
 			};
 		}
 		if (error instanceof ValidationError) {
 			return {
 				applied: false,
-				outcome: outcome(change, 'rejected', 'invalid_payload'),
+				outcome: await persistTerminal(
+					outcome(change, 'rejected', 'invalid_payload'),
+					change.payloadHash,
+				),
 			};
 		}
 		throw error;
+	}
+};
+
+const serializeWarranty = (record: Warranty) => ({
+	remote_id: record.id,
+	client_id: record.clientId,
+	version: record.version,
+	start_date: record.startDate.toISOString(),
+	duration_years: record.durationYears,
+	pdf_url: record.pdfUrl,
+	warranty_card_number: record.warrantyCardNumber,
+	row_cursor: record.syncCursor.toString(),
+	server_timestamp: record.updatedAt.toISOString(),
+	deleted_at: null,
+});
+
+const serializeProposal = (record: Proposal) => ({
+	remote_id: record.id,
+	client_id: record.clientId,
+	pdf_url: record.pdfUrl,
+	row_cursor: record.syncCursor.toString(),
+	server_timestamp: record.updatedAt.toISOString(),
+	deleted_at: record.deletedAt ? record.deletedAt.toISOString() : null,
+});
+
+const assertSnapshotBounds = (collections: Record<string, unknown[]>) => {
+	for (const [collection, records] of Object.entries(collections)) {
+		if (records.length > MAX_SYNC_RESPONSE_RECORDS) {
+			throw new SyncEnvelopeError(
+				'snapshot_too_large',
+				`${collection} exceeds the bounded sync snapshot size.`,
+				409,
+			);
+		}
 	}
 };
 
@@ -1168,6 +1333,7 @@ const snapshot = async (
 			['syncCursor', 'ASC'],
 			['id', 'ASC'],
 		],
+		limit: MAX_SYNC_RESPONSE_RECORDS + 1,
 	});
 	const allClients = await Client.findAll({
 		where: { franchiseeId },
@@ -1185,6 +1351,7 @@ const snapshot = async (
 					['syncCursor', 'ASC'],
 					['id', 'ASC'],
 				],
+				limit: MAX_SYNC_RESPONSE_RECORDS + 1,
 			})
 		: [];
 	const allItems = clientIds.length
@@ -1205,6 +1372,7 @@ const snapshot = async (
 					['syncCursor', 'ASC'],
 					['id', 'ASC'],
 				],
+				limit: MAX_SYNC_RESPONSE_RECORDS + 1,
 			})
 		: [];
 	const defaultPrices = await DefaultPrice.findAll({
@@ -1215,15 +1383,41 @@ const snapshot = async (
 			['syncCursor', 'ASC'],
 			['id', 'ASC'],
 		],
+		limit: MAX_SYNC_RESPONSE_RECORDS + 1,
 	});
-	return {
-		clients: clients.map((record) => serializeRecord('clients', record)),
-		items: items.map((record) => serializeRecord('items', record)),
-		rectangles: rectangles.map((record) => serializeRecord('rectangles', record)),
-		default_prices: defaultPrices.map((record) =>
-			serializeRecord('default_prices', record),
-		),
+	const warranties = clientIds.length
+		? await Warranty.findAll({
+				where: { clientId: { [Op.in]: clientIds }, syncCursor: range },
+				transaction,
+				order: [
+					['syncCursor', 'ASC'],
+					['id', 'ASC'],
+				],
+				limit: MAX_SYNC_RESPONSE_RECORDS + 1,
+			})
+		: [];
+	const proposals = clientIds.length
+		? await Proposal.findAll({
+				where: { clientId: { [Op.in]: clientIds }, syncCursor: range },
+				paranoid: false,
+				transaction,
+				order: [
+					['syncCursor', 'ASC'],
+					['id', 'ASC'],
+				],
+				limit: MAX_SYNC_RESPONSE_RECORDS + 1,
+			})
+		: [];
+	const result = {
+		clients: clients.map((record) => serializeLwwRecord('clients', record)),
+		items: items.map((record) => serializeLwwRecord('items', record)),
+		rectangles: rectangles.map((record) => serializeLwwRecord('rectangles', record)),
+		default_prices: defaultPrices.map((record) => serializeLwwRecord('default_prices', record)),
+		warranties: warranties.map(serializeWarranty),
+		proposals: proposals.map(serializeProposal),
 	};
+	assertSnapshotBounds(result);
+	return result;
 };
 
 export const executeSyncV2 = async (
@@ -1235,7 +1429,7 @@ export const executeSyncV2 = async (
 	const response = await sequelize.transaction(
 		{ isolationLevel: Transaction.ISOLATION_LEVELS.READ_COMMITTED },
 		async (transaction: Transaction) => {
-			const state = await ensureTenantState(franchiseeId, transaction);
+			const state = await lockTenantSyncState(franchiseeId, transaction);
 			const receipt = await SyncV2Request.findOne({
 				where: { franchiseeId, requestId: envelope.requestId },
 				transaction,
@@ -1260,19 +1454,33 @@ export const executeSyncV2 = async (
 					409,
 				);
 			}
+			const warrantySequence = await WarrantyDeletionSequence.findByPk(1, {
+				transaction,
+			});
+			const authoritativeWarrantyCursor = BigInt(warrantySequence?.lastValue ?? '0');
+			if (envelope.warrantyTombstoneCursor > authoritativeWarrantyCursor) {
+				throw new SyncEnvelopeError(
+					'future_warranty_tombstone_cursor',
+					'warranty_tombstone_cursor is ahead of the authoritative sequence.',
+					409,
+				);
+			}
 			await preflightTenant(envelope, franchiseeId, transaction);
 
 			const hasCandidates = COLLECTIONS.some(
 				(collection) => envelope.changes[collection].length > 0,
 			);
-			if (hasCandidates && currentCursor === MAX_SYNC_BIGINT) {
-				throw new SyncEnvelopeError(
-					'cursor_exhausted',
-					'The authoritative tenant cursor is exhausted.',
-					409,
-				);
+			let nextCursor = currentCursor;
+			if (hasCandidates) {
+				try {
+					nextCursor = nextTenantSyncCursor(state.cursor);
+				} catch (error) {
+					if (error instanceof TenantCursorExhaustedError) {
+						throw new SyncEnvelopeError('cursor_exhausted', error.message, 409);
+					}
+					throw error;
+				}
 			}
-			const nextCursor = hasCandidates ? currentCursor + 1n : currentCursor;
 			const outcomes: Record<Collection, Array<Record<string, unknown>>> = {
 				clients: [],
 				items: [],
@@ -1341,8 +1549,8 @@ export const executeSyncV2 = async (
 		},
 	);
 	if (cleanupKeys.length) {
-		void reconcileManagedFileCleanupByStorageKeys([...new Set(cleanupKeys)]).catch(
-			(error) => console.error('Unable to reconcile APP-111 cleanup:', error),
+		void reconcileManagedFileCleanupByStorageKeys([...new Set(cleanupKeys)]).catch((error) =>
+			console.error('Unable to reconcile APP-111 cleanup:', error),
 		);
 	}
 	return response;
@@ -1352,29 +1560,34 @@ const legacyPayload = (collection: Collection, record: any) => {
 	if (record.deletedAt) return {};
 	switch (collection) {
 		case 'clients':
-			return serializeRecord(collection, record).payload as JsonObject;
+			return serializeLwwRecord(collection, record).payload as JsonObject;
 		case 'items':
-			return serializeRecord(collection, record).payload as JsonObject;
+			return serializeLwwRecord(collection, record).payload as JsonObject;
 		case 'rectangles':
-			return serializeRecord(collection, record).payload as JsonObject;
+			return serializeLwwRecord(collection, record).payload as JsonObject;
 		case 'default_prices':
-			return serializeRecord(collection, record).payload as JsonObject;
+			return serializeLwwRecord(collection, record).payload as JsonObject;
 	}
 };
 
 export const stampLegacySyncChanges = async (
 	franchiseeId: string,
-	appliedIds: Partial<Record<Collection, string[]>>,
+	appliedIds: Partial<Record<SyncVisibleCollection, string[]>>,
 	transaction: Transaction,
 ) => {
-	const hasChanges = COLLECTIONS.some((collection) => appliedIds[collection]?.length);
+	const visibleCollections: SyncVisibleCollection[] = [...COLLECTIONS, 'warranties', 'proposals'];
+	const hasChanges = visibleCollections.some((collection) => appliedIds[collection]?.length);
 	if (!hasChanges) return;
-	const state = await ensureTenantState(franchiseeId, transaction);
-	const current = BigInt(state.cursor);
-	if (current === MAX_SYNC_BIGINT) {
-		throw new SyncEnvelopeError('cursor_exhausted', 'Tenant cursor exhausted.', 409);
+	const state = await lockTenantSyncState(franchiseeId, transaction);
+	let cursor: bigint;
+	try {
+		cursor = nextTenantSyncCursor(state.cursor);
+	} catch (error) {
+		if (error instanceof TenantCursorExhaustedError) {
+			throw new SyncEnvelopeError('cursor_exhausted', error.message, 409);
+		}
+		throw error;
 	}
-	const cursor = current + 1n;
 	for (const collection of COLLECTIONS) {
 		for (const id of [...new Set(appliedIds[collection] ?? [])]) {
 			const record = await modelFor(collection).findByPk(id, {
@@ -1413,6 +1626,37 @@ export const stampLegacySyncChanges = async (
 					lwwPayloadHash: payloadHash(payload),
 					syncCursor: cursor.toString(),
 				},
+				{
+					where: { id },
+					paranoid: false,
+					transaction,
+				},
+			);
+		}
+	}
+	for (const collection of ['warranties', 'proposals'] as const) {
+		const model = collection === 'warranties' ? Warranty : Proposal;
+		for (const id of [...new Set(appliedIds[collection] ?? [])]) {
+			const record = await model.findByPk(id, {
+				paranoid: false,
+				transaction,
+				lock: transaction.LOCK.UPDATE,
+			});
+			if (!record) continue;
+			const client = await Client.findByPk(record.clientId, {
+				paranoid: false,
+				transaction,
+			});
+			if (!client || client.franchiseeId !== franchiseeId) {
+				throw new SyncTenantAuthorizationError({
+					clients: [],
+					items: [],
+					rectangles: [],
+					default_prices: [],
+				});
+			}
+			await model.update(
+				{ syncCursor: cursor.toString() },
 				{
 					where: { id },
 					paranoid: false,

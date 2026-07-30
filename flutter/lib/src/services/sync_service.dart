@@ -1,3 +1,6 @@
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'api_service.dart';
@@ -50,14 +53,26 @@ class SyncService {
 
     // The legacy writer drains first. A v2 state bit is persisted only in the
     // same SQLite transaction that applies a successful cursor-zero snapshot.
-    await _syncV1();
+    try {
+      await _syncV1();
+    } on ApiException catch (error) {
+      if (supportsV2 &&
+          error.statusCode == 426 &&
+          error.code == 'sync_protocol_upgrade_required') {
+        await dbService.claimLegacyLwwChanges(franchiseeId);
+        await _syncV2(franchiseeId, activateProtocol: true);
+        return;
+      }
+      rethrow;
+    }
     if (!supportsV2) return;
     try {
       await _syncV2(franchiseeId, activateProtocol: true);
-    } catch (_) {
+    } on ApiException catch (error) {
       // During the compatibility window an old server may not expose /sync/v2.
       // The successful v1 drain remains durable, while no v2 cursor/state is
       // persisted and the next explicit sync retries the bootstrap safely.
+      if (!error.endpointMissing) rethrow;
     }
   }
 
@@ -611,6 +626,10 @@ class SyncService {
     r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
     caseSensitive: false,
   );
+  static const _maxBigint = '9223372036854775807';
+  static const _maxPrice = 99999999.99;
+  static const _maxImageDataBytes = 15 * 1024 * 1024;
+  static const _maxResponseRecords = 1000;
 
   ApiException _protocolError(String message) =>
       ApiException('Sync protocol error: $message');
@@ -626,7 +645,7 @@ class SyncService {
     }
     final parsed = BigInt.parse(value);
     if ((!allowZero && parsed == BigInt.zero) ||
-        parsed > BigInt.parse('9223372036854775807')) {
+        parsed > BigInt.parse(_maxBigint)) {
       throw _protocolError('$label is outside the supported range.');
     }
     return parsed;
@@ -651,6 +670,59 @@ class SyncService {
     }
   }
 
+  dynamic _stableJsonValue(dynamic value) {
+    if (value is List) return value.map(_stableJsonValue).toList();
+    if (value is Map) {
+      final keys = value.keys.map((key) => key.toString()).toList()..sort();
+      return {
+        for (final key in keys) key: _stableJsonValue(value[key]),
+      };
+    }
+    if (value is double &&
+        value.isFinite &&
+        value == value.truncateToDouble()) {
+      return value.toInt();
+    }
+    return value;
+  }
+
+  String _payloadHash(Map<String, dynamic> payload) => sha256
+      .convert(utf8.encode(jsonEncode(_stableJsonValue(payload))))
+      .toString();
+
+  bool _boundedString(dynamic value, {required int max, bool nullable = true}) {
+    if (value == null) return nullable;
+    return value is String && value.length <= max;
+  }
+
+  bool _currency(dynamic value, {bool nullable = false}) {
+    if (value == null) return nullable;
+    if (value is! num || !value.isFinite || value < 0 || value > _maxPrice) {
+      return false;
+    }
+    final doubleValue = value.toDouble();
+    return (doubleValue * 100).round() / 100 == doubleValue;
+  }
+
+  DateTime _serverDate(dynamic value, String label) {
+    if (value is! String ||
+        !RegExp(r'(?:Z|[+-]\d{2}:\d{2})$').hasMatch(value)) {
+      throw _protocolError('$label is not an offset-aware timestamp.');
+    }
+    final parsed = DateTime.tryParse(value);
+    if (parsed == null) throw _protocolError('$label is invalid.');
+    return parsed;
+  }
+
+  bool _canonicalDataImage(dynamic value) {
+    if (value == null) return true;
+    return value is String &&
+        utf8.encode(value).length <= _maxImageDataBytes &&
+        RegExp(
+          r'^data:image/(?:jpeg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$',
+        ).hasMatch(value);
+  }
+
   Map<String, dynamic> _validateV2Record(
     dynamic raw,
     String collection, {
@@ -673,9 +745,13 @@ class SyncService {
       'deleted_at',
       'payload',
     };
-    final extra = collection == 'items' || collection == 'rectangles'
-        ? {'parent_id'}
-        : {'franchisee_id'};
+    final extra = switch (collection) {
+      'clients' => {'franchisee_id', 'media'},
+      'items' => {'parent_id'},
+      'rectangles' => {'parent_id', 'media'},
+      'default_prices' => {'franchisee_id'},
+      _ => throw _protocolError('unknown authoritative collection.'),
+    };
     _exactKeys(
       record,
       {...common, ...extra},
@@ -710,13 +786,9 @@ class SyncService {
         (snapshot && rowCursor <= requestCursor)) {
       throw _protocolError('$collection.row_cursor is outside the snapshot.');
     }
-    if (DateTime.tryParse(record['server_timestamp'].toString()) == null) {
-      throw _protocolError('$collection.server_timestamp is invalid.');
-    }
+    _serverDate(record['server_timestamp'], '$collection.server_timestamp');
     final deletedAt = record['deleted_at'];
-    if (deletedAt != null && DateTime.tryParse(deletedAt.toString()) == null) {
-      throw _protocolError('$collection.deleted_at is invalid.');
-    }
+    if (deletedAt != null) _serverDate(deletedAt, '$collection.deleted_at');
     if ((record['operation'] == 'delete') != (deletedAt != null)) {
       throw _protocolError('$collection deletion state is inconsistent.');
     }
@@ -724,12 +796,14 @@ class SyncService {
       throw _protocolError('$collection.payload is invalid.');
     }
     final payload = Map<String, dynamic>.from(record['payload'] as Map);
-    bool finiteNumber(dynamic value) => value is num && value.isFinite;
+    final deleting = record['operation'] == 'delete';
+    if (deleting && payload.isNotEmpty) {
+      throw _protocolError('$collection delete payload must be empty.');
+    }
     switch (collection) {
       case 'clients':
-        _exactKeys(
-          payload,
-          {
+        if (!deleting) {
+          const keys = {
             'name',
             'address',
             'site_address',
@@ -738,68 +812,105 @@ class SyncService {
             'latitude',
             'longitude',
             'discounted_price',
-          },
-          {
-            'name',
-            'address',
-            'site_address',
-            'email',
-            'phone',
-            'latitude',
-            'longitude',
-            'discounted_price',
-          },
-          'clients.payload',
+          };
+          _exactKeys(payload, keys, keys, 'clients.payload');
+          final name = payload['name'];
+          final email = payload['email'];
+          final latitude = payload['latitude'];
+          final longitude = payload['longitude'];
+          if (name is! String ||
+              name.trim().isEmpty ||
+              name.length > 255 ||
+              !_boundedString(payload['address'], max: 255) ||
+              !_boundedString(payload['site_address'], max: 255) ||
+              !_boundedString(email, max: 255) ||
+              !_boundedString(payload['phone'], max: 255) ||
+              (email is String &&
+                  email.isNotEmpty &&
+                  !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) ||
+              (latitude != null &&
+                  (latitude is! num ||
+                      !latitude.isFinite ||
+                      latitude < -90 ||
+                      latitude > 90)) ||
+              (longitude != null &&
+                  (longitude is! num ||
+                      !longitude.isFinite ||
+                      longitude < -180 ||
+                      longitude > 180)) ||
+              !_currency(payload['discounted_price'], nullable: true)) {
+            throw _protocolError('clients.payload contains invalid values.');
+          }
+        }
+        final media = _v2Object(record['media'], 'clients.media');
+        _exactKeys(media, {'photos'}, {'photos'}, 'clients.media');
+        final photos = media['photos'];
+        final photoPattern = RegExp(
+          '^/api/photos/client/${RegExp.escape(record['remote_id'] as String)}/'
+          r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-'
+          r'[0-9a-f]{12}\.(?:jpg|png|webp)$',
+          caseSensitive: false,
         );
-        if (payload['name'] is! String ||
-            (record['operation'] == 'upsert' &&
-                (payload['name'] as String).trim().isEmpty) ||
-            [
-              payload['address'],
-              payload['site_address'],
-              payload['email'],
-              payload['phone']
-            ].any((value) => value != null && value is! String) ||
-            [
-              payload['latitude'],
-              payload['longitude'],
-              payload['discounted_price']
-            ].any((value) => value != null && !finiteNumber(value))) {
-          throw _protocolError('clients.payload contains invalid values.');
+        if (photos is! List ||
+            photos.length > 100 ||
+            photos.any(
+              (photo) => photo is! String || !photoPattern.hasMatch(photo),
+            ) ||
+            photos.toSet().length != photos.length ||
+            (deleting && photos.isNotEmpty)) {
+          throw _protocolError('clients.media contains invalid photos.');
         }
       case 'items':
-        _exactKeys(
-          payload,
-          {'name', 'price', 'enabled'},
-          {'name', 'price', 'enabled'},
-          'items.payload',
-        );
-        if (payload['name'] is! String ||
-            !finiteNumber(payload['price']) ||
-            payload['enabled'] is! bool) {
-          throw _protocolError('items.payload contains invalid values.');
+        if (!deleting) {
+          _exactKeys(
+            payload,
+            {'name', 'price', 'enabled'},
+            {'name', 'price', 'enabled'},
+            'items.payload',
+          );
+          final name = payload['name'];
+          if (name is! String ||
+              name.trim().isEmpty ||
+              name.length > 255 ||
+              !_currency(payload['price']) ||
+              payload['enabled'] is! bool) {
+            throw _protocolError('items.payload contains invalid values.');
+          }
         }
       case 'rectangles':
-        _exactKeys(
-          payload,
-          {'length', 'width'},
-          {'length', 'width'},
-          'rectangles.payload',
-        );
-        if (!finiteNumber(payload['length']) ||
-            !finiteNumber(payload['width'])) {
-          throw _protocolError('rectangles.payload contains invalid values.');
+        if (!deleting) {
+          _exactKeys(
+            payload,
+            {'length', 'width'},
+            {'length', 'width'},
+            'rectangles.payload',
+          );
+          if ([payload['length'], payload['width']].any(
+            (value) =>
+                value is! num || !value.isFinite || value <= 0 || value > 10000,
+          )) {
+            throw _protocolError('rectangles.payload contains invalid values.');
+          }
+        }
+        final media = _v2Object(record['media'], 'rectangles.media');
+        _exactKeys(media, {'image_data'}, {'image_data'}, 'rectangles.media');
+        if (!_canonicalDataImage(media['image_data']) ||
+            (deleting && media['image_data'] != null)) {
+          throw _protocolError('rectangles.media is invalid.');
         }
       case 'default_prices':
-        _exactKeys(
-          payload,
-          {'price', 'enabled'},
-          {'price', 'enabled'},
-          'default_prices.payload',
-        );
-        if (!finiteNumber(payload['price']) || payload['enabled'] is! bool) {
-          throw _protocolError(
-              'default_prices.payload contains invalid values.');
+        if (!deleting) {
+          _exactKeys(
+            payload,
+            {'price', 'enabled'},
+            {'price', 'enabled'},
+            'default_prices.payload',
+          );
+          if (!_currency(payload['price']) || payload['enabled'] is! bool) {
+            throw _protocolError(
+              'default_prices.payload contains invalid values.',
+            );
+          }
         }
     }
     if (collection == 'items' || collection == 'rectangles') {
@@ -807,59 +918,152 @@ class SyncService {
     } else if (record['franchisee_id'] != franchiseeId) {
       throw _protocolError('$collection crossed tenant ownership.');
     }
+    if (_payloadHash(payload) != record['payload_hash']) {
+      throw _protocolError('$collection.payload_hash does not match payload.');
+    }
     return record;
   }
 
-  Future<Set<String>> _prepareV2ClientPhotos(String franchiseeId) async {
-    final blocked = <String>{};
-    final clients = (await dbService.getDirtyClients())
-        .where((client) =>
-            client.franchiseeId == franchiseeId && client.deletedAt == null)
+  Map<String, dynamic> _validateV2Resource(
+    dynamic raw,
+    String collection, {
+    required BigInt requestCursor,
+    required BigInt responseCursor,
+  }) {
+    final record = _v2Object(raw, '$collection record');
+    final common = {
+      'remote_id',
+      'client_id',
+      'pdf_url',
+      'row_cursor',
+      'server_timestamp',
+      'deleted_at',
+    };
+    final keys = collection == 'warranties'
+        ? {
+            ...common,
+            'version',
+            'start_date',
+            'duration_years',
+            'warranty_card_number',
+          }
+        : common;
+    _exactKeys(record, keys, keys, '$collection record');
+    final remoteId = _v2Uuid(record['remote_id'], '$collection.remote_id');
+    _v2Uuid(record['client_id'], '$collection.client_id');
+    final rowCursor = _v2Decimal(
+      record['row_cursor'],
+      '$collection.row_cursor',
+      allowZero: false,
+    );
+    if (rowCursor <= requestCursor || rowCursor > responseCursor) {
+      throw _protocolError('$collection.row_cursor is outside the snapshot.');
+    }
+    _serverDate(record['server_timestamp'], '$collection.server_timestamp');
+    final deletedAt = record['deleted_at'];
+    if (deletedAt != null) _serverDate(deletedAt, '$collection.deleted_at');
+    final expectedPdfUrl = collection == 'warranties'
+        ? '/api/warranty/$remoteId/download'
+        : '/api/proposal/$remoteId/download';
+    if (record['pdf_url'] != expectedPdfUrl ||
+        (record['pdf_url'] as String).length > 255) {
+      throw _protocolError('$collection.pdf_url is invalid.');
+    }
+    if (collection == 'warranties') {
+      final version = record['version'];
+      final duration = record['duration_years'];
+      final card = record['warranty_card_number'];
+      if (deletedAt != null ||
+          version is! int ||
+          version < 1 ||
+          version > 2147483647 ||
+          duration is! int ||
+          duration < 1 ||
+          duration > 2147483647 ||
+          card is! String ||
+          card.trim().isEmpty ||
+          card.length > 255) {
+        throw _protocolError('warranties contains invalid values.');
+      }
+      _serverDate(record['start_date'], 'warranties.start_date');
+    }
+    return record;
+  }
+
+  Future<bool> _uploadPendingV2ClientPhotos(String franchiseeId) async {
+    var uploaded = false;
+    final clients = (await dbService.getClients())
+        .where((client) => client.franchiseeId == franchiseeId)
         .toList();
     for (final client in clients) {
-      final canonical = <String>[];
-      var failed = false;
-      for (final photo in client.photos) {
-        if (photo.startsWith('/api/photos/client/')) {
-          canonical.add(photo);
-          continue;
-        }
+      for (final photo in [...client.photos]) {
+        if (photo.startsWith('/api/photos/client/')) continue;
         final uri = Uri.tryParse(photo);
         if (uri != null &&
             (uri.scheme == 'http' || uri.scheme == 'https') &&
             uri.path.startsWith('/api/photos/client/')) {
-          canonical.add(uri.path);
+          await dbService.replaceClientPhotoPath(
+            franchiseeId: franchiseeId,
+            remoteId: client.remoteId,
+            localPath: photo,
+            canonicalPath: uri.path,
+          );
           continue;
         }
-        try {
-          canonical.add(
-            await apiService.uploadClientPhoto(client.remoteId, photo),
-          );
-        } catch (_) {
-          failed = true;
-          blocked.add(client.remoteId);
-          break;
-        }
-      }
-      if (!failed &&
-          canonical.length == client.photos.length &&
-          canonical.join('|') != client.photos.join('|')) {
-        // Photos stay outside the LWW payload. Canonicalizing the local paths
-        // creates a new exact pending change so an older in-flight outcome
-        // cannot clear this row.
-        await dbService.updateClient(
-          client.copyWith(
-            photos: canonical,
-            isDirty: true,
-            updatedAt: DateTime.now(),
-          ),
+        final canonical = await apiService.uploadClientPhoto(
+          client.remoteId,
+          photo,
         );
+        await dbService.replaceClientPhotoPath(
+          franchiseeId: franchiseeId,
+          remoteId: client.remoteId,
+          localPath: photo,
+          canonicalPath: canonical,
+        );
+        uploaded = true;
       }
     }
-    return blocked;
+    return uploaded;
+  }
+
+  Future<bool> _deletePendingV2Proposals(String franchiseeId) async {
+    final activeClientIds = (await dbService.getClients())
+        .where((client) => client.franchiseeId == franchiseeId)
+        .map((client) => client.localId)
+        .whereType<int>()
+        .toSet();
+    var deleted = false;
+    for (final proposal in await dbService.getDirtyProposals()) {
+      if (proposal.deletedAt == null ||
+          !activeClientIds.contains(proposal.clientId)) {
+        continue;
+      }
+      await apiService.deleteProposal(proposal.remoteId);
+      deleted = true;
+    }
+    return deleted;
   }
 
   Future<void> _syncV2(
+    String franchiseeId, {
+    required bool activateProtocol,
+  }) async {
+    await _syncV2Round(
+      franchiseeId,
+      activateProtocol: activateProtocol,
+    );
+    final changedResources = await Future.wait([
+      _uploadPendingV2ClientPhotos(franchiseeId),
+      _deletePendingV2Proposals(franchiseeId),
+    ]);
+    if (changedResources.any((changed) => changed)) {
+      // The dedicated endpoints advance/stamp the tenant cursor. Pull once
+      // more so exact authoritative media/PDF state and cursor land atomically.
+      await _syncV2Round(franchiseeId, activateProtocol: false);
+    }
+  }
+
+  Future<void> _syncV2Round(
     String franchiseeId, {
     required bool activateProtocol,
   }) async {
@@ -869,11 +1073,7 @@ class SyncService {
       franchiseeId,
     );
     _v2Decimal(warrantyCursor, 'warranty_tombstone_cursor');
-    final blockedPhotoClients = await _prepareV2ClientPhotos(franchiseeId);
     final changes = await dbService.getPendingLwwChanges(franchiseeId);
-    changes['clients']?.removeWhere(
-      (change) => blockedPhotoClients.contains(change['remote_id']),
-    );
     final requestId = const Uuid().v4();
     final submittedChangeIds = <String, Map<String, String>>{
       for (final collection in _v2Collections)
@@ -888,6 +1088,7 @@ class SyncService {
           change['change_id'].toString(): {
             'collection': collection,
             'remote_id': change['remote_id'].toString(),
+            'operation': change['operation'].toString(),
           },
     };
     final response = await apiService.syncV2({
@@ -945,9 +1146,11 @@ class SyncService {
       _v2Collections.toSet(),
       'outcomes',
     );
-    if (response['warnings'] is! List) {
+    if (response['warnings'] is! List ||
+        (response['warnings'] as List).length > submittedByChangeId.length) {
       throw _protocolError('warnings must be a list.');
     }
+    final warningChangeIds = <String>{};
     for (final rawWarning in response['warnings'] as List) {
       final warning = _v2Object(rawWarning, 'warning');
       _exactKeys(
@@ -962,7 +1165,8 @@ class SyncService {
       }
       final warningChangeId =
           _v2Uuid(warning['change_id'], 'warning.change_id');
-      if (!submittedByChangeId.containsKey(warningChangeId)) {
+      if (!submittedByChangeId.containsKey(warningChangeId) ||
+          !warningChangeIds.add(warningChangeId)) {
         throw _protocolError('warning references an unrelated change.');
       }
     }
@@ -994,10 +1198,29 @@ class SyncService {
       'server_field_forbidden',
       'unknown_field',
       'not_authorized',
+      'permanently_deleted',
+    };
+    const statusReasons = <String, Set<String>>{
+      'applied': {'upsert_applied', 'delete_applied'},
+      'already_applied': {'already_applied'},
+      'superseded': {'delete_wins', 'version_superseded'},
+      'rejected': {
+        'future_base_version',
+        'change_id_reused',
+        'parent_required',
+        'parent_unavailable',
+        'immutable_parent',
+        'invalid_payload',
+        'server_field_forbidden',
+        'unknown_field',
+      },
+      'permanently_deleted': {'permanently_deleted'},
+      'unauthorized': {'not_authorized'},
     };
     for (final collection in _v2Collections) {
       final collectionOutcomes = outcomes[collection];
-      if (collectionOutcomes is! List) {
+      if (collectionOutcomes is! List ||
+          collectionOutcomes.length > (changes[collection]?.length ?? 0)) {
         throw _protocolError('$collection outcomes must be a list.');
       }
       for (final rawOutcome in collectionOutcomes) {
@@ -1023,31 +1246,49 @@ class SyncService {
             !seenOutcomes.add(changeId)) {
           throw _protocolError('$collection returned an unrelated outcome.');
         }
-        if (!statuses.contains(result['status']) ||
+        final status = result['status'];
+        final reason = result['reason_code'];
+        if (!statuses.contains(status) ||
             result['reason_code'] is! String ||
-            !reasonCodes.contains(result['reason_code'])) {
+            !reasonCodes.contains(reason) ||
+            !statusReasons[status]!.contains(reason)) {
           throw _protocolError('$collection outcome status is invalid.');
         }
-        if ({
-              'applied',
-              'already_applied',
-              'superseded',
-            }.contains(result['status']) &&
-            result['authoritative'] == null) {
+        final requiresAuthoritative = {
+          'applied',
+          'already_applied',
+          'superseded',
+        }.contains(status);
+        if (requiresAuthoritative != result.containsKey('authoritative')) {
           throw _protocolError('$collection omitted authoritative state.');
         }
-        outcomeStatuses[changeId] = result['status'] as String;
+        outcomeStatuses[changeId] = status as String;
         if (result['authoritative'] != null) {
-          authoritative[collection]!.add(
-            _validateV2Record(
-              result['authoritative'],
-              collection,
-              responseCursor: responseCursor,
-              requestCursor: parsedRequestCursor,
-              franchiseeId: franchiseeId,
-              snapshot: false,
-            ),
+          final authoritativeRecord = _validateV2Record(
+            result['authoritative'],
+            collection,
+            responseCursor: responseCursor,
+            requestCursor: parsedRequestCursor,
+            franchiseeId: franchiseeId,
+            snapshot: false,
           );
+          if ((status == 'applied' || status == 'already_applied') &&
+              (authoritativeRecord['change_id'] != changeId ||
+                  authoritativeRecord['operation'] != submitted['operation'])) {
+            throw _protocolError(
+              '$collection outcome acknowledged the wrong logical change.',
+            );
+          }
+          if (status == 'applied' &&
+              reason !=
+                  (submitted['operation'] == 'delete'
+                      ? 'delete_applied'
+                      : 'upsert_applied')) {
+            throw _protocolError(
+              '$collection applied reason does not match the operation.',
+            );
+          }
+          authoritative[collection]!.add(authoritativeRecord);
         }
       }
     }
@@ -1058,8 +1299,18 @@ class SyncService {
     final updates = _v2Object(response['updates'], 'updates');
     _exactKeys(
       updates,
-      {..._v2Collections, 'warranty_tombstones'},
-      {..._v2Collections, 'warranty_tombstones'},
+      {
+        ..._v2Collections,
+        'warranties',
+        'proposals',
+        'warranty_tombstones',
+      },
+      {
+        ..._v2Collections,
+        'warranties',
+        'proposals',
+        'warranty_tombstones',
+      },
       'updates',
     );
     final records = <String, List<Map<String, dynamic>>>{
@@ -1067,7 +1318,7 @@ class SyncService {
     };
     for (final collection in _v2Collections) {
       final rawRecords = updates[collection];
-      if (rawRecords is! List) {
+      if (rawRecords is! List || rawRecords.length > _maxResponseRecords) {
         throw _protocolError('$collection updates must be a list.');
       }
       final byRemoteId = <String, Map<String, dynamic>>{};
@@ -1095,8 +1346,32 @@ class SyncService {
       records[collection] = byRemoteId.values.toList();
     }
 
+    final resources = <String, List<Map<String, dynamic>>>{
+      'warranties': [],
+      'proposals': [],
+    };
+    for (final collection in resources.keys) {
+      final rawRecords = updates[collection];
+      if (rawRecords is! List || rawRecords.length > _maxResponseRecords) {
+        throw _protocolError('$collection updates must be a bounded list.');
+      }
+      final seenRemoteIds = <String>{};
+      for (final rawRecord in rawRecords) {
+        final record = _validateV2Resource(
+          rawRecord,
+          collection,
+          requestCursor: parsedRequestCursor,
+          responseCursor: responseCursor,
+        );
+        if (!seenRemoteIds.add(record['remote_id'] as String)) {
+          throw _protocolError('$collection contains a duplicate update.');
+        }
+        resources[collection]!.add(record);
+      }
+    }
+
     final rawTombstones = updates['warranty_tombstones'];
-    if (rawTombstones is! List) {
+    if (rawTombstones is! List || rawTombstones.length > _maxResponseRecords) {
       throw _protocolError('warranty_tombstones must be a list.');
     }
     final warrantyTombstones = <WarrantyDeletionTombstone>[];
@@ -1118,6 +1393,7 @@ class SyncService {
         'deletion_sequence',
         allowZero: false,
       );
+      _serverDate(map['deleted_at'], 'warranty tombstone.deleted_at');
       if (sequence <= lastWarrantySequence || sequence > parsedWarrantyCursor) {
         throw _protocolError('warranty tombstone ordering is invalid.');
       }
@@ -1132,9 +1408,13 @@ class SyncService {
 
     await dbService.applySyncV2Response(
       franchiseeId: franchiseeId,
+      requestCursor: requestCursor,
       responseCursor: responseCursor.toString(),
+      requestWarrantyTombstoneCursor: warrantyCursor,
       warrantyTombstoneCursor: parsedWarrantyCursor.toString(),
       records: records,
+      warranties: resources['warranties']!,
+      proposals: resources['proposals']!,
       warrantyTombstones: warrantyTombstones,
       submittedChangeIds: submittedChangeIds,
       outcomeStatuses: outcomeStatuses,

@@ -326,6 +326,28 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
       ) as _i5.Future<int>);
 
   @override
+  _i5.Future<void> replaceClientPhotoPath({
+    required String? franchiseeId,
+    required String? remoteId,
+    required String? localPath,
+    required String? canonicalPath,
+  }) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #replaceClientPhotoPath,
+          [],
+          {
+            #franchiseeId: franchiseeId,
+            #remoteId: remoteId,
+            #localPath: localPath,
+            #canonicalPath: canonicalPath,
+          },
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
+
+  @override
   _i5.Future<int> softDeleteClient(int? localId) => (super.noSuchMethod(
         Invocation.method(
           #softDeleteClient,
@@ -448,6 +470,17 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
         ),
         returnValue: _i5.Future<int>.value(0),
       ) as _i5.Future<int>);
+
+  @override
+  _i5.Future<void> claimLegacyLwwChanges(String? franchiseeId) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #claimLegacyLwwChanges,
+          [franchiseeId],
+        ),
+        returnValue: _i5.Future<void>.value(),
+        returnValueForMissingStub: _i5.Future<void>.value(),
+      ) as _i5.Future<void>);
 
   @override
   _i5.Future<int> insertDefaultPrice(
@@ -745,9 +778,13 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
   @override
   _i5.Future<void> applySyncV2Response({
     required String? franchiseeId,
+    required String? requestCursor,
     required String? responseCursor,
+    required String? requestWarrantyTombstoneCursor,
     required String? warrantyTombstoneCursor,
     required Map<String, List<Map<String, dynamic>>>? records,
+    required List<Map<String, dynamic>>? warranties,
+    required List<Map<String, dynamic>>? proposals,
     required List<_i12.WarrantyDeletionTombstone>? warrantyTombstones,
     required Map<String, Map<String, String>>? submittedChangeIds,
     required Map<String, String>? outcomeStatuses,
@@ -759,9 +796,13 @@ class MockDbService extends _i1.Mock implements _i6.DbService {
           [],
           {
             #franchiseeId: franchiseeId,
+            #requestCursor: requestCursor,
             #responseCursor: responseCursor,
+            #requestWarrantyTombstoneCursor: requestWarrantyTombstoneCursor,
             #warrantyTombstoneCursor: warrantyTombstoneCursor,
             #records: records,
+            #warranties: warranties,
+            #proposals: proposals,
             #warrantyTombstones: warrantyTombstones,
             #submittedChangeIds: submittedChangeIds,
             #outcomeStatuses: outcomeStatuses,

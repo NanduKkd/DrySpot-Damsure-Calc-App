@@ -26,11 +26,9 @@ class ClientProvider extends ChangeNotifier {
   List<Proposal> get currentClientProposals => _currentClientProposals;
 
   void updateSession({required bool isAuthenticated, String? franchiseeId}) {
-    final normalizedFranchiseeId = franchiseeId?.trim().isNotEmpty == true
-        ? franchiseeId!.trim()
-        : null;
-    final hasChanged =
-        !_sessionBound ||
+    final normalizedFranchiseeId =
+        franchiseeId?.trim().isNotEmpty == true ? franchiseeId!.trim() : null;
+    final hasChanged = !_sessionBound ||
         _isAuthenticated != isAuthenticated ||
         _activeFranchiseeId != normalizedFranchiseeId;
 
@@ -133,7 +131,11 @@ class ClientProvider extends ChangeNotifier {
     final client = _clients.firstWhere((c) => c.localId == clientLocalId);
     for (var item in client.items) {
       await _dbService.updateItem(
-        item.copyWith(price: price, updatedAt: DateTime.now()),
+        item.copyWith(
+          price: price,
+          isDirty: true,
+          updatedAt: DateTime.now(),
+        ),
       );
     }
     await loadClients();

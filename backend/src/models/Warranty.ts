@@ -13,6 +13,7 @@ export class Warranty extends Model {
 	public version!: number;
 	/** Non-null only for the one currently active warranty for a client. */
 	public activeClientId!: string | null;
+	public syncCursor!: string;
 	public readonly createdAt!: Date;
 	public readonly updatedAt!: Date;
 	public readonly deletedAt!: Date;
@@ -58,6 +59,11 @@ Warranty.init(
 			type: DataTypes.UUID,
 			allowNull: true,
 			unique: true,
+		},
+		syncCursor: {
+			type: DataTypes.BIGINT,
+			allowNull: false,
+			defaultValue: '1',
 		},
 		deletedAt: {
 			type: DataTypes.DATE,
