@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "updatesEnabled": true,
+  "manifestRevision": 42,
+  "latestVersion": "1.4.0",
+  "latestVersionCode": 10400,
+  "minimumSupportedVersionCode": 10300,
+  "artifactUrl": "https://damsure.nandakrishnan.in/releases/damsure-10400.apk",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "sizeBytes": 12345678,
+  "publishedAt": "2026-07-30T10:00:00Z",
+  "releaseNotes": "Improved calculation reliability."
+}
