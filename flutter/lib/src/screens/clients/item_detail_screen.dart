@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
@@ -28,11 +29,13 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
   final _newWidthController = TextEditingController();
   final _newLengthFocus = FocusNode();
   final _newWidthFocus = FocusNode();
+  final Map<Object, _RectangleInputControllers> _rectangleInputs = {};
 
   late final RectangleImageService _rectangleImageService;
 
   Item? _item;
   bool _isLoading = true;
+  bool _didAutofocusNewLength = false;
   bool _isProcessingImage = false;
   double? _selectedPrice;
   bool _isCustomPrice = false;
@@ -53,7 +56,64 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     _newWidthController.dispose();
     _newLengthFocus.dispose();
     _newWidthFocus.dispose();
+    for (final input in _rectangleInputs.values) {
+      input.dispose();
+    }
     super.dispose();
+  }
+
+  Object _rectangleKey(Rectangle rect) => rect.localId ?? rect.remoteId;
+
+  String _formatMeasurement(double value) {
+    if (value == value.truncateToDouble()) {
+      return value.toStringAsFixed(0);
+    }
+    return value.toString();
+  }
+
+  void _syncRectangleInputs(List<Rectangle> rectangles) {
+    final activeKeys = rectangles.map(_rectangleKey).toSet();
+    final staleKeys = _rectangleInputs.keys
+        .where((key) => !activeKeys.contains(key))
+        .toList();
+
+    for (final key in staleKeys) {
+      _rectangleInputs.remove(key)?.dispose();
+    }
+
+    for (final rect in rectangles) {
+      final key = _rectangleKey(rect);
+      final input = _rectangleInputs.putIfAbsent(
+        key,
+        () => _RectangleInputControllers(
+          length: _formatMeasurement(rect.length),
+          width: _formatMeasurement(rect.width),
+        ),
+      );
+
+      if (!input.lengthFocus.hasFocus) {
+        input.lengthController.text = _formatMeasurement(rect.length);
+      }
+      if (!input.widthFocus.hasFocus) {
+        input.widthController.text = _formatMeasurement(rect.width);
+      }
+    }
+  }
+
+  void _requestNewLengthFocus({bool showKeyboard = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        FocusScope.of(context).requestFocus(_newLengthFocus);
+        if (showKeyboard) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && _newLengthFocus.hasFocus) {
+              SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+            }
+          });
+          WidgetsBinding.instance.scheduleFrame();
+        }
+      }
+    });
   }
 
   Future<void> _loadItem() async {
@@ -68,6 +128,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     setState(() {
       _item = item;
       if (item != null) {
+        _syncRectangleInputs(item.rectangles);
         _priceController.text = item.price.toStringAsFixed(2);
 
         final defaultPrices = settingsProvider.defaultPrices
@@ -85,11 +146,10 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
       _isLoading = false;
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        _newLengthFocus.requestFocus();
-      }
-    });
+    if (!_didAutofocusNewLength) {
+      _didAutofocusNewLength = true;
+      _requestNewLengthFocus();
+    }
   }
 
   Future<void> _updatePrice(double? price) async {
@@ -128,7 +188,6 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
       imageData: _pendingRectangleImageData,
     );
 
-    _newLengthFocus.requestFocus();
     await context.read<ClientProvider>().addRectangle(rectangle);
 
     if (!mounted) return;
@@ -138,68 +197,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
       _pendingRectangleImageData = null;
     });
     await _loadItem();
-  }
-
-  Future<void> _showEditRectangleDialog(Rectangle rect) async {
-    final lengthController =
-        TextEditingController(text: rect.length.toString());
-    final widthController = TextEditingController(text: rect.width.toString());
-    final clientProvider = context.read<ClientProvider>();
-
-    final updated = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit Rectangle'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: lengthController,
-              keyboardType:
-                  const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Length'),
-              autofocus: true,
-            ),
-            TextField(
-              controller: widthController,
-              keyboardType:
-                  const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Width'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              final length = double.tryParse(lengthController.text);
-              final width = double.tryParse(widthController.text);
-              if (length != null && width != null && length > 0 && width > 0) {
-                Navigator.of(context).pop(true);
-              }
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-
-    if (updated != true) return;
-
-    final updatedRect = rect.copyWith(
-      length: double.parse(lengthController.text),
-      width: double.parse(widthController.text),
-      updatedAt: DateTime.now(),
-      isDirty: true,
-    );
-    await clientProvider.updateRectangle(updatedRect);
-
-    if (mounted) {
-      await _loadItem();
-    }
+    _requestNewLengthFocus(showKeyboard: true);
   }
 
   Future<void> _showImageSourceOptions({
@@ -336,38 +334,6 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     );
   }
 
-  Widget _buildRectangleThumbnail(Rectangle rect, int index) {
-    final hasImage = _rectangleImageService.hasImage(rect.imageData);
-    final image = rect.imageData;
-
-    if (!hasImage || image == null) {
-      return CircleAvatar(child: Text('${index + 1}'));
-    }
-
-    return InkWell(
-      onTap: () => _showImagePreview(image),
-      borderRadius: BorderRadius.circular(12),
-      child: Ink(
-        width: 56,
-        height: 56,
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(12),
-          child: Image(
-            image: _rectangleImageService.buildImageProvider(image),
-            fit: BoxFit.cover,
-            errorBuilder: (context, error, stackTrace) {
-              return const Center(child: Icon(Icons.broken_image_outlined));
-            },
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _buildPendingImagePreview() {
     final imageData = _pendingRectangleImageData;
     if (!_rectangleImageService.hasImage(imageData) || imageData == null) {
@@ -404,6 +370,188 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
               style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _saveRectangleFromInputs(Rectangle rect) async {
+    final input = _rectangleInputs[_rectangleKey(rect)];
+    if (input == null) return;
+
+    final length = double.tryParse(input.lengthController.text);
+    final width = double.tryParse(input.widthController.text);
+
+    if (length == null || width == null || length <= 0 || width <= 0) {
+      return;
+    }
+
+    if (length == rect.length && width == rect.width) {
+      return;
+    }
+
+    final updatedRect = rect.copyWith(
+      length: length,
+      width: width,
+      updatedAt: DateTime.now(),
+      isDirty: true,
+    );
+    await context.read<ClientProvider>().updateRectangle(updatedRect);
+
+    if (mounted) {
+      await _loadItem();
+    }
+  }
+
+  void _focusNextAfterRectangle(int index) {
+    final rectangles = _item?.rectangles ?? [];
+    if (index + 1 < rectangles.length) {
+      _rectangleInputs[_rectangleKey(rectangles[index + 1])]
+          ?.lengthFocus
+          .requestFocus();
+      return;
+    }
+
+    _requestNewLengthFocus(showKeyboard: true);
+  }
+
+  Widget _buildMeasurementRow(Rectangle rect, int index) {
+    final input = _rectangleInputs[_rectangleKey(rect)]!;
+    final hasImage = _rectangleImageService.hasImage(rect.imageData);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: input.lengthController,
+                  focusNode: input.lengthFocus,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: 'Length (ft)',
+                    border: OutlineInputBorder(),
+                  ),
+                  textInputAction: TextInputAction.next,
+                  onEditingComplete: () {},
+                  onSubmitted: (_) => input.widthFocus.requestFocus(),
+                  onTapOutside: (_) => _saveRectangleFromInputs(rect),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: TextField(
+                  controller: input.widthController,
+                  focusNode: input.widthFocus,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: 'Width (ft)',
+                    border: OutlineInputBorder(),
+                  ),
+                  textInputAction: TextInputAction.next,
+                  onEditingComplete: () {},
+                  onSubmitted: (_) async {
+                    await _saveRectangleFromInputs(rect);
+                    if (mounted) {
+                      _focusNextAfterRectangle(index);
+                    }
+                  },
+                  onTapOutside: (_) => _saveRectangleFromInputs(rect),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                tooltip:
+                    hasImage ? 'Change Rectangle Image' : 'Add Rectangle Image',
+                icon: Icon(
+                  hasImage ? Icons.image_outlined : Icons.add_a_photo_outlined,
+                ),
+                onPressed: _isProcessingImage
+                    ? null
+                    : () => _manageRectangleImage(rect),
+              ),
+              IconButton(
+                tooltip: 'Delete Measurement',
+                icon: const Icon(Icons.delete_outline),
+                color: Colors.red,
+                onPressed: rect.localId == null
+                    ? null
+                    : () async {
+                        await context
+                            .read<ClientProvider>()
+                            .deleteRectangle(rect.localId!);
+                        if (mounted) {
+                          await _loadItem();
+                        }
+                      },
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Text(
+              '${rect.area.toStringAsFixed(1)} sqft',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ),
+          if (hasImage)
+            Text(
+              'Image attached',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNewMeasurementRow() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _newLengthController,
+              focusNode: _newLengthFocus,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Length (ft)',
+                border: OutlineInputBorder(),
+              ),
+              textInputAction: TextInputAction.next,
+              onEditingComplete: () {},
+              onSubmitted: (_) => _newWidthFocus.requestFocus(),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: TextField(
+              controller: _newWidthController,
+              focusNode: _newWidthFocus,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Width (ft)',
+                border: OutlineInputBorder(),
+              ),
+              textInputAction: TextInputAction.next,
+              onEditingComplete: () {},
+              onSubmitted: (_) => _submitNewRectangle(),
+            ),
+          ),
+          const SizedBox(width: 104),
         ],
       ),
     );
@@ -511,61 +659,23 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
               ),
               const Divider(),
               Expanded(
-                child: ListView.builder(
-                  itemCount: _item!.rectangles.length,
-                  itemBuilder: (context, index) {
-                    final rect = _item!.rectangles[index];
-                    final hasImage =
-                        _rectangleImageService.hasImage(rect.imageData);
-
-                    return ListTile(
-                      leading: _buildRectangleThumbnail(rect, index),
-                      title: Text('${rect.length} x ${rect.width}'),
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            'Area: ${(rect.length * rect.width).toStringAsFixed(2)} sqft',
-                          ),
-                          Text(hasImage ? 'Image attached' : 'No image'),
-                        ],
+                child: ListView(
+                  keyboardDismissBehavior:
+                      ScrollViewKeyboardDismissBehavior.onDrag,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      child: Text(
+                        'Measurements',
+                        style: Theme.of(context).textTheme.titleMedium,
                       ),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            tooltip: hasImage
-                                ? 'Change Rectangle Image'
-                                : 'Add Rectangle Image',
-                            icon: Icon(
-                              hasImage
-                                  ? Icons.image_outlined
-                                  : Icons.add_a_photo_outlined,
-                            ),
-                            onPressed: _isProcessingImage
-                                ? null
-                                : () => _manageRectangleImage(rect),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.edit_outlined),
-                            onPressed: () => _showEditRectangleDialog(rect),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.delete_outline),
-                            onPressed: () async {
-                              await context
-                                  .read<ClientProvider>()
-                                  .deleteRectangle(rect.localId!);
-                              if (mounted) {
-                                await _loadItem();
-                              }
-                            },
-                          ),
-                        ],
-                      ),
-                    );
-                  },
+                    ),
+                    for (var index = 0;
+                        index < _item!.rectangles.length;
+                        index++)
+                      _buildMeasurementRow(_item!.rectangles[index], index),
+                    _buildNewMeasurementRow(),
+                  ],
                 ),
               ),
               SafeArea(
@@ -585,42 +695,6 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                     Text(
                       totalCostText,
                       style: Theme.of(context).textTheme.titleSmall,
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _newLengthController,
-                            focusNode: _newLengthFocus,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: true,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'Length',
-                              border: OutlineInputBorder(),
-                            ),
-                            textInputAction: TextInputAction.next,
-                            onSubmitted: (_) => _newWidthFocus.requestFocus(),
-                          ),
-                        ),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: TextField(
-                            controller: _newWidthController,
-                            focusNode: _newWidthFocus,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: true,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'Width',
-                              border: OutlineInputBorder(),
-                            ),
-                            textInputAction: TextInputAction.done,
-                            onSubmitted: (_) => _submitNewRectangle(),
-                          ),
-                        ),
-                      ],
                     ),
                     _buildPendingImagePreview(),
                     const SizedBox(height: 12),
@@ -674,5 +748,27 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
         ],
       ),
     );
+  }
+}
+
+class _RectangleInputControllers {
+  final TextEditingController lengthController;
+  final TextEditingController widthController;
+  final FocusNode lengthFocus;
+  final FocusNode widthFocus;
+
+  _RectangleInputControllers({
+    required String length,
+    required String width,
+  })  : lengthController = TextEditingController(text: length),
+        widthController = TextEditingController(text: width),
+        lengthFocus = FocusNode(),
+        widthFocus = FocusNode();
+
+  void dispose() {
+    lengthController.dispose();
+    widthController.dispose();
+    lengthFocus.dispose();
+    widthFocus.dispose();
   }
 }
