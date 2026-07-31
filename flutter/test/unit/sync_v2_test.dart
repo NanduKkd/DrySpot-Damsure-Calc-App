@@ -18,6 +18,7 @@ class V2ApiService extends ApiService {
   Map<String, dynamic>? lastV2;
   final List<Map<String, dynamic>> v2Requests = [];
   final List<List<String>> photoUploads = [];
+  final List<String?> photoOperationIds = [];
   final List<String> proposalDeletes = [];
   Future<Map<String, dynamic>> Function(Map<String, dynamic>)? v1Handler;
   Future<Map<String, dynamic>> Function(Map<String, dynamic>)? v2Handler;
@@ -40,6 +41,18 @@ class V2ApiService extends ApiService {
   @override
   Future<String> uploadClientPhoto(String clientId, String filePath) async {
     photoUploads.add([clientId, filePath]);
+    return photoHandler!(clientId, filePath);
+  }
+
+  @override
+  Future<String> uploadClientPhotoWithIdempotency(
+    String clientId,
+    String filePath,
+    String? idempotencyKey,
+    String? fileSha256,
+  ) async {
+    photoUploads.add([clientId, filePath]);
+    photoOperationIds.add(idempotencyKey);
     return photoHandler!(clientId, filePath);
   }
 
@@ -200,6 +213,7 @@ void main() {
       version: 1,
       onCreate: (db, _) => createSchema(db),
     );
+    await DbService.migrateSchema(database, 13, 14);
     dbService = DbService(database: database);
     apiService = V2ApiService();
   });
@@ -923,7 +937,7 @@ void main() {
   }
 
   test(
-      'ambiguous committed photo response preserves local intent through pull and converges on retry',
+      'ambiguous committed photo response retries one logical upload and replays its canonical result',
       () async {
     await activate();
     const localPhoto = '/offline/ambiguous.jpg';
@@ -1019,7 +1033,14 @@ void main() {
       [canonicalPhoto],
     );
     expect(await dbService.getPendingClientPhotos(tenant), isEmpty);
-    expect(apiService.photoUploads, hasLength(2));
+    expect(apiService.photoUploads, hasLength(2),
+        reason:
+            'the response was lost, so transport retried the same operation');
+    expect(apiService.photoOperationIds, hasLength(2));
+    expect(apiService.photoOperationIds.toSet(), hasLength(1),
+        reason: 'both transport attempts carry one durable upload_id');
+    expect(apiService.photoOperationIds.toSet().single,
+        matches(RegExp(r'^[0-9a-f-]{36}$')));
   });
 
   test('photo acknowledgement CAS preserves an in-flight local edit', () async {

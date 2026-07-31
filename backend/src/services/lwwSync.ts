@@ -22,6 +22,7 @@ import {
 	nextTenantSyncCursor,
 	TenantCursorExhaustedError,
 } from './tenantSyncCursor';
+import { terminalizeClientPhotoUploadReceipts } from './clientPhotoUploadReceipt';
 
 export const MAX_SYNC_BIGINT = MAX_TENANT_SYNC_CURSOR;
 export const MAX_BRANCH_SEQUENCE = 1_000_000;
@@ -978,6 +979,15 @@ const applyRecord = async (
 					cleanupKeys.push(match[1]);
 				}
 			}
+			await terminalizeClientPhotoUploadReceipts({
+				franchiseeId,
+				clientId: existing.id,
+				canonicalUrls: (Array.isArray(rawPhotos) ? rawPhotos : []).filter(
+					(photo): photo is string =>
+						typeof photo === 'string' && MANAGED_PHOTO.test(photo),
+				),
+				transaction,
+			});
 			cleanupKeys.push(
 				...(await tombstoneClientWarranties({
 					clientId: existing.id,

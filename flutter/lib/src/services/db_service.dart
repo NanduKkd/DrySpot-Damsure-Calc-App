@@ -176,7 +176,7 @@ class DbService {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 13,
+      version: 14,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
@@ -241,6 +241,9 @@ class DbService {
     }
     if (oldVersion < 13 && newVersion >= 13) {
       await _addPendingLwwSnapshots(db);
+    }
+    if (oldVersion < 14 && newVersion >= 14) {
+      await _upgradeSyncRecoveryState(db);
     }
   }
 
@@ -341,7 +344,9 @@ class DbService {
     await _createWarrantiesTable(db);
     await _createWarrantyDeletionTombstonesTable(db);
     await _createSyncStateTable(db);
-    await _createPendingClientPhotosTable(db);
+    await _createPendingClientPhotosTable(db, durableUploads: true);
+    await _createPendingPhotoUploadIndexes(db);
+    await _createSyncNoticesTable(db);
     await _createProposalsTable(db);
   }
 
@@ -642,19 +647,99 @@ class DbService {
   }
 
   static Future<void> _createPendingClientPhotosTable(
-    DatabaseExecutor db,
-  ) async {
+    DatabaseExecutor db, {
+    bool durableUploads = false,
+  }) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS pending_client_photos (
         franchisee_id TEXT NOT NULL,
         client_remote_id TEXT NOT NULL,
         local_path TEXT NOT NULL,
+        ${durableUploads ? '''
+        upload_id TEXT NOT NULL,
+        file_sha256 TEXT,
+        canonical_url TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        ''' : ''}
         PRIMARY KEY (franchisee_id, client_remote_id, local_path)
       )
     ''');
     await db.execute('''
       CREATE INDEX IF NOT EXISTS pending_client_photos_client
       ON pending_client_photos (franchisee_id, client_remote_id)
+    ''');
+  }
+
+  static Future<void> _createPendingPhotoUploadIndexes(
+    DatabaseExecutor db,
+  ) async {
+    await db.execute('''
+      CREATE UNIQUE INDEX IF NOT EXISTS pending_client_photos_tenant_upload
+      ON pending_client_photos (franchisee_id, upload_id)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS pending_client_photos_status
+      ON pending_client_photos (franchisee_id, status, client_remote_id)
+    ''');
+  }
+
+  /// APP-112 keeps the existing APP-111 photo queue, then adds the durable
+  /// transport identity needed to retry an ambiguous upload safely.  The
+  /// schema remains additive so an interrupted upgrade can be reapplied.
+  static Future<void> _upgradeSyncRecoveryState(Database db) async {
+    await _createPendingClientPhotosTable(db);
+    final columns =
+        await db.rawQuery('PRAGMA table_info(pending_client_photos)');
+    final names = columns.map((column) => column['name']).toSet();
+    if (!names.contains('upload_id')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN upload_id TEXT');
+    }
+    if (!names.contains('canonical_url')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN canonical_url TEXT');
+    }
+    if (!names.contains('file_sha256')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN file_sha256 TEXT');
+    }
+    if (!names.contains('status')) {
+      await db.execute(
+        "ALTER TABLE pending_client_photos ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+      );
+    }
+    final rows = await db.query(
+      'pending_client_photos',
+      columns: ['rowid', 'upload_id'],
+      where: 'upload_id IS NULL OR upload_id = ?',
+      whereArgs: [''],
+    );
+    for (final row in rows) {
+      await db.update(
+        'pending_client_photos',
+        {'upload_id': const Uuid().v4()},
+        where: 'rowid = ?',
+        whereArgs: [row['rowid']],
+      );
+    }
+    await _createPendingPhotoUploadIndexes(db);
+    await _createSyncNoticesTable(db);
+  }
+
+  static Future<void> _createSyncNoticesTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_notices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        franchisee_id TEXT NOT NULL,
+        code TEXT NOT NULL,
+        collection_name TEXT,
+        entity_id TEXT,
+        created_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS sync_notices_tenant_created
+      ON sync_notices (franchisee_id, created_at DESC, id DESC)
     ''');
   }
 
@@ -819,6 +904,26 @@ class DbService {
     return rows.isNotEmpty;
   }
 
+  Future<bool> _supportsDurablePhotoUploads(DatabaseExecutor executor) async {
+    if (!await _supportsPendingClientPhotos(executor)) return false;
+    final columns =
+        await executor.rawQuery('PRAGMA table_info(pending_client_photos)');
+    final names = columns.map((column) => column['name']).toSet();
+    return names.containsAll({
+      'upload_id',
+      'canonical_url',
+      'file_sha256',
+      'status',
+    });
+  }
+
+  Future<bool> _supportsSyncNotices(DatabaseExecutor executor) async {
+    final rows = await executor.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_notices'",
+    );
+    return rows.isNotEmpty;
+  }
+
   Future<void> _syncPendingClientPhotos(
     DatabaseExecutor executor,
     int localId,
@@ -841,9 +946,12 @@ class DbService {
         franchiseeId.isEmpty) {
       return;
     }
+    final durableUploads = await _supportsDurablePhotoUploads(executor);
     final pendingRows = await executor.query(
       'pending_client_photos',
-      columns: ['local_path'],
+      columns: durableUploads
+          ? ['local_path', 'canonical_url', 'status']
+          : ['local_path'],
       where: 'franchisee_id = ? AND client_remote_id = ?',
       whereArgs: [franchiseeId, remoteId],
     );
@@ -857,7 +965,14 @@ class DbService {
         : const <String>{};
     for (final pending in pendingRows) {
       final path = pending['local_path'] as String;
-      if (!desired.contains(path)) {
+      final uploadedCanonical =
+          durableUploads ? pending['canonical_url']?.toString() : null;
+      final isUploaded = durableUploads && pending['status'] == 'uploaded';
+      if (!desired.contains(path) &&
+          !(isUploaded &&
+              uploadedCanonical != null &&
+              _isCanonicalClientPhotoPath(uploadedCanonical,
+                  remoteId: remoteId))) {
         await executor.delete(
           'pending_client_photos',
           where:
@@ -873,6 +988,10 @@ class DbService {
             'franchisee_id': franchiseeId,
             'client_remote_id': remoteId,
             'local_path': path,
+            if (durableUploads) ...{
+              'upload_id': const Uuid().v4(),
+              'status': 'pending',
+            },
           },
           conflictAlgorithm: ConflictAlgorithm.ignore);
     }
@@ -1046,6 +1165,7 @@ class DbService {
   ) async {
     final db = await database;
     if (!await _supportsPendingClientPhotos(db)) return const [];
+    final durableUploads = await _supportsDurablePhotoUploads(db);
     final rows = await db.rawQuery(
       '''
       SELECT p.client_remote_id, p.local_path
@@ -1055,6 +1175,7 @@ class DbService {
        AND c.franchisee_id = p.franchisee_id
       WHERE p.franchisee_id = ?
         AND c.deleted_at IS NULL
+        ${durableUploads ? "AND p.status = 'pending'" : ''}
       ORDER BY c.local_id, p.rowid
       ''',
       [franchiseeId],
@@ -1066,6 +1187,289 @@ class DbService {
           'local_path': row['local_path'] as String,
         },
     ];
+  }
+
+  /// Returns only uploads that still need an HTTP request.  The stable
+  /// [upload_id] survives app restart and an ambiguous response, while the
+  /// public legacy helper above deliberately keeps its historical shape.
+  Future<List<Map<String, String>>> getPendingClientPhotoUploads(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsPendingClientPhotos(db)) return const [];
+    if (!await _supportsDurablePhotoUploads(db)) {
+      return getPendingClientPhotos(franchiseeId);
+    }
+    final rows = await db.rawQuery(
+      '''
+      SELECT p.client_remote_id, p.local_path, p.upload_id, p.file_sha256
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND p.status = 'pending'
+        AND c.deleted_at IS NULL
+      ORDER BY c.local_id, p.rowid
+      ''',
+      [franchiseeId],
+    );
+    return [
+      for (final row in rows)
+        {
+          'client_remote_id': row['client_remote_id'] as String,
+          'local_path': row['local_path'] as String,
+          'upload_id': row['upload_id'] as String,
+          if (row['file_sha256'] != null)
+            'file_sha256': row['file_sha256'] as String,
+        },
+    ];
+  }
+
+  /// Writes the immutable content digest before the first multipart request.
+  /// A path whose bytes change must be deliberately removed and re-added,
+  /// creating a fresh upload ID rather than rebinding an existing receipt.
+  Future<void> persistPendingPhotoUploadDigestForSession({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(fileSha256)) {
+      throw const FormatException('A photo digest is invalid.');
+    }
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      if (!await _supportsDurablePhotoUploads(transaction)) {
+        throw StateError('The durable photo queue is unavailable.');
+      }
+      final rows = await transaction.query(
+        'pending_client_photos',
+        columns: ['file_sha256'],
+        where: '''
+          franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+          AND upload_id = ? AND status = 'pending'
+        ''',
+        whereArgs: [franchiseeId, remoteId, localPath, uploadId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        throw StateError('The pending photo upload is no longer current.');
+      }
+      final existing = rows.single['file_sha256']?.toString();
+      if (existing != null && existing != fileSha256) {
+        throw const FormatException(
+          'The selected photo changed. Remove and add it again before retrying.',
+        );
+      }
+      await transaction.update(
+        'pending_client_photos',
+        {'file_sha256': fileSha256},
+        where: '''
+          franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+          AND upload_id = ? AND status = 'pending'
+        ''',
+        whereArgs: [franchiseeId, remoteId, localPath, uploadId],
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+    });
+  }
+
+  Future<Map<String, dynamic>> getSyncRecoveryState(String franchiseeId) async {
+    final db = await database;
+    final statusRows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncRecoveryStateKey(franchiseeId)],
+      limit: 1,
+    );
+    Map<String, dynamic> status = const {};
+    if (statusRows.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(statusRows.single['value'] as String);
+        if (decoded is Map) status = Map<String, dynamic>.from(decoded);
+      } on FormatException {
+        // A recovery projection must never make the APP-111 cursor unreadable.
+      }
+    }
+    final notices = await _supportsSyncNotices(db)
+        ? await db.query(
+            'sync_notices',
+            columns: ['code', 'collection_name', 'created_at'],
+            where: 'franchisee_id = ?',
+            whereArgs: [franchiseeId],
+            orderBy: 'created_at DESC, id DESC',
+            limit: 20,
+          )
+        : const <Map<String, Object?>>[];
+    return {
+      'last_attempt_at': status['last_attempt_at'],
+      'last_successful_at': status['last_successful_at'],
+      'notices': [
+        for (final notice in notices)
+          {
+            'code': notice['code'],
+            'collection': notice['collection_name'],
+            'created_at': notice['created_at'],
+          },
+      ],
+    };
+  }
+
+  Future<Map<String, int>> getSyncRecoveryCounts(String franchiseeId) async {
+    final db = await database;
+    final dirty = await db.rawQuery(
+      '''
+      SELECT COUNT(*) AS count FROM (
+        SELECT c.local_id FROM clients c
+          WHERE c.franchisee_id = ? AND c.is_dirty = 1
+        UNION ALL
+        SELECT i.local_id FROM items i JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ? AND i.is_dirty = 1
+        UNION ALL
+        SELECT r.local_id FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ? AND r.is_dirty = 1
+        UNION ALL
+        SELECT d.local_id FROM default_prices d
+          WHERE d.franchisee_id = ? AND d.is_dirty = 1
+        UNION ALL
+        SELECT w.local_id FROM warranties w JOIN clients c ON c.local_id = w.client_id
+          WHERE c.franchisee_id = ? AND w.is_dirty = 1
+        UNION ALL
+        SELECT p.local_id FROM proposals p JOIN clients c ON c.local_id = p.client_id
+          WHERE c.franchisee_id = ? AND p.is_dirty = 1
+      )
+      ''',
+      List.filled(6, franchiseeId),
+    );
+    if (!await _supportsPendingClientPhotos(db)) {
+      return {
+        'dirty_records': (dirty.single['count'] as num).toInt(),
+        'pending_photos': 0,
+      };
+    }
+    final durableUploads = await _supportsDurablePhotoUploads(db);
+    final photo = await db.rawQuery(
+      '''
+      SELECT COUNT(DISTINCT p.local_path) AS count
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND c.deleted_at IS NULL
+        ${durableUploads ? "AND p.status = 'pending'" : ''}
+      ''',
+      [franchiseeId],
+    );
+    return {
+      'dirty_records': (dirty.single['count'] as num).toInt(),
+      'pending_photos': (photo.single['count'] as num).toInt(),
+    };
+  }
+
+  Future<void> recordSyncAttemptForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+    DateTime? at,
+  }) =>
+      _recordSyncRecoveryForSession(
+        franchiseeId,
+        attemptedAt: at ?? DateTime.now().toUtc(),
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> recordSyncRecoveryForSession(
+    String franchiseeId, {
+    DateTime? successfulAt,
+    List<Map<String, String>> notices = const [],
+    required bool Function() isSessionCurrent,
+  }) =>
+      _recordSyncRecoveryForSession(
+        franchiseeId,
+        successfulAt: successfulAt,
+        notices: notices,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  static String _syncRecoveryStateKey(String franchiseeId) =>
+      'sync_recovery:$franchiseeId';
+
+  Future<void> _recordSyncRecoveryForSession(
+    String franchiseeId, {
+    DateTime? attemptedAt,
+    DateTime? successfulAt,
+    List<Map<String, String>> notices = const [],
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final key = _syncRecoveryStateKey(franchiseeId);
+      final rows = await transaction.query(
+        'sync_state',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [key],
+        limit: 1,
+      );
+      Map<String, dynamic> current = const {};
+      if (rows.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(rows.single['value'] as String);
+          if (decoded is Map) current = Map<String, dynamic>.from(decoded);
+        } on FormatException {
+          current = const {};
+        }
+      }
+      final next = <String, dynamic>{
+        if (current['last_attempt_at'] is String)
+          'last_attempt_at': current['last_attempt_at'],
+        if (current['last_successful_at'] is String)
+          'last_successful_at': current['last_successful_at'],
+        if (attemptedAt != null)
+          'last_attempt_at': attemptedAt.toUtc().toIso8601String(),
+        if (successfulAt != null)
+          'last_successful_at': successfulAt.toUtc().toIso8601String(),
+      };
+      await transaction.insert(
+        'sync_state',
+        {'key': key, 'value': jsonEncode(next)},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      if (await _supportsSyncNotices(transaction)) {
+        for (final notice in notices) {
+          await transaction.insert('sync_notices', {
+            'franchisee_id': franchiseeId,
+            'code': notice['code'],
+            'collection_name': notice['collection'],
+            'entity_id': null,
+            'created_at': DateTime.now().toUtc().toIso8601String(),
+          });
+        }
+        await transaction.rawDelete(
+          '''
+          DELETE FROM sync_notices
+          WHERE franchisee_id = ? AND id NOT IN (
+            SELECT id FROM sync_notices
+            WHERE franchisee_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+          )
+          ''',
+          [franchiseeId, franchiseeId],
+        );
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+    });
   }
 
   Future<bool> acknowledgeClientPhotoUpload({
@@ -1086,6 +1490,7 @@ class DbService {
     required String remoteId,
     required String localPath,
     required String canonicalPath,
+    String? uploadId,
     required bool Function() isSessionCurrent,
   }) =>
       _acknowledgeClientPhotoUpload(
@@ -1093,6 +1498,7 @@ class DbService {
         remoteId: remoteId,
         localPath: localPath,
         canonicalPath: canonicalPath,
+        uploadId: uploadId,
         isSessionCurrent: isSessionCurrent,
       );
 
@@ -1101,6 +1507,7 @@ class DbService {
     required String remoteId,
     required String localPath,
     required String canonicalPath,
+    String? uploadId,
     bool Function()? isSessionCurrent,
   }) async {
     if (isSessionCurrent?.call() == false) {
@@ -1117,11 +1524,26 @@ class DbService {
         throw StateError('A stale session cannot acknowledge a photo upload.');
       }
       if (!await _supportsPendingClientPhotos(transaction)) return false;
+      final durableUploads = await _supportsDurablePhotoUploads(transaction);
       final pending = await transaction.query(
         'pending_client_photos',
-        columns: ['local_path'],
-        where: 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
-        whereArgs: [franchiseeId, remoteId, localPath],
+        columns: durableUploads
+            ? ['local_path', 'upload_id', 'status']
+            : ['local_path'],
+        where: durableUploads && uploadId != null
+            ? '''
+                franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+                AND upload_id = ? AND status = 'pending'
+              '''
+            : durableUploads
+                ? '''
+                    franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+                    AND status = 'pending'
+                  '''
+                : 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+        whereArgs: durableUploads && uploadId != null
+            ? [franchiseeId, remoteId, localPath, uploadId]
+            : [franchiseeId, remoteId, localPath],
         limit: 1,
       );
       if (pending.isEmpty) return false;
@@ -1156,12 +1578,32 @@ class DbService {
           .map((photo) => photo == localPath ? canonicalPath : photo)
           .toSet()
           .toList();
-      final removed = await transaction.delete(
-        'pending_client_photos',
-        where: 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
-        whereArgs: [franchiseeId, remoteId, localPath],
-      );
-      if (removed != 1) return false;
+      if (durableUploads) {
+        final effectiveUploadId =
+            uploadId ?? pending.single['upload_id']?.toString();
+        if (effectiveUploadId == null ||
+            pending.single['upload_id'] != effectiveUploadId) {
+          return false;
+        }
+        final changed = await transaction.update(
+          'pending_client_photos',
+          {'canonical_url': canonicalPath, 'status': 'uploaded'},
+          where: '''
+            franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+            AND upload_id = ? AND status = 'pending'
+          ''',
+          whereArgs: [franchiseeId, remoteId, localPath, effectiveUploadId],
+        );
+        if (changed != 1) return false;
+      } else {
+        final removed = await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        if (removed != 1) return false;
+      }
       if (isSessionCurrent?.call() == false) {
         throw StateError('A stale session cannot acknowledge a photo upload.');
       }
@@ -2635,10 +3077,13 @@ class DbService {
   }) async {
     final pendingPaths = <String>[];
     if (await _supportsPendingClientPhotos(executor)) {
+      final durableUploads = await _supportsDurablePhotoUploads(executor);
       final rows = await executor.query(
         'pending_client_photos',
         columns: ['local_path'],
-        where: 'franchisee_id = ? AND client_remote_id = ?',
+        where: durableUploads
+            ? "franchisee_id = ? AND client_remote_id = ? AND status = 'pending'"
+            : 'franchisee_id = ? AND client_remote_id = ?',
         whereArgs: [franchiseeId, remoteId],
         orderBy: 'rowid',
       );
@@ -2668,6 +3113,25 @@ class DbService {
       where: 'franchisee_id = ? AND client_remote_id = ?',
       whereArgs: [franchiseeId, remoteId],
     );
+  }
+
+  Future<void> _completeAcknowledgedPhotoUploads(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> serverPhotos,
+  }) async {
+    if (!await _supportsDurablePhotoUploads(executor)) return;
+    for (final canonicalPath in serverPhotos) {
+      await executor.delete(
+        'pending_client_photos',
+        where: '''
+          franchisee_id = ? AND client_remote_id = ?
+          AND status = 'uploaded' AND canonical_url = ?
+        ''',
+        whereArgs: [franchiseeId, remoteId, canonicalPath],
+      );
+    }
   }
 
   Future<void> _applyV2Record(
@@ -3200,6 +3664,14 @@ class DbService {
                 submittedChangeIds[collection] ?? const <String, String>{},
             outcomeStatuses: outcomeStatuses,
           );
+          if (collection == 'clients') {
+            await _completeAcknowledgedPhotoUploads(
+              transaction,
+              franchiseeId: franchiseeId,
+              remoteId: record['remote_id'] as String,
+              serverPhotos: _serverPhotos(record),
+            );
+          }
         }
       }
       for (final warranty in warranties) {

@@ -193,7 +193,10 @@ class ApiService {
   }
 
   ApiException _exceptionFor(http.Response response, String fallbackMessage) {
-    var message = _extractErrorMessage(response, fallbackMessage);
+    // This exception feeds APP-112 recovery notices. Do not pass a raw server
+    // body (which can contain proxy diagnostics or echoed request content) to
+    // the UI; the typed status and safe code below are sufficient.
+    final message = '$fallbackMessage (HTTP ${response.statusCode})';
     String? code;
     var structuredResponse = false;
     try {
@@ -202,13 +205,17 @@ class ApiService {
         structuredResponse = true;
         final rawError = decoded['error'];
         if (rawError is Map) {
-          final nestedMessage = rawError['message'];
-          if (nestedMessage is String && nestedMessage.trim().isNotEmpty) {
-            message = nestedMessage.trim();
+          final candidate = rawError['code']?.toString();
+          if (candidate != null &&
+              RegExp(r'^[a-z][a-z0-9_]{0,63}$').hasMatch(candidate)) {
+            code = candidate;
           }
-          code = rawError['code']?.toString();
         } else {
-          code = decoded['code']?.toString();
+          final candidate = decoded['code']?.toString();
+          if (candidate != null &&
+              RegExp(r'^[a-z][a-z0-9_]{0,63}$').hasMatch(candidate)) {
+            code = candidate;
+          }
         }
       }
     } on FormatException {
@@ -532,15 +539,35 @@ class ApiService {
   Future<String> uploadClientPhoto(String clientId, String filePath) =>
       _uploadClientPhoto(clientId, filePath);
 
+  /// A stable operation ID is supplied by APP-112's tenant-scoped SQLite
+  /// queue. Repeating this request after an ambiguous response is safe: the
+  /// server replays its existing canonical asset instead of creating another.
+  Future<String> uploadClientPhotoWithIdempotency(
+    String clientId,
+    String filePath,
+    String? idempotencyKey,
+    String? fileSha256,
+  ) =>
+      _uploadClientPhoto(
+        clientId,
+        filePath,
+        idempotencyKey: idempotencyKey,
+        fileSha256: fileSha256,
+      );
+
   Future<String> uploadClientPhotoForSession(
     String clientId,
     String filePath,
     SessionSnapshot session, {
+    String? idempotencyKey,
+    String? fileSha256,
     required bool Function() isSessionCurrent,
   }) =>
       _uploadClientPhoto(
         clientId,
         filePath,
+        idempotencyKey: idempotencyKey,
+        fileSha256: fileSha256,
         session: session,
         isSessionCurrent: isSessionCurrent,
       );
@@ -548,6 +575,8 @@ class ApiService {
   Future<String> _uploadClientPhoto(
     String clientId,
     String filePath, {
+    String? idempotencyKey,
+    String? fileSha256,
     SessionSnapshot? session,
     bool Function()? isSessionCurrent,
   }) async {
@@ -556,16 +585,18 @@ class ApiService {
       'POST',
       Uri.parse('$baseUrl/photos/client/$clientId'),
     );
-    request.headers.addAll(authenticatedHeadersFor(session));
+    request.headers.addAll({
+      ...authenticatedHeadersFor(session),
+      if (idempotencyKey != null) 'Idempotency-Key': idempotencyKey,
+      if (fileSha256 != null) 'X-Photo-SHA256': fileSha256,
+    });
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
     _requireCurrentSession(isSessionCurrent);
     final response = await http.Response.fromStream(await request.send());
     _requireCurrentSession(isSessionCurrent);
     if (response.statusCode != 201) {
-      throw ApiException(
-        _extractErrorMessage(response, 'Failed to upload photo'),
-      );
+      throw _exceptionFor(response, 'Failed to upload photo');
     }
     final payload = _decodeObjectBody(
       response.body,

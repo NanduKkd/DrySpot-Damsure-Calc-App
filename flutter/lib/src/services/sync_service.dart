@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'api_service.dart';
@@ -13,6 +15,65 @@ import '../models/warranty.dart';
 import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
 import 'session_manager.dart';
+
+enum SyncPhase {
+  preparing,
+  uploadingPhotos,
+  sendingChanges,
+  applyingUpdates,
+  finalising,
+}
+
+enum SyncOutcomeStatus {
+  applied,
+  alreadyApplied,
+  superseded,
+  rejected,
+  permanentlyDeleted,
+  unauthorized,
+}
+
+extension SyncOutcomeStatusWire on SyncOutcomeStatus {
+  String get wireName => switch (this) {
+        SyncOutcomeStatus.applied => 'applied',
+        SyncOutcomeStatus.alreadyApplied => 'already_applied',
+        SyncOutcomeStatus.superseded => 'superseded',
+        SyncOutcomeStatus.rejected => 'rejected',
+        SyncOutcomeStatus.permanentlyDeleted => 'permanently_deleted',
+        SyncOutcomeStatus.unauthorized => 'unauthorized',
+      };
+}
+
+SyncOutcomeStatus _syncOutcomeStatusFromWire(String value) => switch (value) {
+      'applied' => SyncOutcomeStatus.applied,
+      'already_applied' => SyncOutcomeStatus.alreadyApplied,
+      'superseded' => SyncOutcomeStatus.superseded,
+      'rejected' => SyncOutcomeStatus.rejected,
+      'permanently_deleted' => SyncOutcomeStatus.permanentlyDeleted,
+      'unauthorized' => SyncOutcomeStatus.unauthorized,
+      _ => throw ArgumentError.value(value, 'value', 'Unknown APP-111 outcome'),
+    };
+
+class SyncOutcome {
+  const SyncOutcome({
+    required this.collection,
+    required this.status,
+  });
+
+  final String collection;
+  final SyncOutcomeStatus status;
+}
+
+/// A narrow APP-112 projection of APP-111's already-validated outcomes.
+/// It deliberately contains no competing ordering, cursor, payload, or raw
+/// server error data.
+class SyncRunResult {
+  const SyncRunResult({this.outcomes = const []});
+
+  final List<SyncOutcome> outcomes;
+}
+
+typedef SyncPhaseListener = void Function(SyncPhase phase);
 
 class _PhotoUploadResult {
   const _PhotoUploadResult({
@@ -99,14 +160,29 @@ class SyncService {
     String clientId,
     String path,
     SessionSnapshot? session,
+    String? idempotencyKey,
+    String? fileSha256,
   ) {
     _requireCurrent(session);
+    // The unbound branch only exists for legacy isolated V1 tests. The app
+    // always supplies an APP-106 session, so every production photo request
+    // uses its durable operation ID and digest.
+    if (session == null && idempotencyKey == null) {
+      return apiService.uploadClientPhoto(clientId, path);
+    }
     return session == null
-        ? apiService.uploadClientPhoto(clientId, path)
+        ? apiService.uploadClientPhotoWithIdempotency(
+            clientId,
+            path,
+            idempotencyKey,
+            fileSha256,
+          )
         : apiService.uploadClientPhotoForSession(
             clientId,
             path,
             session,
+            idempotencyKey: idempotencyKey,
+            fileSha256: fileSha256,
             isSessionCurrent: () => _isCurrent(session),
           );
   }
@@ -122,12 +198,16 @@ class SyncService {
           );
   }
 
-  Future<void> sync([SessionSnapshot? requestedSession]) async {
+  Future<SyncRunResult> sync([
+    SessionSnapshot? requestedSession,
+    SyncPhaseListener? onPhase,
+  ]) async {
     final session = requestedSession ?? sessionManager?.current;
     if (sessionManager != null && session == null) {
       throw const StaleSessionException();
     }
     _requireCurrent(session);
+    onPhase?.call(SyncPhase.preparing);
     final prefs = await SharedPreferences.getInstance();
     _requireCurrent(session);
     final franchiseeId =
@@ -137,8 +217,12 @@ class SyncService {
     _requireCurrent(session);
     if (supportsV2 && await dbService.isSyncV2Enabled(franchiseeId)) {
       _requireCurrent(session);
-      await _syncV2(franchiseeId, session, activateProtocol: false);
-      return;
+      return await _syncV2(
+        franchiseeId,
+        session,
+        activateProtocol: false,
+        onPhase: onPhase,
+      );
     }
     if (supportsV2) {
       _requireCurrent(session);
@@ -156,6 +240,7 @@ class SyncService {
     // The legacy writer drains first. A v2 state bit is persisted only in the
     // same SQLite transaction that applies a successful cursor-zero snapshot.
     try {
+      onPhase?.call(SyncPhase.sendingChanges);
       await _syncV1(session);
     } on ApiException catch (error) {
       if (supportsV2 &&
@@ -169,31 +254,38 @@ class SyncService {
           session,
           activateProtocol: false,
           includePending: false,
+          onPhase: onPhase,
         );
         _requireCurrent(session);
         await dbService.rebasePendingLwwChangesForBootstrapForSession(
           franchiseeId,
           isSessionCurrent: () => _isCurrent(session),
         );
-        await _syncV2(
+        return await _syncV2(
           franchiseeId,
           session,
           activateProtocol: true,
           requireSubmittedAccepted: true,
+          onPhase: onPhase,
         );
-        return;
       }
       rethrow;
     }
-    if (!supportsV2) return;
+    if (!supportsV2) return const SyncRunResult();
     try {
-      await _syncV2(franchiseeId, session, activateProtocol: true);
+      return await _syncV2(
+        franchiseeId,
+        session,
+        activateProtocol: true,
+        onPhase: onPhase,
+      );
     } on ApiException catch (error) {
       // During the compatibility window an old server may not expose /sync/v2.
       // The successful v1 drain remains durable, while no v2 cursor/state is
       // persisted and the next explicit sync retries the bootstrap safely.
       if (!error.endpointMissing) rethrow;
     }
+    return const SyncRunResult();
   }
 
   Future<void> _syncV1(SessionSnapshot? session) async {
@@ -375,7 +467,7 @@ class SyncService {
 
         try {
           canonicalPhotos.add(
-            await _uploadPhoto(client.remoteId, photo, session),
+            await _uploadPhoto(client.remoteId, photo, session, null, null),
           );
         } catch (_) {
           uploadFailed = true;
@@ -1740,11 +1832,12 @@ class SyncService {
     SessionSnapshot? session,
   ) async {
     var authoritativeChanged = false;
-    for (final pending in await dbService.getPendingClientPhotos(
+    for (final pending in await dbService.getPendingClientPhotoUploads(
       franchiseeId,
     )) {
       final remoteId = pending['client_remote_id']!;
       final photo = pending['local_path']!;
+      final uploadId = pending['upload_id'];
       try {
         if (photo.startsWith('/api/photos/client/')) {
           _requireCurrent(session);
@@ -1753,6 +1846,7 @@ class SyncService {
             remoteId: remoteId,
             localPath: photo,
             canonicalPath: photo,
+            uploadId: uploadId,
             isSessionCurrent: () => _isCurrent(session),
           );
           continue;
@@ -1774,11 +1868,43 @@ class SyncService {
             remoteId: remoteId,
             localPath: photo,
             canonicalPath: uri.path,
+            uploadId: uploadId,
             isSessionCurrent: () => _isCurrent(session),
           );
           continue;
         }
-        final canonical = await _uploadPhoto(remoteId, photo, session);
+        String? digest;
+        if (session != null) {
+          final bytes = await File(photo).readAsBytes();
+          _requireCurrent(session);
+          digest = sha256.convert(bytes).toString();
+          final persistedDigest = pending['file_sha256'];
+          if (persistedDigest != null && persistedDigest != digest) {
+            throw const FormatException(
+              'The selected photo changed. Remove and add it again before retrying.',
+            );
+          }
+          if (uploadId == null) {
+            throw StateError(
+                'A durable photo upload is missing its upload ID.');
+          }
+          await dbService.persistPendingPhotoUploadDigestForSession(
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+            uploadId: uploadId,
+            localPath: photo,
+            fileSha256: digest,
+            isSessionCurrent: () => _isCurrent(session),
+          );
+          _requireCurrent(session);
+        }
+        final canonical = await _uploadPhoto(
+          remoteId,
+          photo,
+          session,
+          uploadId,
+          digest,
+        );
         _requireCurrent(session);
         authoritativeChanged = true;
         await dbService.acknowledgeClientPhotoUploadForSession(
@@ -1786,6 +1912,7 @@ class SyncService {
           remoteId: remoteId,
           localPath: photo,
           canonicalPath: canonical,
+          uploadId: uploadId,
           isSessionCurrent: () => _isCurrent(session),
         );
       } on Object catch (error, stackTrace) {
@@ -1824,18 +1951,23 @@ class SyncService {
     return deleted;
   }
 
-  Future<void> _syncV2(
+  Future<SyncRunResult> _syncV2(
     String franchiseeId,
     SessionSnapshot? session, {
     required bool activateProtocol,
     bool requireSubmittedAccepted = false,
+    SyncPhaseListener? onPhase,
   }) async {
-    await _syncV2Round(
-      franchiseeId,
-      session,
-      activateProtocol: activateProtocol,
-      requireSubmittedAccepted: requireSubmittedAccepted,
-    );
+    final outcomes = <SyncOutcome>[
+      ...await _syncV2Round(
+        franchiseeId,
+        session,
+        activateProtocol: activateProtocol,
+        requireSubmittedAccepted: requireSubmittedAccepted,
+        onPhase: onPhase,
+      ),
+    ];
+    onPhase?.call(SyncPhase.uploadingPhotos);
     final photoResult = await _uploadPendingV2ClientPhotos(
       franchiseeId,
       session,
@@ -1852,7 +1984,14 @@ class SyncService {
     if (photoResult.authoritativeChanged || proposalChanged) {
       // The dedicated endpoints advance/stamp the tenant cursor. Pull once
       // more so exact authoritative media/PDF state and cursor land atomically.
-      await _syncV2Round(franchiseeId, session, activateProtocol: false);
+      outcomes.addAll(
+        await _syncV2Round(
+          franchiseeId,
+          session,
+          activateProtocol: false,
+          onPhase: onPhase,
+        ),
+      );
     }
     if (photoResult.error != null) {
       Error.throwWithStackTrace(photoResult.error!, photoResult.stackTrace!);
@@ -1860,14 +1999,17 @@ class SyncService {
     if (proposalError != null) {
       Error.throwWithStackTrace(proposalError, proposalStackTrace!);
     }
+    onPhase?.call(SyncPhase.finalising);
+    return SyncRunResult(outcomes: outcomes);
   }
 
-  Future<void> _syncV2Round(
+  Future<List<SyncOutcome>> _syncV2Round(
     String franchiseeId,
     SessionSnapshot? session, {
     required bool activateProtocol,
     bool includePending = true,
     bool requireSubmittedAccepted = false,
+    SyncPhaseListener? onPhase,
   }) async {
     final requestCursor = await dbService.getSyncV2Cursor(franchiseeId);
     final parsedRequestCursor = _v2Decimal(requestCursor, 'request_cursor');
@@ -1898,6 +2040,7 @@ class SyncService {
             'operation': change['operation'].toString(),
           },
     };
+    onPhase?.call(SyncPhase.sendingChanges);
     final response = await _requestV2({
       'protocol_version': 2,
       'request_id': requestId,
@@ -2216,6 +2359,7 @@ class SyncService {
     }
 
     _requireCurrent(session);
+    onPhase?.call(SyncPhase.applyingUpdates);
     await dbService.applySyncV2ResponseForSession(
       franchiseeId: franchiseeId,
       requestCursor: requestCursor,
@@ -2231,5 +2375,13 @@ class SyncService {
       activateProtocol: activateProtocol,
       isSessionCurrent: () => _isCurrent(session),
     );
+    return [
+      for (final entry in submittedByChangeId.entries)
+        if (outcomeStatuses[entry.key] != null)
+          SyncOutcome(
+            collection: entry.value['collection']!,
+            status: _syncOutcomeStatusFromWire(outcomeStatuses[entry.key]!),
+          ),
+    ];
   }
 }

@@ -23,6 +23,7 @@ import {
 } from '../services/warrantyLifecycle';
 import { stampLegacySyncChanges } from '../services/lwwSync';
 import { lockTenantSyncState } from '../services/tenantSyncCursor';
+import { terminalizeClientPhotoUploadReceipts } from '../services/clientPhotoUploadReceipt';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
@@ -248,9 +249,14 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							// A client tombstone makes its managed assets unreachable. Remove
 							// their metadata in the same transaction, then clean files only
 							// after the tombstone commits.
-							canonicalPhotoUrls(existing.photos, existing.id).forEach(
-								queueStoredPhotoRemoval,
-							);
+							const removedPhotos = canonicalPhotoUrls(existing.photos, existing.id);
+							await terminalizeClientPhotoUploadReceipts({
+								franchiseeId,
+								clientId: existing.id,
+								canonicalUrls: removedPhotos,
+								transaction,
+							});
+							removedPhotos.forEach(queueStoredPhotoRemoval);
 							queuedWarrantyPdfsToRemove.push(
 								...(await tombstoneClientWarranties({
 									clientId: existing.id,
@@ -283,9 +289,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 										)
 									: [];
 						if (syncedPhotos) {
-							existingPhotos
-								.filter((photo) => !syncedPhotos.includes(photo))
-								.forEach(queueStoredPhotoRemoval);
+							const removedPhotos = existingPhotos.filter(
+								(photo) => !syncedPhotos.includes(photo),
+							);
+							if (existing && removedPhotos.length) {
+								await terminalizeClientPhotoUploadReceipts({
+									franchiseeId,
+									clientId: existing.id,
+									canonicalUrls: removedPhotos,
+									transaction,
+								});
+							}
+							removedPhotos.forEach(queueStoredPhotoRemoval);
 						}
 						const values = {
 							...rest,

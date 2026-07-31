@@ -38,6 +38,37 @@ void main() {
     });
 
     test(
+        'fresh v14 creation includes the full durable photo-upload queue before its indexes',
+        () async {
+      final originalPath = await getDatabasesPath();
+      final temporaryPath =
+          await Directory.systemTemp.createTemp('app112-fresh-v14-');
+      addTearDown(() async {
+        await databaseFactory.setDatabasesPath(originalPath);
+        await temporaryPath.delete(recursive: true);
+      });
+      await databaseFactory.setDatabasesPath(temporaryPath.path);
+      final service = DbService();
+      final database = await service.database;
+      addTearDown(database.close);
+
+      final columns =
+          await database.rawQuery('PRAGMA table_info(pending_client_photos)');
+      expect(
+        columns.map((column) => column['name']),
+        containsAll(['upload_id', 'file_sha256', 'canonical_url', 'status']),
+      );
+      expect(
+        (await database.rawQuery("PRAGMA index_list('pending_client_photos')"))
+            .map((index) => index['name']),
+        containsAll([
+          'pending_client_photos_tenant_upload',
+          'pending_client_photos_status',
+        ]),
+      );
+    });
+
+    test(
         'v10 adds warranty deletion state idempotently while discarding legacy offline deletes',
         () async {
       final database = await openDatabase(
@@ -520,6 +551,123 @@ void main() {
         {'pending_payload_hash': expectedHash},
       );
       await DbService.migrateSchema(database, 12, 13);
+    });
+
+    test(
+        'v13 to v14 reopens idempotently with tenant-isolated recovery state and upload IDs',
+        () async {
+      final path =
+          '${Directory.systemTemp.path}/app112-v13-${DateTime.now().microsecondsSinceEpoch}.db';
+      final legacy = await openDatabase(
+        path,
+        version: 13,
+        onCreate: (db, _) async {
+          await db.execute('''
+            CREATE TABLE clients (
+              local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              remote_id TEXT UNIQUE,
+              franchisee_id TEXT,
+              deleted_at TEXT
+            )
+          ''');
+          await db.execute('''
+            CREATE TABLE pending_client_photos (
+              franchisee_id TEXT NOT NULL,
+              client_remote_id TEXT NOT NULL,
+              local_path TEXT NOT NULL,
+              PRIMARY KEY (franchisee_id, client_remote_id, local_path)
+            )
+          ''');
+          await db.execute(
+              'CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+          await db.insert('clients',
+              {'remote_id': 'a-client', 'franchisee_id': 'tenant-a'});
+          await db.insert('clients',
+              {'remote_id': 'b-client', 'franchisee_id': 'tenant-b'});
+          await db.insert('pending_client_photos', {
+            'franchisee_id': 'tenant-a',
+            'client_remote_id': 'a-client',
+            'local_path': '/private/a.jpg',
+          });
+          await db.insert('pending_client_photos', {
+            'franchisee_id': 'tenant-b',
+            'client_remote_id': 'b-client',
+            'local_path': '/private/b.jpg',
+          });
+        },
+      );
+      await DbService.migrateSchema(legacy, 13, 14);
+      final ids =
+          await legacy.query('pending_client_photos', orderBy: 'franchisee_id');
+      expect(ids.map((row) => row['upload_id']), everyElement(isA<String>()));
+      expect(ids.map((row) => row['upload_id']).toSet(), hasLength(2));
+      await legacy.close();
+
+      final reopened = await openDatabase(path,
+          version: 14, onUpgrade: DbService.migrateSchema);
+      addTearDown(() async => databaseFactory.deleteDatabase(path));
+      addTearDown(reopened.close);
+      await DbService.migrateSchema(reopened, 13, 14);
+      final db = DbService(database: reopened);
+      expect(
+          (await db.getPendingClientPhotoUploads('tenant-a'))
+              .single['local_path'],
+          '/private/a.jpg');
+      expect(
+          (await db.getPendingClientPhotoUploads('tenant-b'))
+              .single['local_path'],
+          '/private/b.jpg');
+      expect(
+          (await db.getPendingClientPhotoUploads('tenant-a'))
+              .single['upload_id'],
+          ids[0]['upload_id']);
+      await db.persistPendingPhotoUploadDigestForSession(
+        franchiseeId: 'tenant-a',
+        remoteId: 'a-client',
+        uploadId: ids[0]['upload_id'] as String,
+        localPath: '/private/a.jpg',
+        fileSha256: List.filled(64, 'a').join(),
+        isSessionCurrent: () => true,
+      );
+      expect(
+        (await db.getPendingClientPhotoUploads('tenant-a'))
+            .single['file_sha256'],
+        List.filled(64, 'a').join(),
+        reason:
+            'an ambiguous response keeps the same durable operation for replay',
+      );
+      await reopened.delete(
+        'pending_client_photos',
+        where: 'franchisee_id = ? AND client_remote_id = ?',
+        whereArgs: ['tenant-a', 'a-client'],
+      );
+      await reopened.insert('pending_client_photos', {
+        'franchisee_id': 'tenant-a',
+        'client_remote_id': 'a-client',
+        'local_path': '/private/a.jpg',
+        'upload_id': '10000000-0000-4000-8000-000000000099',
+        'status': 'pending',
+      });
+      expect(
+          (await db.getPendingClientPhotoUploads('tenant-a'))
+              .single['upload_id'],
+          '10000000-0000-4000-8000-000000000099',
+          reason: 'deleting and re-adding a path creates a new logical upload');
+
+      await db.recordSyncRecoveryForSession(
+        'tenant-a',
+        successfulAt: DateTime.utc(2026, 7, 31, 12),
+        notices: const [
+          {'code': 'superseded', 'collection': 'clients'}
+        ],
+        isSessionCurrent: () => true,
+      );
+      final a = await db.getSyncRecoveryState('tenant-a');
+      final b = await db.getSyncRecoveryState('tenant-b');
+      expect(a['last_successful_at'], isNotNull);
+      expect(a['notices'], hasLength(1));
+      expect(b['last_successful_at'], isNull);
+      expect(b['notices'], isEmpty);
     });
   });
 }

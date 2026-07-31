@@ -14,6 +14,7 @@ import { UserAdminAuditEvent } from './UserAdminAuditEvent';
 import { TenantSyncState } from './TenantSyncState';
 import { SyncV2Request } from './SyncV2Request';
 import { SyncV2ChangeReceipt } from './SyncV2ChangeReceipt';
+import { ClientPhotoUpload } from './ClientPhotoUpload';
 
 // Associations
 Franchisee.hasMany(User, { foreignKey: 'franchiseeId' });
@@ -54,4 +55,5 @@ export {
 	TenantSyncState,
 	SyncV2Request,
 	SyncV2ChangeReceipt,
+	ClientPhotoUpload,
 };

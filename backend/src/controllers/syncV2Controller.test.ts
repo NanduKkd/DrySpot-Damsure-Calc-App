@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import app from '../app';
@@ -890,10 +890,13 @@ describe('APP-111 sync protocol v2', () => {
 		expect(core.status).toBe(200);
 		const coreCursor = core.body.response_cursor as string;
 
+		const photoBody = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]);
 		const photo = await request(app)
 			.post(`/api/photos/client/${clientId}`)
 			.set('Authorization', `Bearer ${tokenA}`)
-			.attach('file', Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]), {
+			.set('Idempotency-Key', randomUUID())
+			.set('X-Photo-SHA256', createHash('sha256').update(photoBody).digest('hex'))
+			.attach('file', photoBody, {
 				filename: 'camera.jpg',
 				contentType: 'image/jpeg',
 			});

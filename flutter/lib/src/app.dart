@@ -62,7 +62,10 @@ class App extends StatelessWidget {
           update: (_, auth, syncProvider) {
             final provider =
                 syncProvider ?? SyncProvider(syncService: syncService);
-            provider.updateSession(auth.sessionSnapshot);
+            provider.updateSession(
+              auth.sessionSnapshot,
+              onAuthenticationExpired: auth.logout,
+            );
             return provider;
           },
         ),
