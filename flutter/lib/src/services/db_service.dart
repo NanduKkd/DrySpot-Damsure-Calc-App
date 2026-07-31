@@ -955,8 +955,11 @@ class DbService {
       where: 'franchisee_id = ? AND client_remote_id = ?',
       whereArgs: [franchiseeId, remoteId],
     );
-    final desired = row['deleted_at'] == null
+    final currentPhotos = row['deleted_at'] == null
         ? _decodeClientPhotos(row['photos'])
+        : const <String>[];
+    final desired = row['deleted_at'] == null
+        ? currentPhotos
             .where(
               (photo) =>
                   !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
@@ -968,11 +971,18 @@ class DbService {
       final uploadedCanonical =
           durableUploads ? pending['canonical_url']?.toString() : null;
       final isUploaded = durableUploads && pending['status'] == 'uploaded';
-      if (!desired.contains(path) &&
-          !(isUploaded &&
-              uploadedCanonical != null &&
-              _isCanonicalClientPhotoPath(uploadedCanonical,
-                  remoteId: remoteId))) {
+      // An uploaded row remains only while its canonical replacement is still
+      // selected on the client. Removing that canonical URL is an explicit
+      // local removal, including a one-transaction remove/re-add of the same
+      // local path. Delete the old operation before inserting the new path so
+      // the replacement receives a fresh upload_id and digest binding.
+      final retainsUploadedCanonical = isUploaded &&
+          uploadedCanonical != null &&
+          _isCanonicalClientPhotoPath(uploadedCanonical, remoteId: remoteId) &&
+          currentPhotos.contains(uploadedCanonical);
+      final shouldRemove =
+          isUploaded ? !retainsUploadedCanonical : !desired.contains(path);
+      if (shouldRemove) {
         await executor.delete(
           'pending_client_photos',
           where:
@@ -3956,6 +3966,86 @@ class DbService {
       if (!isSessionCurrent()) throw const StaleSessionException();
       return changed;
     });
+  }
+
+  /// V1 has no APP-111 authoritative record echo for a successfully applied
+  /// client mutation. Its applied outcome nevertheless confirms the exact
+  /// canonical photo list sent in the V1 payload. Complete only the matching
+  /// uploaded operations in the same transaction as the client CAS; a local
+  /// N+1 edit or stale session therefore retains its queue rows for retry.
+  Future<int> markClientSyncedAndCompleteAcknowledgedPhotoUploads(
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    final db = await database;
+    return db.transaction((transaction) =>
+        _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+          transaction,
+          remoteId,
+          franchiseeId: franchiseeId,
+          submittedUpdatedAt: submittedUpdatedAt,
+          confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+        ));
+  }
+
+  Future<int> markClientSyncedAndCompleteAcknowledgedPhotoUploadsForSession(
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed =
+          await _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+        transaction,
+        remoteId,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+    DatabaseExecutor executor,
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    final changed = await _markAsSyncedWithExecutor(
+      executor,
+      'clients',
+      remoteId,
+      franchiseeId: franchiseeId,
+      submittedUpdatedAt: submittedUpdatedAt,
+    );
+    if (changed != 1 || !await _supportsDurablePhotoUploads(executor)) {
+      return changed;
+    }
+    final confirmed = {
+      for (final photo in confirmedCanonicalPhotos)
+        if (_isCanonicalClientPhotoPath(photo, remoteId: remoteId)) photo,
+    };
+    if (confirmed.isEmpty) return changed;
+    final placeholders = List.filled(confirmed.length, '?').join(', ');
+    await executor.delete(
+      'pending_client_photos',
+      where: '''
+        franchisee_id = ? AND client_remote_id = ?
+        AND status = 'uploaded' AND canonical_url IN ($placeholders)
+      ''',
+      whereArgs: [franchiseeId, remoteId, ...confirmed],
+    );
+    return changed;
   }
 
   Future<int> _markAsSyncedWithExecutor(

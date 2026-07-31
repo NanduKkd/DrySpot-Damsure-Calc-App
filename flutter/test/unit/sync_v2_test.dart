@@ -1781,6 +1781,11 @@ void main() {
     expect(apiService.lastV1, isNull,
         reason: 'V1 must not activate after an unacknowledged photo upload');
     expect(await dbService.isSyncV2Enabled(tenant), isFalse);
+    final retryQueue =
+        (await dbService.getPendingClientPhotoUploads(tenant)).single;
+    expect(retryQueue['upload_id'], apiService.photoOperationIds.single,
+        reason:
+            'an ambiguous response retains the durable operation for retry');
 
     await service.sync(v1Session);
 
@@ -1788,6 +1793,133 @@ void main() {
     expect(apiService.photoOperationIds.toSet(), hasLength(1));
     expect(await dbService.getPendingClientPhotoUploads(tenant), isEmpty);
     expect(await dbService.isSyncV2Enabled(tenant), isTrue);
+  });
+
+  test(
+      'explicit canonical removal replaces an uploaded V1 operation without crossing tenant or CAS fences',
+      () async {
+    const localPath = '/offline/readded.jpg';
+    const canonical =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000074.jpg';
+    const otherTenant = '50000000-0000-4000-8000-000000000001';
+    const otherRemoteId = '50000000-0000-4000-8000-000000000002';
+    const otherCanonical =
+        '/api/photos/client/$otherRemoteId/50000000-0000-4000-8000-000000000003.jpg';
+    final originalUpdatedAt = DateTime.parse(now);
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'Remove and re-add',
+      photos: const [localPath],
+      updatedAt: originalUpdatedAt,
+    ));
+    final original =
+        (await dbService.getPendingClientPhotoUploads(tenant)).single;
+    final originalDigest = sha256.convert(utf8.encode('original')).toString();
+    await dbService.persistPendingPhotoUploadDigest(
+      franchiseeId: tenant,
+      remoteId: remoteId,
+      uploadId: original['upload_id']!,
+      localPath: localPath,
+      fileSha256: originalDigest,
+    );
+    expect(
+      await dbService.acknowledgeClientPhotoUpload(
+        franchiseeId: tenant,
+        remoteId: remoteId,
+        localPath: localPath,
+        canonicalPath: canonical,
+      ),
+      isTrue,
+    );
+
+    await dbService.insertClient(Client(
+      remoteId: otherRemoteId,
+      franchiseeId: otherTenant,
+      name: 'Other tenant',
+      photos: const [localPath],
+      updatedAt: originalUpdatedAt,
+    ));
+    final other =
+        (await dbService.getPendingClientPhotoUploads(otherTenant)).single;
+    await dbService.persistPendingPhotoUploadDigest(
+      franchiseeId: otherTenant,
+      remoteId: otherRemoteId,
+      uploadId: other['upload_id']!,
+      localPath: localPath,
+      fileSha256: sha256.convert(utf8.encode('other')).toString(),
+    );
+    await dbService.acknowledgeClientPhotoUpload(
+      franchiseeId: otherTenant,
+      remoteId: otherRemoteId,
+      localPath: localPath,
+      canonicalPath: otherCanonical,
+    );
+
+    expect(
+      await dbService.markClientSyncedAndCompleteAcknowledgedPhotoUploads(
+        remoteId,
+        franchiseeId: tenant,
+        submittedUpdatedAt: DateTime.utc(2000).toIso8601String(),
+        confirmedCanonicalPhotos: const [canonical],
+      ),
+      0,
+      reason: 'a stale V1 CAS cannot complete an uploaded operation',
+    );
+    await expectLater(
+      dbService.markClientSyncedAndCompleteAcknowledgedPhotoUploadsForSession(
+        remoteId,
+        franchiseeId: tenant,
+        submittedUpdatedAt: originalUpdatedAt.toIso8601String(),
+        confirmedCanonicalPhotos: const [canonical],
+        isSessionCurrent: () => false,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    final retained = await database.query(
+      'pending_client_photos',
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [tenant, remoteId],
+    );
+    expect(retained.single['upload_id'], original['upload_id']);
+    expect(retained.single['status'], 'uploaded');
+
+    final client =
+        (await dbService.getClientByRemoteIdForFranchisee(remoteId, tenant))!;
+    await dbService.updateClient(client.copyWith(
+      photos: const [localPath],
+      isDirty: true,
+      updatedAt: originalUpdatedAt.add(const Duration(seconds: 1)),
+    ));
+
+    final replacement =
+        (await dbService.getPendingClientPhotoUploads(tenant)).single;
+    expect(replacement['upload_id'], isNot(original['upload_id']));
+    final replacementDigest =
+        sha256.convert(utf8.encode('replacement')).toString();
+    await dbService.persistPendingPhotoUploadDigest(
+      franchiseeId: tenant,
+      remoteId: remoteId,
+      uploadId: replacement['upload_id']!,
+      localPath: localPath,
+      fileSha256: replacementDigest,
+    );
+    final replacementRows = await database.query(
+      'pending_client_photos',
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [tenant, remoteId],
+    );
+    expect(replacementRows.single['file_sha256'], replacementDigest);
+    expect(replacementRows.single['status'], 'pending');
+    expect(
+      await database.query(
+        'pending_client_photos',
+        where: 'franchisee_id = ? AND client_remote_id = ?',
+        whereArgs: [otherTenant, otherRemoteId],
+      ),
+      hasLength(1),
+      reason: 'the first tenant cannot remove another tenant upload row',
+    );
   });
 
   test('V1 photo failure prevents legacy payload submission and V2 activation',
@@ -1868,12 +2000,17 @@ void main() {
     expect(await dbService.getSyncV2Cursor(tenant), '1');
   });
 
-  test('a missing old-server v2 endpoint leaves the successful v1 drain safe',
+  test(
+      'a V1-confirmed photo completes its queue when the old-server V2 endpoint is missing',
       () async {
+    final file = await v1PhotoFile('missing-v2');
+    const canonical =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000073.jpg';
     await dbService.insertClient(Client(
       remoteId: remoteId,
       franchiseeId: tenant,
       name: 'Legacy dirty',
+      photos: [file.path],
       updatedAt: DateTime.parse(now),
     ));
     apiService.v1Handler = (request) async => {
@@ -1902,6 +2039,10 @@ void main() {
             'proposals': [],
           },
         };
+    apiService.photoHandler = (_, path) async {
+      expect(path, file.path);
+      return canonical;
+    };
     apiService.v2Handler = (_) async => throw const ApiException(
           'Not found',
           statusCode: 404,
@@ -1911,6 +2052,19 @@ void main() {
     await SyncService(apiService: apiService, dbService: dbService).sync();
 
     expect(await dbService.getDirtyClients(), isEmpty);
+    expect(
+      await database.query(
+        'pending_client_photos',
+        where: 'franchisee_id = ? AND client_remote_id = ?',
+        whereArgs: [tenant, remoteId],
+      ),
+      isEmpty,
+      reason: 'the V1 applied outcome authoritatively confirmed the photo',
+    );
+    expect(
+      jsonDecode(apiService.lastV1!['changes']['clients'].single['photos']),
+      [canonical],
+    );
     expect(await dbService.isSyncV2Enabled(tenant), isFalse);
     expect(await dbService.getSyncV2Cursor(tenant), '0');
   });

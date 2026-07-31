@@ -1394,11 +1394,28 @@ class SyncService {
       if (appliedClients.contains(c.remoteId)) {
         await _writeForCurrent(
           session,
-          () => markAsSynced(
-            'clients',
-            c.remoteId,
-            submittedUpdatedAt: c.updatedAt.toIso8601String(),
-          ),
+          () => drainDurablePhotoUploads
+              ? sessionManager == null
+                  ? dbService
+                      .markClientSyncedAndCompleteAcknowledgedPhotoUploads(
+                      c.remoteId,
+                      franchiseeId: activeFranchiseeId!,
+                      submittedUpdatedAt: c.updatedAt.toIso8601String(),
+                      confirmedCanonicalPhotos: c.photos,
+                    )
+                  : dbService
+                      .markClientSyncedAndCompleteAcknowledgedPhotoUploadsForSession(
+                      c.remoteId,
+                      franchiseeId: activeFranchiseeId!,
+                      submittedUpdatedAt: c.updatedAt.toIso8601String(),
+                      confirmedCanonicalPhotos: c.photos,
+                      isSessionCurrent: () => _isCurrent(session),
+                    )
+              : markAsSynced(
+                  'clients',
+                  c.remoteId,
+                  submittedUpdatedAt: c.updatedAt.toIso8601String(),
+                ),
         );
       }
     }
