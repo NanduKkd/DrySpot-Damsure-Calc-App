@@ -61,42 +61,30 @@ const parsePhotos = (photos: unknown): string[] => {
  * file is published.  Never leave that URL visible when the staged file is
  * unrecoverable: compensate under the same lock order as media mutation.
  */
-const compensateUnpublishableReceipt = async (receipt: ClientPhotoUpload) => {
-	await sequelize.transaction(async (transaction) => {
-		const state = await lockTenantSyncState(receipt.franchiseeId, transaction);
-		const lockedReceipt = await ClientPhotoUpload.findOne({
-			where: { franchiseeId: receipt.franchiseeId, uploadId: receipt.uploadId },
-			transaction,
-			lock: transaction.LOCK.UPDATE,
-		});
-		if (
-			!lockedReceipt ||
-			lockedReceipt.status === 'deleted' ||
-			lockedReceipt.deletedAt != null
-		) {
-			return;
-		}
-		const client = await Client.findOne({
-			where: { id: lockedReceipt.clientId, franchiseeId: lockedReceipt.franchiseeId },
-			transaction,
-			lock: transaction.LOCK.UPDATE,
-		});
-		const photos = client ? parsePhotos(client.photos) : [];
-		if (client && photos.includes(lockedReceipt.canonicalUrl)) {
-			const nextCursor = nextTenantSyncCursor(state.cursor);
-			await client.update(
-				{
-					photos: JSON.stringify(
-						photos.filter((photo) => photo !== lockedReceipt.canonicalUrl),
-					),
-					syncCursor: nextCursor.toString(),
-				},
-				{ transaction },
-			);
-			await state.update({ cursor: nextCursor.toString() }, { transaction });
-		}
-		await lockedReceipt.update({ status: 'deleted', deletedAt: new Date() }, { transaction });
-	});
+const compensateLockedUnpublishableReceipt = async ({
+	state,
+	receipt,
+	client,
+	transaction,
+}: {
+	state: Awaited<ReturnType<typeof lockTenantSyncState>>;
+	receipt: ClientPhotoUpload;
+	client: Client | null;
+	transaction: Transaction;
+}) => {
+	const photos = client ? parsePhotos(client.photos) : [];
+	if (client && photos.includes(receipt.canonicalUrl)) {
+		const nextCursor = nextTenantSyncCursor(state.cursor);
+		await client.update(
+			{
+				photos: JSON.stringify(photos.filter((photo) => photo !== receipt.canonicalUrl)),
+				syncCursor: nextCursor.toString(),
+			},
+			{ transaction },
+		);
+		await state.update({ cursor: nextCursor.toString() }, { transaction });
+	}
+	await receipt.update({ status: 'deleted', deletedAt: new Date() }, { transaction });
 };
 
 export const terminalizeClientPhotoUploadReceipts = async ({
@@ -111,6 +99,10 @@ export const terminalizeClientPhotoUploadReceipts = async ({
 	transaction: Transaction;
 }) => {
 	if (!canonicalUrls.length) return;
+	// The caller holds the tenant sync-state lock before this conditional row
+	// transition. PostgreSQL therefore serializes against finalization's own
+	// tenant-state -> receipt -> client lock sequence; SQLite gets the same
+	// transaction boundary. A terminal receipt can never become completed.
 	await ClientPhotoUpload.update(
 		{ status: 'deleted', deletedAt: new Date() },
 		{
@@ -126,36 +118,94 @@ export const terminalizeClientPhotoUploadReceipts = async ({
 };
 
 /** Finalize a receipt committed before its staged file could be published. */
-export const finalizeClientPhotoUploadReceipt = async (receipt: ClientPhotoUpload) => {
-	if (receipt.status === 'deleted' || receipt.deletedAt != null) return 'deleted' as const;
-	const filename = receipt.storageKey;
-	if (!isManagedFilename(filename)) {
-		await compensateUnpublishableReceipt(receipt);
-		return 'deleted' as const;
-	}
-	const finalPath = path.resolve(storedPhotoPath(filename));
-	const stagedPath = path.resolve(stagedPhotoPath(filename));
-	if (
-		path.dirname(finalPath) !== photoUploadPath ||
-		path.dirname(stagedPath) !== photoUploadStagingPath
-	) {
-		await compensateUnpublishableReceipt(receipt);
-		return 'deleted' as const;
-	}
-	if (!fs.existsSync(finalPath) && fs.existsSync(stagedPath)) {
-		await fs.promises.mkdir(photoUploadPath, { recursive: true });
-		await fs.promises.rename(stagedPath, finalPath);
-	}
-	if (!fs.existsSync(finalPath)) {
-		// Do not allow a missing staged asset to be silently recreated under an
-		// existing operation key. Compensation removes only this canonical URL,
-		// advances its tenant/client cursor together, and leaves replay terminal.
-		await compensateUnpublishableReceipt(receipt);
-		return 'deleted' as const;
-	}
-	if (receipt.status !== 'completed') await receipt.update({ status: 'completed' });
-	return 'completed' as const;
-};
+export const finalizeClientPhotoUploadReceipt = async (staleReceipt: ClientPhotoUpload) =>
+	withClientPhotoUploadReceiptLock(
+		staleReceipt.franchiseeId,
+		staleReceipt.uploadId,
+		async () =>
+			sequelize.transaction(async (transaction) => {
+				// Never trust the stale Sequelize instance supplied by a replay or the
+				// startup scan. The fresh locks make terminal deletion win before any
+				// publication state is written or a 201 is returned.
+				const state = await lockTenantSyncState(staleReceipt.franchiseeId, transaction);
+				const receipt = await ClientPhotoUpload.findOne({
+					where: {
+						franchiseeId: staleReceipt.franchiseeId,
+						uploadId: staleReceipt.uploadId,
+					},
+					transaction,
+					lock: transaction.LOCK.UPDATE,
+				});
+				if (!receipt || receipt.status === 'deleted' || receipt.deletedAt != null) {
+					return 'deleted' as const;
+				}
+				const client = await Client.findOne({
+					where: { id: receipt.clientId, franchiseeId: receipt.franchiseeId },
+					transaction,
+					lock: transaction.LOCK.UPDATE,
+				});
+				if (!client || !parsePhotos(client.photos).includes(receipt.canonicalUrl)) {
+					await receipt.update({ status: 'deleted', deletedAt: new Date() }, { transaction });
+					return 'deleted' as const;
+				}
+
+				const filename = receipt.storageKey;
+				const finalPath = path.resolve(storedPhotoPath(filename));
+				const stagedPath = path.resolve(stagedPhotoPath(filename));
+				const unsafePath =
+					!isManagedFilename(filename) ||
+					path.dirname(finalPath) !== photoUploadPath ||
+					path.dirname(stagedPath) !== photoUploadStagingPath;
+				if (unsafePath) {
+					await compensateLockedUnpublishableReceipt({
+						state,
+						receipt,
+						client,
+						transaction,
+					});
+					return 'deleted' as const;
+				}
+				try {
+					if (!fs.existsSync(finalPath) && fs.existsSync(stagedPath)) {
+						await fs.promises.mkdir(photoUploadPath, { recursive: true });
+						await fs.promises.rename(stagedPath, finalPath);
+					}
+				} catch {
+					await compensateLockedUnpublishableReceipt({
+						state,
+						receipt,
+						client,
+						transaction,
+					});
+					return 'deleted' as const;
+				}
+				if (!fs.existsSync(finalPath)) {
+					await compensateLockedUnpublishableReceipt({
+						state,
+						receipt,
+						client,
+						transaction,
+					});
+					return 'deleted' as const;
+				}
+				if (receipt.status === 'staged') {
+					const [changed] = await ClientPhotoUpload.update(
+						{ status: 'completed' },
+						{
+							where: {
+								franchiseeId: receipt.franchiseeId,
+								uploadId: receipt.uploadId,
+								status: 'staged',
+								deletedAt: null,
+							},
+							transaction,
+						},
+					);
+					if (changed !== 1) return 'deleted' as const;
+				}
+				return 'completed' as const;
+			}),
+	);
 
 /**
  * Startup reconciliation repairs a commit-before-response interruption and

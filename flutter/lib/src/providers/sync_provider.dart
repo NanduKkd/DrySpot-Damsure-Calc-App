@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 
 import '../services/api_service.dart';
+import '../services/db_service.dart';
 import '../services/session_manager.dart';
+import '../services/sync_connection_monitor.dart';
 import '../services/sync_service.dart';
 
 enum SyncRecoveryAction {
@@ -57,6 +60,8 @@ class SyncNotice {
           'This photo upload no longer matches the saved upload operation. Restore or re-add the photo before retrying.',
         'uploaded_asset_deleted' =>
           'This uploaded photo was removed. Restore or re-add the photo before retrying.',
+        'connection_restored' =>
+          'Connection restored. Review the pending work, then retry sync when ready.',
         _ => 'Sync could not finish safely. Retry when ready.',
       };
 }
@@ -116,16 +121,89 @@ class SyncViewState {
 
 const _absent = Object();
 
+/// Narrow injection seam for the APP-112 status projection. APP-111 data and
+/// cursor transactions remain in SyncService; this only makes UI settlement
+/// deterministic when the status projection itself cannot access SQLite.
+abstract interface class SyncStatusStore {
+  Future<Map<String, dynamic>> state(String franchiseeId);
+  Future<Map<String, int>> counts(String franchiseeId);
+  Future<void> recordAttempt(
+    SessionSnapshot session, {
+    required DateTime at,
+    required bool Function() isSessionCurrent,
+  });
+  Future<void> recordRecovery(
+    SessionSnapshot session, {
+    DateTime? successfulAt,
+    required List<Map<String, String>> notices,
+    required bool Function() isSessionCurrent,
+  });
+}
+
+class DbSyncStatusStore implements SyncStatusStore {
+  const DbSyncStatusStore(this._db);
+
+  final DbService _db;
+
+  @override
+  Future<Map<String, int>> counts(String franchiseeId) =>
+      _db.getSyncRecoveryCounts(franchiseeId);
+
+  @override
+  Future<void> recordAttempt(
+    SessionSnapshot session, {
+    required DateTime at,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _db.recordSyncAttemptForSession(
+        session.franchiseeId,
+        at: at,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  @override
+  Future<void> recordRecovery(
+    SessionSnapshot session, {
+    DateTime? successfulAt,
+    required List<Map<String, String>> notices,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _db.recordSyncRecoveryForSession(
+        session.franchiseeId,
+        successfulAt: successfulAt,
+        notices: notices,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  @override
+  Future<Map<String, dynamic>> state(String franchiseeId) =>
+      _db.getSyncRecoveryState(franchiseeId);
+}
+
 class SyncProvider extends ChangeNotifier {
   final SyncService _syncService;
+  final SyncConnectionMonitor _connectionMonitor;
+  final SyncStatusStore _statusStore;
   SessionSnapshot? _session;
+  SessionSnapshot? _networkFailureSession;
   Future<void>? _activeRun;
   Future<void> Function()? _onAuthenticationExpired;
+  late final StreamSubscription<bool> _connectionSubscription;
+  bool _disposed = false;
   SyncViewState _viewState = const SyncViewState.empty();
 
-  SyncProvider({required SyncService syncService})
-      : _syncService = syncService {
+  SyncProvider({
+    required SyncService syncService,
+    SyncConnectionMonitor? connectionMonitor,
+    SyncStatusStore? statusStore,
+  })  : _syncService = syncService,
+        _connectionMonitor =
+            connectionMonitor ?? PlatformSyncConnectionMonitor(),
+        _statusStore = statusStore ?? DbSyncStatusStore(syncService.dbService) {
     _syncService.sessionManager?.addInvalidationListener(_clearForInvalidation);
+    _connectionSubscription = _connectionMonitor.connectionChanges.listen(
+      _onConnectionChanged,
+    );
   }
 
   SyncViewState get viewState => _viewState;
@@ -147,6 +225,7 @@ class SyncProvider extends ChangeNotifier {
     if (_sameSession(_session, session)) return;
     _session = session;
     _activeRun = null;
+    _networkFailureSession = null;
     _viewState = const SyncViewState.empty();
     notifyListeners();
     if (session != null) unawaited(_hydrate(session));
@@ -155,6 +234,7 @@ class SyncProvider extends ChangeNotifier {
   void _clearForInvalidation() {
     _session = null;
     _activeRun = null;
+    _networkFailureSession = null;
     _viewState = const SyncViewState.empty();
     notifyListeners();
   }
@@ -163,14 +243,15 @@ class SyncProvider extends ChangeNotifier {
       a?.generation == b?.generation && a?.franchiseeId == b?.franchiseeId;
 
   bool _isCurrent(SessionSnapshot session) =>
+      !_disposed &&
       _sameSession(_session, session) &&
       (_syncService.sessionManager?.isCurrent(session) ?? true);
 
   Future<void> _hydrate(SessionSnapshot session) async {
     try {
       final values = await Future.wait<dynamic>([
-        _syncService.dbService.getSyncRecoveryState(session.franchiseeId),
-        _syncService.dbService.getSyncRecoveryCounts(session.franchiseeId),
+        _statusStore.state(session.franchiseeId),
+        _statusStore.counts(session.franchiseeId),
       ]);
       if (!_isCurrent(session)) return;
       final state = Map<String, dynamic>.from(values[0] as Map);
@@ -200,6 +281,9 @@ class SyncProvider extends ChangeNotifier {
   Future<void> sync() {
     final active = _activeRun;
     if (active != null) return active;
+    if (_viewState.recoveryAction == SyncRecoveryAction.updateRequired) {
+      return Future<void>.value();
+    }
     late final Future<void> run;
     run = _run().whenComplete(() {
       if (identical(_activeRun, run)) _activeRun = null;
@@ -221,8 +305,8 @@ class SyncProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _syncService.dbService.recordSyncAttemptForSession(
-        session.franchiseeId,
+      await _statusStore.recordAttempt(
+        session,
         at: startedAt,
         isSessionCurrent: () => _isCurrent(session),
       );
@@ -244,16 +328,25 @@ class SyncProvider extends ChangeNotifier {
         (notice) => notice.code == 'rejected' || notice.code == 'unauthorized',
       );
       final completedAt = DateTime.now().toUtc();
-      await _syncService.dbService.recordSyncRecoveryForSession(
-        session.franchiseeId,
+      final persistenceNotice = await _recordRecoveryBestEffort(
+        session,
         successfulAt: completedAt,
         notices: [
           for (final notice in notices)
             {'code': notice.code, 'collection': notice.collection ?? ''},
         ],
-        isSessionCurrent: () => _isCurrent(session),
       );
       if (!_isCurrent(session)) return;
+      if (persistenceNotice != null) {
+        await _setFinished(
+          session,
+          kind: SyncViewKind.needsAttention,
+          notices: [persistenceNotice],
+          recoveryAction: _actionForNotices([persistenceNotice]),
+        );
+        return;
+      }
+      _networkFailureSession = null;
       await _setFinished(
         session,
         kind: attention ? SyncViewKind.needsAttention : SyncViewKind.completed,
@@ -265,18 +358,19 @@ class SyncProvider extends ChangeNotifier {
       // APP-106 owns the invalidation; stale work is intentionally invisible.
     } on Object catch (error) {
       if (!_isCurrent(session)) return;
-      final notice = _noticeForError(error);
+      var notice = _noticeForError(error);
+      SyncNotice? persistenceNotice;
       try {
-        await _syncService.dbService.recordSyncRecoveryForSession(
-          session.franchiseeId,
+        persistenceNotice = await _recordRecoveryBestEffort(
+          session,
           notices: [
             {'code': notice.code, 'collection': notice.collection ?? ''},
           ],
-          isSessionCurrent: () => _isCurrent(session),
         );
       } on StaleSessionException {
         return;
       }
+      if (persistenceNotice != null) notice = persistenceNotice;
       if (!_isCurrent(session)) return;
       await _setFinished(
         session,
@@ -284,9 +378,31 @@ class SyncProvider extends ChangeNotifier {
         notices: [notice],
         recoveryAction: _actionForNotices([notice]),
       );
-      if (notice.code == 'authentication' && _onAuthenticationExpired != null) {
-        await _onAuthenticationExpired!();
+      if (notice.code == 'network') {
+        _networkFailureSession = session;
+      } else {
+        _networkFailureSession = null;
       }
+    }
+  }
+
+  Future<SyncNotice?> _recordRecoveryBestEffort(
+    SessionSnapshot session, {
+    DateTime? successfulAt,
+    required List<Map<String, String>> notices,
+  }) async {
+    try {
+      await _statusStore.recordRecovery(
+        session,
+        successfulAt: successfulAt,
+        notices: notices,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+      return null;
+    } on StaleSessionException {
+      rethrow;
+    } on Object catch (error) {
+      return _noticeForError(error);
     }
   }
 
@@ -297,20 +413,113 @@ class SyncProvider extends ChangeNotifier {
     required SyncRecoveryAction recoveryAction,
     DateTime? successfulAt,
   }) async {
-    final counts = await _syncService.dbService.getSyncRecoveryCounts(
-      session.franchiseeId,
-    );
+    Map<String, int> counts;
+    try {
+      counts = await _statusStore.counts(session.franchiseeId);
+    } on Object catch (error) {
+      if (!_isCurrent(session)) return;
+      final storageNotice = _noticeForError(error);
+      try {
+        await _recordRecoveryBestEffort(
+          session,
+          notices: [
+            {
+              'code': storageNotice.code,
+              'collection': storageNotice.collection ?? '',
+            },
+          ],
+        );
+      } on StaleSessionException {
+        return;
+      }
+      if (!_isCurrent(session)) return;
+      _publishFinished(
+        kind: SyncViewKind.needsAttention,
+        notices: [storageNotice],
+        recoveryAction: SyncRecoveryAction.restorePhoto,
+        successfulAt: successfulAt,
+      );
+      return;
+    }
     if (!_isCurrent(session)) return;
+    _publishFinished(
+      kind: kind,
+      notices: notices,
+      recoveryAction: recoveryAction,
+      successfulAt: successfulAt,
+      counts: counts,
+    );
+  }
+
+  void _publishFinished({
+    required SyncViewKind kind,
+    required List<SyncNotice> notices,
+    required SyncRecoveryAction recoveryAction,
+    DateTime? successfulAt,
+    Map<String, int>? counts,
+  }) {
     _viewState = _viewState.copyWith(
       kind: kind,
       phase: null,
       lastSuccessfulAt: successfulAt ?? _viewState.lastSuccessfulAt,
-      pendingRecordCount: counts['dirty_records'] ?? 0,
-      pendingPhotoCount: counts['pending_photos'] ?? 0,
+      pendingRecordCount:
+          counts?['dirty_records'] ?? _viewState.pendingRecordCount,
+      pendingPhotoCount:
+          counts?['pending_photos'] ?? _viewState.pendingPhotoCount,
       notices: notices,
       recoveryAction: recoveryAction,
     );
     notifyListeners();
+  }
+
+  void _onConnectionChanged(bool connected) {
+    if (!connected) return;
+    final session = _networkFailureSession;
+    if (session == null) return;
+    if (!_isCurrent(session)) {
+      _networkFailureSession = null;
+      return;
+    }
+    _networkFailureSession = null;
+    unawaited(_publishConnectionRestored(session));
+  }
+
+  Future<void> _publishConnectionRestored(SessionSnapshot session) async {
+    if (!_isCurrent(session)) return;
+    const notice = SyncNotice(code: 'connection_restored');
+    SyncNotice? persistenceNotice;
+    try {
+      persistenceNotice = await _recordRecoveryBestEffort(
+        session,
+        notices: const [
+          {'code': 'connection_restored', 'collection': ''},
+        ],
+      );
+    } on StaleSessionException {
+      return;
+    }
+    if (!_isCurrent(session)) return;
+    final current = persistenceNotice ?? notice;
+    await _setFinished(
+      session,
+      kind: SyncViewKind.needsAttention,
+      notices: [current],
+      recoveryAction: _actionForNotices([current]),
+    );
+  }
+
+  /// Only the fenced APP-106 logout action has an external side effect. The
+  /// other recovery actions are navigational/operator guidance and must never
+  /// silently retry a request.
+  Future<void> performRecoveryAction(SyncRecoveryAction action) async {
+    if (action != SyncRecoveryAction.signInAgain ||
+        _viewState.recoveryAction != action) {
+      return;
+    }
+    final session = _session;
+    final callback = _onAuthenticationExpired;
+    if (session == null || callback == null || !_isCurrent(session)) return;
+    await callback();
   }
 
   List<SyncNotice> _notices(Object? raw) {
@@ -355,7 +564,9 @@ class SyncProvider extends ChangeNotifier {
         codes.contains('uploaded_asset_deleted')) {
       return SyncRecoveryAction.restorePhoto;
     }
-    if (codes.contains('network') || codes.contains('protocol')) {
+    if (codes.contains('network') ||
+        codes.contains('connection_restored') ||
+        codes.contains('protocol')) {
       return SyncRecoveryAction.retry;
     }
     return SyncRecoveryAction.none;
@@ -388,7 +599,9 @@ class SyncProvider extends ChangeNotifier {
     if (error is TimeoutException || error is SocketException) {
       return const SyncNotice(code: 'network');
     }
-    if (error is FileSystemException || error is FormatException) {
+    if (error is DatabaseException ||
+        error is FileSystemException ||
+        error is FormatException) {
       return const SyncNotice(code: 'local_storage');
     }
     return const SyncNotice(code: 'protocol');
@@ -396,8 +609,10 @@ class SyncProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _syncService.sessionManager
         ?.removeInvalidationListener(_clearForInvalidation);
+    _connectionSubscription.cancel();
     super.dispose();
   }
 }

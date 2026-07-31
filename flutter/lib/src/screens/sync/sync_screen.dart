@@ -16,6 +16,8 @@ class SyncScreen extends StatelessWidget {
         builder: (context, syncProvider, _) {
           final state = syncProvider.viewState;
           final action = _actionFor(state.recoveryAction);
+          final updateBlocked =
+              state.recoveryAction == SyncRecoveryAction.updateRequired;
           return ListView(
             padding: const EdgeInsets.all(24),
             children: [
@@ -93,25 +95,33 @@ class SyncScreen extends StatelessWidget {
                 button: true,
                 label: state.isRunning
                     ? 'Sync in progress. Repeated sync requests are ignored.'
-                    : 'Sync now',
+                    : updateBlocked
+                        ? 'Sync blocked. An app update is required. Use update guidance.'
+                        : 'Sync now',
                 child: FilledButton.icon(
-                  onPressed: state.isRunning
+                  onPressed: state.isRunning || updateBlocked
                       ? null
                       : () => _runSync(context, syncProvider),
                   icon: const Icon(Icons.sync),
-                  label: Text(state.recoveryAction == SyncRecoveryAction.retry
-                      ? 'Retry sync'
-                      : 'Sync now'),
+                  label: Text(updateBlocked
+                      ? 'Sync blocked until update'
+                      : state.recoveryAction == SyncRecoveryAction.retry
+                          ? 'Retry sync'
+                          : 'Sync now'),
                 ),
               ),
               if (action != null) ...[
                 const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: state.isRunning
-                      ? null
-                      : () => _recover(context, syncProvider, action),
-                  icon: Icon(action.icon),
-                  label: Text(action.label),
+                Semantics(
+                  button: true,
+                  label: action.semanticsLabel ?? action.label,
+                  child: OutlinedButton.icon(
+                    onPressed: state.isRunning
+                        ? null
+                        : () => _recover(context, syncProvider, action),
+                    icon: Icon(action.icon),
+                    label: Text(action.label),
+                  ),
                 ),
               ],
             ],
@@ -139,11 +149,58 @@ class SyncScreen extends StatelessWidget {
       case _RecoveryKind.retry:
         await _runSync(context, syncProvider);
         return;
+      case _RecoveryKind.signIn:
+        await syncProvider
+            .performRecoveryAction(SyncRecoveryAction.signInAgain);
+        return;
+      case _RecoveryKind.update:
+        await _showGuidance(
+          context,
+          title: 'Update required',
+          message:
+              'Sync is blocked until this app is updated. Install the approved update, then return and retry sync.',
+        );
+        return;
+      case _RecoveryKind.contact:
+        await _showGuidance(
+          context,
+          title: 'Contact administrator',
+          message:
+              'This account is not authorised to sync this work. Contact an administrator to review access, then retry only after access is restored.',
+        );
+        return;
       case _RecoveryKind.review:
       case _RecoveryKind.restore:
-        if (context.mounted) Navigator.of(context).pop();
+        await _showGuidance(
+          context,
+          title: action.kind == _RecoveryKind.review
+              ? 'Review affected records'
+              : 'Restore or re-add photo',
+          message: action.kind == _RecoveryKind.review
+              ? 'Review the affected record, correct it if needed, then retry sync manually.'
+              : 'Restore the original photo or remove and add it again, then retry sync manually.',
+        );
     }
   }
+
+  Future<void> _showGuidance(
+    BuildContext context, {
+    required String title,
+    required String message,
+  }) =>
+      showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
 
   _RecoveryAction? _actionFor(SyncRecoveryAction action) => switch (action) {
         SyncRecoveryAction.retry => const _RecoveryAction(
@@ -160,6 +217,24 @@ class SyncScreen extends StatelessWidget {
             kind: _RecoveryKind.restore,
             label: 'Restore or re-add photo',
             icon: Icons.photo_outlined,
+          ),
+        SyncRecoveryAction.signInAgain => const _RecoveryAction(
+            kind: _RecoveryKind.signIn,
+            label: 'Sign in again',
+            semanticsLabel: 'Sign in again to continue syncing',
+            icon: Icons.login,
+          ),
+        SyncRecoveryAction.contactAdministrator => const _RecoveryAction(
+            kind: _RecoveryKind.contact,
+            label: 'Contact administrator',
+            semanticsLabel: 'Contact an administrator about sync access',
+            icon: Icons.support_agent,
+          ),
+        SyncRecoveryAction.updateRequired => const _RecoveryAction(
+            kind: _RecoveryKind.update,
+            label: 'View update guidance',
+            semanticsLabel: 'View required update guidance',
+            icon: Icons.system_update_alt,
           ),
         _ => null,
       };
@@ -208,16 +283,18 @@ class _StatusRow extends StatelessWidget {
       );
 }
 
-enum _RecoveryKind { retry, review, restore }
+enum _RecoveryKind { retry, review, restore, signIn, update, contact }
 
 class _RecoveryAction {
   const _RecoveryAction({
     required this.kind,
     required this.label,
     required this.icon,
+    this.semanticsLabel,
   });
 
   final _RecoveryKind kind;
   final String label;
   final IconData icon;
+  final String? semanticsLabel;
 }

@@ -4,7 +4,11 @@ import path from 'path';
 import { createHash } from 'crypto';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { Client, ClientPhotoUpload, sequelize } from '../models';
-import { removeUploadedPhoto } from '../middleware/photoUploadMiddleware';
+import {
+	promoteUploadedPhoto,
+	removeStoredPhoto,
+	removeUploadedPhoto,
+} from '../middleware/photoUploadMiddleware';
 import {
 	queueManagedFileCleanup,
 	reconcileManagedFileCleanupByStorageKeys,
@@ -71,19 +75,81 @@ const safeFilePath = (filename: string) => {
 	return path.dirname(filePath) === uploadsDirectory ? filePath : null;
 };
 
+/**
+ * APP-112 receipts are additive. Deployed APP-111/V1 clients do not yet send
+ * operation headers, so retain their prior tenant-bound, validated upload
+ * behavior until the separate enforcement rollout. They cannot accidentally
+ * enter receipt mode: any supplied Idempotency-Key takes the strict path.
+ */
+const uploadLegacyPhoto = async ({
+	req,
+	res,
+	file,
+	franchiseeId,
+	canonicalPath,
+}: {
+	req: AuthRequest;
+	res: Response;
+	file: Express.Multer.File;
+	franchiseeId: string;
+	canonicalPath: string;
+}) => {
+	let promoted = false;
+	try {
+		// This matches the pre-APP-112 write ordering: a legacy file is made
+		// available before its metadata transaction, and is removed if that
+		// transaction cannot commit.
+		await promoteUploadedPhoto(file);
+		promoted = true;
+		const result = await sequelize.transaction(async (transaction) => {
+			const state = await lockTenantSyncState(franchiseeId, transaction);
+			const client = await Client.findOne({
+				where: { id: req.params.client_id, franchiseeId },
+				transaction,
+				lock: transaction.LOCK.UPDATE,
+			});
+			if (!client) return null;
+			const photos = parsePhotos(client.photos);
+			if (photos.length >= MAX_CLIENT_PHOTOS) throw new Error('client_photo_limit');
+			const nextCursor = nextTenantSyncCursor(state.cursor);
+			await client.update(
+				{
+					photos: JSON.stringify([...new Set([...photos, canonicalPath])]),
+					syncCursor: nextCursor.toString(),
+				},
+				{ transaction },
+			);
+			await state.update({ cursor: nextCursor.toString() }, { transaction });
+			return {
+				cursor: nextCursor.toString(),
+				record: serializeLwwRecord('clients', client),
+			};
+		});
+		if (!result) {
+			await removeStoredPhoto(file.filename);
+			return res
+				.status(403)
+				.json({ error: 'Unauthorized: Client does not belong to your franchisee' });
+		}
+		return res.status(201).json({
+			url: canonicalPath,
+			response_cursor: result.cursor,
+			authoritative: result.record,
+		});
+	} catch (error) {
+		if (promoted) await removeStoredPhoto(file.filename);
+		else await removeUploadedPhoto(file);
+		if (error instanceof Error && error.message === 'client_photo_limit') {
+			return res.status(409).json({ error: 'A client may store at most 100 photos' });
+		}
+		console.error('Photo upload error:', error);
+		return res.status(500).json({ error: 'An error occurred during photo upload' });
+	}
+};
+
 export const uploadPhoto = async (req: AuthRequest, res: Response) => {
 	const file = req.file;
 	if (!file) return res.status(400).json({ error: 'No image file uploaded' });
-	const uploadId = req.get('Idempotency-Key')?.trim().toLowerCase();
-	if (!uploadId || !uuidV4.test(uploadId)) {
-		await removeUploadedPhoto(file);
-		return res.status(400).json({
-			error: {
-				code: 'invalid_idempotency_key',
-				message: 'A valid upload id is required.',
-			},
-		});
-	}
 	if (!(await validImageContent(file))) {
 		await removeUploadedPhoto(file);
 		return res
@@ -96,6 +162,21 @@ export const uploadPhoto = async (req: AuthRequest, res: Response) => {
 		await removeUploadedPhoto(file);
 		return res.status(401).json({ error: 'Unauthorized' });
 	}
+	const canonicalPath = photoPath(req.params.client_id, file.filename);
+	const rawUploadId = req.get('Idempotency-Key');
+	if (rawUploadId == null) {
+		return uploadLegacyPhoto({ req, res, file, franchiseeId, canonicalPath });
+	}
+	const uploadId = rawUploadId.trim().toLowerCase();
+	if (!uuidV4.test(uploadId)) {
+		await removeUploadedPhoto(file);
+		return res.status(400).json({
+			error: {
+				code: 'invalid_idempotency_key',
+				message: 'A valid upload id is required.',
+			},
+		});
+	}
 	const digest = await fileSha256(file);
 	const suppliedDigest = req.get('X-Photo-SHA256')?.trim().toLowerCase();
 	if (!suppliedDigest || !/^[0-9a-f]{64}$/.test(suppliedDigest) || suppliedDigest !== digest) {
@@ -107,7 +188,6 @@ export const uploadPhoto = async (req: AuthRequest, res: Response) => {
 			},
 		});
 	}
-	const canonicalPath = photoPath(req.params.client_id, file.filename);
 	let receiptCommitted = false;
 	try {
 		const result = await withClientPhotoUploadReceiptLock(franchiseeId, uploadId, () =>

@@ -241,7 +241,11 @@ class SyncService {
     // same SQLite transaction that applies a successful cursor-zero snapshot.
     try {
       onPhase?.call(SyncPhase.sendingChanges);
-      await _syncV1(session);
+      await _syncV1(
+        session,
+        drainDurablePhotoUploads: supportsV2,
+        onPhase: onPhase,
+      );
     } on ApiException catch (error) {
       if (supportsV2 &&
           error.statusCode == 426 &&
@@ -288,7 +292,11 @@ class SyncService {
     return const SyncRunResult();
   }
 
-  Future<void> _syncV1(SessionSnapshot? session) async {
+  Future<void> _syncV1(
+    SessionSnapshot? session, {
+    required bool drainDurablePhotoUploads,
+    SyncPhaseListener? onPhase,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     final activeFranchiseeId =
         session?.franchiseeId ?? prefs.getString('franchisee_id')?.trim();
@@ -306,6 +314,24 @@ class SyncService {
     final warrantyTombstoneCursor = shouldFilterByFranchise
         ? await dbService.getWarrantyTombstoneCursor(activeFranchiseeId)
         : '0';
+
+    if (drainDurablePhotoUploads) {
+      // An upgraded client must drain V1 media through the APP-112 durable
+      // operation queue before it can send a legacy client payload or activate
+      // V2. A failure is deliberately terminal for this run: silently omitting
+      // the photo would make bootstrap appear complete while losing its change.
+      onPhase?.call(SyncPhase.uploadingPhotos);
+      final photoResult = await _uploadPendingV2ClientPhotos(
+        activeFranchiseeId!,
+        session,
+        requireDurableReceipt: true,
+      );
+      if (photoResult.error != null) {
+        Error.throwWithStackTrace(photoResult.error!, photoResult.stackTrace!);
+      }
+      _requireCurrent(session);
+      onPhase?.call(SyncPhase.sendingChanges);
+    }
 
     // Build active-session maps once so all payloads resolve IDs consistently.
     final activeClients = shouldFilterByFranchise && enforceSessionBoundary
@@ -465,6 +491,12 @@ class SyncService {
           continue;
         }
 
+        if (drainDurablePhotoUploads) {
+          // Queue acknowledgement rewrites the local path before this V1
+          // payload is assembled. Seeing one here means the durable drain did
+          // not converge, so do not submit or activate a partial bootstrap.
+          throw StateError('A V1 photo upload did not drain safely.');
+        }
         try {
           canonicalPhotos.add(
             await _uploadPhoto(client.remoteId, photo, session, null, null),
@@ -1829,8 +1861,9 @@ class SyncService {
 
   Future<_PhotoUploadResult> _uploadPendingV2ClientPhotos(
     String franchiseeId,
-    SessionSnapshot? session,
-  ) async {
+    SessionSnapshot? session, {
+    bool requireDurableReceipt = false,
+  }) async {
     var authoritativeChanged = false;
     for (final pending in await dbService.getPendingClientPhotoUploads(
       franchiseeId,
@@ -1874,7 +1907,7 @@ class SyncService {
           continue;
         }
         String? digest;
-        if (session != null) {
+        if (session != null || requireDurableReceipt) {
           final bytes = await File(photo).readAsBytes();
           _requireCurrent(session);
           digest = sha256.convert(bytes).toString();
@@ -1888,14 +1921,24 @@ class SyncService {
             throw StateError(
                 'A durable photo upload is missing its upload ID.');
           }
-          await dbService.persistPendingPhotoUploadDigestForSession(
-            franchiseeId: franchiseeId,
-            remoteId: remoteId,
-            uploadId: uploadId,
-            localPath: photo,
-            fileSha256: digest,
-            isSessionCurrent: () => _isCurrent(session),
-          );
+          if (session == null) {
+            await dbService.persistPendingPhotoUploadDigest(
+              franchiseeId: franchiseeId,
+              remoteId: remoteId,
+              uploadId: uploadId,
+              localPath: photo,
+              fileSha256: digest,
+            );
+          } else {
+            await dbService.persistPendingPhotoUploadDigestForSession(
+              franchiseeId: franchiseeId,
+              remoteId: remoteId,
+              uploadId: uploadId,
+              localPath: photo,
+              fileSha256: digest,
+              isSessionCurrent: () => _isCurrent(session),
+            );
+          }
           _requireCurrent(session);
         }
         final canonical = await _uploadPhoto(

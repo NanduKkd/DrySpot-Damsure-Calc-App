@@ -1,10 +1,12 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/services/db_service.dart';
 import 'package:app_client/src/services/lww_protocol.dart';
+import 'package:app_client/src/services/session_manager.dart';
 import 'package:app_client/src/services/sync_service.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -19,6 +21,7 @@ class V2ApiService extends ApiService {
   final List<Map<String, dynamic>> v2Requests = [];
   final List<List<String>> photoUploads = [];
   final List<String?> photoOperationIds = [];
+  final List<String?> photoDigests = [];
   final List<String> proposalDeletes = [];
   Future<Map<String, dynamic>> Function(Map<String, dynamic>)? v1Handler;
   Future<Map<String, dynamic>> Function(Map<String, dynamic>)? v2Handler;
@@ -32,7 +35,28 @@ class V2ApiService extends ApiService {
   }
 
   @override
+  Future<Map<String, dynamic>> syncForSession(
+    Map<String, dynamic> data,
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    lastV1 = data;
+    return v1Handler!(data);
+  }
+
+  @override
   Future<Map<String, dynamic>> syncV2(Map<String, dynamic> data) async {
+    lastV2 = data;
+    v2Requests.add(data);
+    return v2Handler!(data);
+  }
+
+  @override
+  Future<Map<String, dynamic>> syncV2ForSession(
+    Map<String, dynamic> data,
+    SessionSnapshot session, {
+    required bool Function() isSessionCurrent,
+  }) async {
     lastV2 = data;
     v2Requests.add(data);
     return v2Handler!(data);
@@ -53,6 +77,22 @@ class V2ApiService extends ApiService {
   ) async {
     photoUploads.add([clientId, filePath]);
     photoOperationIds.add(idempotencyKey);
+    photoDigests.add(fileSha256);
+    return photoHandler!(clientId, filePath);
+  }
+
+  @override
+  Future<String> uploadClientPhotoForSession(
+    String clientId,
+    String filePath,
+    SessionSnapshot session, {
+    String? idempotencyKey,
+    String? fileSha256,
+    required bool Function() isSessionCurrent,
+  }) async {
+    photoUploads.add([clientId, filePath]);
+    photoOperationIds.add(idempotencyKey);
+    photoDigests.add(fileSha256);
     return photoHandler!(clientId, filePath);
   }
 
@@ -71,6 +111,13 @@ void main() {
   const remoteId = '40000000-0000-4000-8000-000000000002';
   const serverWriter = '40000000-0000-4000-8000-000000000003';
   const serverChange = '40000000-0000-4000-8000-000000000004';
+  const v1Session = SessionSnapshot(
+    token: 'v1-session-token',
+    userName: null,
+    franchiseeId: tenant,
+    franchiseeName: null,
+    generation: 7,
+  );
   final now = DateTime.utc(2026, 7, 30).toIso8601String();
 
   late Database database;
@@ -1615,6 +1662,159 @@ void main() {
       (await dbService.getPendingLwwChanges(tenant))['items'],
       hasLength(1),
     );
+  });
+
+  Future<Map<String, dynamic>> v1AppliedResponse(
+    Map<String, dynamic> request,
+  ) async {
+    final changes = request['changes'] as Map<String, dynamic>;
+    return {
+      'server_time': now,
+      'warranty_tombstone_cursor': '0',
+      'outcomes': {
+        for (final entry in changes.entries)
+          entry.key: [
+            for (final change in entry.value as List)
+              {
+                'remote_id': change['remote_id'],
+                'status': 'applied',
+              }
+          ],
+      },
+      'updates': {
+        'clients': [],
+        'items': [],
+        'rectangles': [],
+        'default_prices': [],
+        'warranties': [],
+        'warranty_tombstones': [],
+        'proposals': [],
+      },
+    };
+  }
+
+  Future<File> v1PhotoFile(String suffix) async {
+    final file = File(
+      '${Directory.systemTemp.path}/app112-v1-photo-$suffix-${DateTime.now().microsecondsSinceEpoch}.jpg',
+    );
+    await file.writeAsBytes(const [0xff, 0xd8, 0xff, 0xe0, 0x00]);
+    addTearDown(() async {
+      if (await file.exists()) await file.delete();
+    });
+    return file;
+  }
+
+  test(
+      'V1 bootstrap drains a dirty photo with its durable operation and digest',
+      () async {
+    final file = await v1PhotoFile('success');
+    const canonical =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000071.jpg';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'V1 dirty photo',
+      photos: [file.path],
+      updatedAt: DateTime.parse(now),
+    ));
+    final queued =
+        (await dbService.getPendingClientPhotoUploads(tenant)).single;
+    apiService.photoHandler = (_, path) async {
+      expect(path, file.path);
+      return canonical;
+    };
+    apiService.v1Handler = v1AppliedResponse;
+    apiService.v2Handler = (request) async => responseFor(request, cursor: '1');
+
+    final phases = <SyncPhase>[];
+    await SyncService(apiService: apiService, dbService: dbService).sync(
+      v1Session,
+      phases.add,
+    );
+
+    expect(apiService.photoOperationIds, [queued['upload_id']]);
+    expect(apiService.photoDigests, [
+      sha256.convert(await file.readAsBytes()).toString(),
+    ]);
+    expect(
+      apiService.lastV1!['changes']['clients'].single['photos'],
+      contains(canonical),
+    );
+    expect(await dbService.getPendingClientPhotoUploads(tenant), isEmpty);
+    expect(await dbService.isSyncV2Enabled(tenant), isTrue);
+    expect(
+      phases,
+      containsAllInOrder([
+        SyncPhase.preparing,
+        SyncPhase.sendingChanges,
+        SyncPhase.uploadingPhotos,
+        SyncPhase.sendingChanges,
+      ]),
+    );
+  });
+
+  test('V1 photo response loss retries exactly one durable upload operation',
+      () async {
+    final file = await v1PhotoFile('ambiguous');
+    const canonical =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000072.jpg';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'V1 ambiguous photo',
+      photos: [file.path],
+      updatedAt: DateTime.parse(now),
+    ));
+    var attempts = 0;
+    apiService.photoHandler = (_, __) async {
+      attempts += 1;
+      if (attempts == 1) {
+        throw StateError('response lost after server commit');
+      }
+      return canonical;
+    };
+    apiService.v1Handler = v1AppliedResponse;
+    apiService.v2Handler = (request) async => responseFor(request, cursor: '1');
+    final service = SyncService(apiService: apiService, dbService: dbService);
+
+    await expectLater(service.sync(v1Session), throwsA(isA<StateError>()));
+    expect(apiService.lastV1, isNull,
+        reason: 'V1 must not activate after an unacknowledged photo upload');
+    expect(await dbService.isSyncV2Enabled(tenant), isFalse);
+
+    await service.sync(v1Session);
+
+    expect(apiService.photoOperationIds, hasLength(2));
+    expect(apiService.photoOperationIds.toSet(), hasLength(1));
+    expect(await dbService.getPendingClientPhotoUploads(tenant), isEmpty);
+    expect(await dbService.isSyncV2Enabled(tenant), isTrue);
+  });
+
+  test('V1 photo failure prevents legacy payload submission and V2 activation',
+      () async {
+    final file = await v1PhotoFile('failure');
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'V1 blocked photo',
+      photos: [file.path],
+      updatedAt: DateTime.parse(now),
+    ));
+    apiService.photoHandler = (_, __) async => throw const ApiException(
+          'offline',
+        );
+    apiService.v1Handler = v1AppliedResponse;
+    apiService.v2Handler = (request) async => responseFor(request, cursor: '1');
+
+    await expectLater(
+      SyncService(apiService: apiService, dbService: dbService).sync(v1Session),
+      throwsA(isA<ApiException>()),
+    );
+
+    expect(apiService.lastV1, isNull);
+    expect(apiService.lastV2, isNull);
+    expect(await dbService.isSyncV2Enabled(tenant), isFalse);
+    expect(await dbService.getPendingClientPhotoUploads(tenant), hasLength(1));
   });
 
   test('v1 drains before bootstrap and malformed v2 fails without activation',

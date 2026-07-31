@@ -12,7 +12,10 @@ import {
 	TenantSyncState,
 	User,
 } from '../models';
-import { reconcileStagedClientPhotoUploads } from '../services/clientPhotoUploadReceipt';
+import {
+	finalizeClientPhotoUploadReceipt,
+	reconcileStagedClientPhotoUploads,
+} from '../services/clientPhotoUploadReceipt';
 import { photoUploadStagingPath, stagedPhotoPath } from '../middleware/photoUploadMiddleware';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
@@ -71,6 +74,12 @@ describe('client photo storage', () => {
 			.set('X-Photo-SHA256', createHash('sha256').update(body).digest('hex'))
 			.attach('file', body, { filename, contentType: 'image/jpeg' });
 
+	const uploadLegacy = (token: string, body: Buffer, filename: string) =>
+		request(app)
+			.post(`/api/photos/client/${clientId}`)
+			.set('Authorization', `Bearer ${token}`)
+			.attach('file', body, { filename, contentType: 'image/jpeg' });
+
 	it('stores an opaque canonical photo URL and serves it only to the owner tenant', async () => {
 		const response = await upload(
 			ownerToken,
@@ -92,6 +101,33 @@ describe('client photo storage', () => {
 			(await request(app).get(response.body.url).set('Authorization', `Bearer ${otherToken}`))
 				.status,
 		).toBe(404);
+	});
+
+	it('keeps the deployed headerless upload contract while requiring a digest for receipt uploads', async () => {
+		const body = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]);
+		const legacy = await uploadLegacy(ownerToken, body, 'older-client.jpg');
+		expect(legacy.status).toBe(201);
+		expect(legacy.body.url).toMatch(
+			new RegExp(`^/api/photos/client/${clientId}/[0-9a-f-]{36}\\.jpg$`),
+		);
+		expect(
+			await ClientPhotoUpload.count({ where: { canonicalUrl: legacy.body.url } }),
+		).toBe(0);
+		expect(
+			(
+				await request(app)
+					.get(legacy.body.url)
+					.set('Authorization', `Bearer ${ownerToken}`)
+			).status,
+		).toBe(200);
+
+		const claimedWithoutDigest = await request(app)
+			.post(`/api/photos/client/${clientId}`)
+			.set('Authorization', `Bearer ${ownerToken}`)
+			.set('Idempotency-Key', randomUUID())
+			.attach('file', body, { filename: 'claimed-operation.jpg', contentType: 'image/jpeg' });
+		expect(claimedWithoutDigest.status).toBe(400);
+		expect(claimedWithoutDigest.body.error.code).toBe('invalid_photo_digest');
 	});
 
 	it('replays one logical upload after an ambiguous response without duplicate media', async () => {
@@ -167,6 +203,9 @@ describe('client photo storage', () => {
 			Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]),
 		);
 		const uploadId = randomUUID();
+		await (await Client.findByPk(clientId))!.update({
+			photos: JSON.stringify([canonical]),
+		});
 		await ClientPhotoUpload.create({
 			franchiseeId: firstFranchisee,
 			uploadId,
@@ -286,6 +325,30 @@ describe('client photo storage', () => {
 		expect(fs.existsSync(path.join(uploadsDirectory, filename))).toBe(false);
 		expect(JSON.parse((await Client.findByPk(clientId))!.photos)).not.toContain(url);
 		const replay = await upload(ownerToken, body, 'camera.png', uploadId);
+		expect(replay.status).toBe(410);
+		expect(replay.body.error.code).toBe('uploaded_asset_deleted');
+	});
+
+	it('makes a terminal media deletion win over a stale receipt finalizer', async () => {
+		const body = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]);
+		const uploadId = randomUUID();
+		const created = await upload(ownerToken, body, 'delete-wins.jpg', uploadId);
+		expect(created.status).toBe(201);
+		const staleReceipt = (await ClientPhotoUpload.findOne({
+			where: { franchiseeId: firstFranchisee, uploadId },
+		}))!;
+		// Model a finalizer that read a staged instance just before a concurrent
+		// media deletion. The finalizer must freshly lock and re-read it.
+		await staleReceipt.update({ status: 'staged' });
+		await request(app).delete(created.body.url).set('Authorization', `Bearer ${ownerToken}`);
+
+		expect(await finalizeClientPhotoUploadReceipt(staleReceipt)).toBe('deleted');
+		const receipt = await ClientPhotoUpload.findOne({
+			where: { franchiseeId: firstFranchisee, uploadId },
+		});
+		expect(receipt?.status).toBe('deleted');
+		expect(JSON.parse((await Client.findByPk(clientId))!.photos)).not.toContain(created.body.url);
+		const replay = await upload(ownerToken, body, 'delete-wins.jpg', uploadId);
 		expect(replay.status).toBe(410);
 		expect(replay.body.error.code).toBe('uploaded_asset_deleted');
 	});

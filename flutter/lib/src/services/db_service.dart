@@ -1229,6 +1229,21 @@ class DbService {
   /// Writes the immutable content digest before the first multipart request.
   /// A path whose bytes change must be deliberately removed and re-added,
   /// creating a fresh upload ID rather than rebinding an existing receipt.
+  Future<void> persistPendingPhotoUploadDigest({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+  }) =>
+      _persistPendingPhotoUploadDigest(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        uploadId: uploadId,
+        localPath: localPath,
+        fileSha256: fileSha256,
+      );
+
   Future<void> persistPendingPhotoUploadDigestForSession({
     required String franchiseeId,
     required String remoteId,
@@ -1236,14 +1251,35 @@ class DbService {
     required String localPath,
     required String fileSha256,
     required bool Function() isSessionCurrent,
+  }) =>
+      _persistPendingPhotoUploadDigest(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        uploadId: uploadId,
+        localPath: localPath,
+        fileSha256: fileSha256,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _persistPendingPhotoUploadDigest({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+    bool Function()? isSessionCurrent,
   }) async {
     if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(fileSha256)) {
       throw const FormatException('A photo digest is invalid.');
     }
-    if (!isSessionCurrent()) throw const StaleSessionException();
+    if (isSessionCurrent?.call() == false) {
+      throw const StaleSessionException();
+    }
     final db = await database;
     await db.transaction((transaction) async {
-      if (!isSessionCurrent()) throw const StaleSessionException();
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
       if (!await _supportsDurablePhotoUploads(transaction)) {
         throw StateError('The durable photo queue is unavailable.');
       }
@@ -1275,7 +1311,9 @@ class DbService {
         ''',
         whereArgs: [franchiseeId, remoteId, localPath, uploadId],
       );
-      if (!isSessionCurrent()) throw const StaleSessionException();
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
     });
   }
 
@@ -1297,26 +1335,19 @@ class DbService {
         // A recovery projection must never make the APP-111 cursor unreadable.
       }
     }
-    final notices = await _supportsSyncNotices(db)
-        ? await db.query(
-            'sync_notices',
-            columns: ['code', 'collection_name', 'created_at'],
-            where: 'franchisee_id = ?',
-            whereArgs: [franchiseeId],
-            orderBy: 'created_at DESC, id DESC',
-            limit: 20,
-          )
-        : const <Map<String, Object?>>[];
+    final currentNotices = status['current_notices'];
     return {
       'last_attempt_at': status['last_attempt_at'],
       'last_successful_at': status['last_successful_at'],
       'notices': [
-        for (final notice in notices)
-          {
-            'code': notice['code'],
-            'collection': notice['collection_name'],
-            'created_at': notice['created_at'],
-          },
+        if (currentNotices is List)
+          for (final notice in currentNotices)
+            if (notice is Map && notice['code'] is String)
+              {
+                'code': notice['code'],
+                if (notice['collection'] is String)
+                  'collection': notice['collection'],
+              },
       ],
     };
   }
@@ -1383,6 +1414,7 @@ class DbService {
       _recordSyncRecoveryForSession(
         franchiseeId,
         attemptedAt: at ?? DateTime.now().toUtc(),
+        notices: null,
         isSessionCurrent: isSessionCurrent,
       );
 
@@ -1406,7 +1438,7 @@ class DbService {
     String franchiseeId, {
     DateTime? attemptedAt,
     DateTime? successfulAt,
-    List<Map<String, String>> notices = const [],
+    List<Map<String, String>>? notices,
     required bool Function() isSessionCurrent,
   }) async {
     if (!isSessionCurrent()) throw const StaleSessionException();
@@ -1439,13 +1471,22 @@ class DbService {
           'last_attempt_at': attemptedAt.toUtc().toIso8601String(),
         if (successfulAt != null)
           'last_successful_at': successfulAt.toUtc().toIso8601String(),
+        // Recovery state is a current, tenant-scoped projection. Historical
+        // notices live separately for bounded diagnostics, but may never
+        // resurrect a resolved action after provider hydration.
+        if (current['current_notices'] is List && notices == null)
+          'current_notices': current['current_notices'],
+        if (notices != null)
+          'current_notices': _safeCurrentRecoveryNotices(notices),
       };
       await transaction.insert(
         'sync_state',
         {'key': key, 'value': jsonEncode(next)},
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
-      if (await _supportsSyncNotices(transaction)) {
+      if (notices != null &&
+          notices.isNotEmpty &&
+          await _supportsSyncNotices(transaction)) {
         for (final notice in notices) {
           await transaction.insert('sync_notices', {
             'franchisee_id': franchiseeId,
@@ -1471,6 +1512,21 @@ class DbService {
       if (!isSessionCurrent()) throw const StaleSessionException();
     });
   }
+
+  static List<Map<String, String>> _safeCurrentRecoveryNotices(
+    List<Map<String, String>> notices,
+  ) =>
+      [
+        for (final notice in notices.take(20))
+          if (notice['code'] != null &&
+              RegExp(r'^[a-z_]{1,64}$').hasMatch(notice['code']!))
+            {
+              'code': notice['code']!,
+              if (notice['collection'] != null &&
+                  RegExp(r'^[a-z_]{1,64}$').hasMatch(notice['collection']!))
+                'collection': notice['collection']!,
+            },
+      ];
 
   Future<bool> acknowledgeClientPhotoUpload({
     required String franchiseeId,
