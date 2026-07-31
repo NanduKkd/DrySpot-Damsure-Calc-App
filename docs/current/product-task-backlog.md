@@ -16,7 +16,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-110 | 8 | P0 | T3 | Integrated and independently verified locally | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
 | APP-111 | 8 | P0 | T3 | Integrated and independently verified locally; external rehearsal required | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
 | APP-112 | 8 | P1 | T2 | Integrated and independently verified locally; external device/PostgreSQL proof required | Sync status and recovery UX | PD-011; APP-106; APP-111 |
-| APP-113 | 9 | P0 | T3 | Local implementation active; external rollout gated | Optional and required Android updater | APP-104; APP-107 staging; APP-112; signing backup; pilot |
+| APP-113 | 9 | P0 | T3 | Integrated and independently verified locally; external rollout gated | Optional and required Android updater | APP-104; APP-107 staging; APP-112; signing backup; pilot |
 
 ## Task contracts
 
@@ -208,7 +208,7 @@ Frozen contract summary:
 | APP-108 | Portfolio manager | Design `019fb3bd-1ebf-7130-8fc2-1458f6351c36`; implementation `019fb437-b9e2-7223-8176-e588dfbe3fd7`; verifier `019fb497-c2fb-70b2-a45b-7a9bc7abb934` | Integrated as `e46c08d` + `e176c21` + `174a58a` + `2305f39` + `0510eec`; exact candidate `82089dbe` passed independent T3 verification; operator installation and production proof remain external |
 | APP-106 | Portfolio manager | Design `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75`; implementation `019fb52b-1c4f-7172-a185-64c970d20ae7`; verifier `019fb550-07b7-7961-90d7-da3abd6b5073` | Integrated as `b332ad7` + `c22458f` + `bf89999`; exact candidate `3d4b5ef` passed independent T2 verification; physical two-account device proof remains external |
 | APP-112 | Portfolio manager | Design `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245`; implementation `019fb59d-ef05-7431-b3ee-309ce946549c`; verifier `019fb5f7-390e-7ee0-93e3-4e28bdbf878a` | Integrated as `4a20693` + `0067350` + `7296c89` + `4bc6b41`; exact candidate `b98e692` passed independent T2 verification; PostgreSQL and physical-device proof remain external |
-| APP-113 | Portfolio manager | Design `019fb3d4-7ccd-7952-b35e-91af07a71f5a`; implementation `019fb61a-e4ed-77d0-a0e4-72cab4c51ac6`; preflight `019fb61b-1c9f-7782-9676-534fa1394aad` | T3 contract frozen; local implementation active after APP-112 integration; staging, signing-backup restoration, exact hosted artifact, and physical-device upgrade proof remain external |
+| APP-113 | Portfolio manager | Design `019fb3d4-7ccd-7952-b35e-91af07a71f5a`; implementation `019fb61a-e4ed-77d0-a0e4-72cab4c51ac6`; preflight `019fb61b-1c9f-7782-9676-534fa1394aad`; verifier `019fb633-5d93-78d3-85b9-93623f06ff85` | Integrated as `c9369ef` + `1048462` + `1956206`; exact candidate `906c6ca` passed independent T3 verification with zero P0-P3; staging, signing-backup restoration, exact production-signed/hosted artifact, and physical-device upgrade proof remain external |
 | APP-107 | Portfolio manager | Design `019fb3ee-3c42-79d2-b3d4-1b6a718ec025`; implementation `019fb3f2-1ad3-7062-9093-e35a4404421a`; verifier `019fb3ff-648b-7480-8816-9798720b993f` | Integrated as `7c224ff` + `18e5ee4` + `fe767ca` + `427e207` + `f836f9f` + `7588b5f` + `0202f20` + `7878b9b`; exact candidate `f523ec3` passed independent local verification; staging, signing, pilot, approval, and production activation remain external |
 
 Integrated evidence at `7319450`:
