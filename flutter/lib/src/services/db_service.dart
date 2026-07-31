@@ -1125,17 +1125,17 @@ class DbService {
     Client client, {
     required String franchiseeId,
     required String submittedUpdatedAt,
+    List<String>? confirmedCanonicalPhotos,
   }) async {
     final db = await database;
-    return db.update(
-      'clients',
-      client.toMap(),
-      where: '''
-        remote_id = ? AND franchisee_id = ?
-        AND updated_at = ? AND is_dirty = 1
-      ''',
-      whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
-    );
+    return db.transaction(
+        (transaction) => _applyClientFromServerIfUnchangedWithExecutor(
+              transaction,
+              client,
+              franchiseeId: franchiseeId,
+              submittedUpdatedAt: submittedUpdatedAt,
+              confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+            ));
   }
 
   Future<int> applyClientFromServerIfUnchangedForSession(
@@ -1143,6 +1143,7 @@ class DbService {
     required String franchiseeId,
     required String submittedUpdatedAt,
     required bool Function() isSessionCurrent,
+    List<String>? confirmedCanonicalPhotos,
   }) async {
     if (!isSessionCurrent()) {
       throw const StaleSessionException();
@@ -1152,14 +1153,12 @@ class DbService {
       if (!isSessionCurrent()) {
         throw const StaleSessionException();
       }
-      final changed = await transaction.update(
-        'clients',
-        client.toMap(),
-        where: '''
-          remote_id = ? AND franchisee_id = ?
-          AND updated_at = ? AND is_dirty = 1
-        ''',
-        whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
+      final changed = await _applyClientFromServerIfUnchangedWithExecutor(
+        transaction,
+        client,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
       );
       // The last validation occurs in the transaction callback, immediately
       // before SQLite commits. A logout during the awaited update rolls back.
@@ -1168,6 +1167,33 @@ class DbService {
       }
       return changed;
     });
+  }
+
+  Future<int> _applyClientFromServerIfUnchangedWithExecutor(
+    DatabaseExecutor executor,
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    List<String>? confirmedCanonicalPhotos,
+  }) async {
+    final changed = await executor.update(
+      'clients',
+      client.toMap(),
+      where: '''
+          remote_id = ? AND franchisee_id = ?
+          AND updated_at = ? AND is_dirty = 1
+        ''',
+      whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
+    );
+    if (changed == 1 && confirmedCanonicalPhotos != null) {
+      await _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+        executor,
+        franchiseeId: franchiseeId,
+        remoteId: client.remoteId,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+    }
+    return changed;
   }
 
   Future<List<Map<String, String>>> getPendingClientPhotos(
@@ -4028,14 +4054,29 @@ class DbService {
       franchiseeId: franchiseeId,
       submittedUpdatedAt: submittedUpdatedAt,
     );
-    if (changed != 1 || !await _supportsDurablePhotoUploads(executor)) {
-      return changed;
+    if (changed == 1) {
+      await _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+        executor,
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
     }
+    return changed;
+  }
+
+  Future<void> _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    if (!await _supportsDurablePhotoUploads(executor)) return;
     final confirmed = {
       for (final photo in confirmedCanonicalPhotos)
         if (_isCanonicalClientPhotoPath(photo, remoteId: remoteId)) photo,
     };
-    if (confirmed.isEmpty) return changed;
+    if (confirmed.isEmpty) return;
     final placeholders = List.filled(confirmed.length, '?').join(', ');
     await executor.delete(
       'pending_client_photos',
@@ -4045,7 +4086,6 @@ class DbService {
       ''',
       whereArgs: [franchiseeId, remoteId, ...confirmed],
     );
-    return changed;
   }
 
   Future<int> _markAsSyncedWithExecutor(

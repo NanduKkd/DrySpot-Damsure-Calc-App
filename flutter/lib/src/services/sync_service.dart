@@ -713,6 +713,9 @@ class SyncService {
                         franchiseeId: activeFranchiseeId!,
                         submittedUpdatedAt:
                             submittedClient.updatedAt.toIso8601String(),
+                        confirmedCanonicalPhotos: drainDurablePhotoUploads
+                            ? clientFromServer.photos
+                            : null,
                       )
                     : dbService.applyClientFromServerIfUnchangedForSession(
                         clientFromServer.copyWith(
@@ -721,6 +724,9 @@ class SyncService {
                         franchiseeId: activeFranchiseeId!,
                         submittedUpdatedAt:
                             submittedClient.updatedAt.toIso8601String(),
+                        confirmedCanonicalPhotos: drainDurablePhotoUploads
+                            ? clientFromServer.photos
+                            : null,
                         isSessionCurrent: () => _isCurrent(session),
                       ),
               );

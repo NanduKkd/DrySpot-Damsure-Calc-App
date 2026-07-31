@@ -2001,11 +2001,12 @@ void main() {
   });
 
   test(
-      'a V1-confirmed photo completes its queue when the old-server V2 endpoint is missing',
+      'a production-shaped V1 client echo completes its photo queue when V2 is missing',
       () async {
     final file = await v1PhotoFile('missing-v2');
     const canonical =
         '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000073.jpg';
+    final echoedUpdatedAt = DateTime.utc(2030, 1, 2, 3, 4, 5).toIso8601String();
     await dbService.insertClient(Client(
       remoteId: remoteId,
       franchiseeId: tenant,
@@ -2013,32 +2014,55 @@ void main() {
       photos: [file.path],
       updatedAt: DateTime.parse(now),
     ));
-    apiService.v1Handler = (request) async => {
-          'server_time': now,
-          'warranty_tombstone_cursor': '0',
-          'outcomes': {
-            'clients': [
-              {
-                'remote_id': remoteId,
-                'status': 'applied',
-              }
-            ],
-            'items': [],
-            'rectangles': [],
-            'default_prices': [],
-            'warranties': [],
-            'proposals': [],
-          },
-          'updates': {
-            'clients': [],
-            'items': [],
-            'rectangles': [],
-            'default_prices': [],
-            'warranties': [],
-            'warranty_tombstones': [],
-            'proposals': [],
-          },
-        };
+    apiService.v1Handler = (request) async {
+      final submitted = request['changes']['clients'].single;
+      expect(submitted['updated_at'], isNot(echoedUpdatedAt));
+      return {
+        'server_time': now,
+        'warranty_tombstone_cursor': '0',
+        'outcomes': {
+          'clients': [
+            {
+              'remote_id': remoteId,
+              'status': 'applied',
+            }
+          ],
+          'items': [],
+          'rectangles': [],
+          'default_prices': [],
+          'warranties': [],
+          'proposals': [],
+        },
+        // This mirrors syncController's actual echo shape: photos is a JSON
+        // string and updated_at is the authoritative server timestamp, not
+        // the client revision used by the V1 CAS.
+        'updates': {
+          'clients': [
+            {
+              'remote_id': remoteId,
+              'franchisee_id': tenant,
+              'name': submitted['name'],
+              'address': submitted['address'],
+              'email': submitted['email'],
+              'phone': submitted['phone'],
+              'latitude': submitted['latitude'],
+              'longitude': submitted['longitude'],
+              'photos': submitted['photos'],
+              'discounted_price': submitted['discounted_price'],
+              'site_address': submitted['site_address'],
+              'updated_at': echoedUpdatedAt,
+              'deleted_at': null,
+            },
+          ],
+          'items': [],
+          'rectangles': [],
+          'default_prices': [],
+          'warranties': [],
+          'warranty_tombstones': [],
+          'proposals': [],
+        },
+      };
+    };
     apiService.photoHandler = (_, path) async {
       expect(path, file.path);
       return canonical;
@@ -2052,6 +2076,9 @@ void main() {
     await SyncService(apiService: apiService, dbService: dbService).sync();
 
     expect(await dbService.getDirtyClients(), isEmpty);
+    final clientRow = (await database.query('clients')).single;
+    expect(clientRow['updated_at'], echoedUpdatedAt);
+    expect(clientRow['is_dirty'], 0);
     expect(
       await database.query(
         'pending_client_photos',
@@ -2067,6 +2094,94 @@ void main() {
     );
     expect(await dbService.isSyncV2Enabled(tenant), isFalse);
     expect(await dbService.getSyncV2Cursor(tenant), '0');
+  });
+
+  test('a V1 echo cannot complete an uploaded photo after a local N+1 edit',
+      () async {
+    final file = await v1PhotoFile('echo-n-plus-one');
+    const canonical =
+        '/api/photos/client/$remoteId/40000000-0000-4000-8000-000000000075.jpg';
+    await dbService.insertClient(Client(
+      remoteId: remoteId,
+      franchiseeId: tenant,
+      name: 'Initial',
+      photos: [file.path],
+      updatedAt: DateTime.parse(now),
+    ));
+    apiService.photoHandler = (_, __) async => canonical;
+    apiService.v1Handler = (request) async {
+      final submitted = request['changes']['clients'].single;
+      final current =
+          (await dbService.getClientByRemoteIdForFranchisee(remoteId, tenant))!;
+      await dbService.updateClient(current.copyWith(
+        name: 'Local N+1',
+        isDirty: true,
+        updatedAt: current.updatedAt.add(const Duration(seconds: 1)),
+      ));
+      return {
+        'server_time': now,
+        'warranty_tombstone_cursor': '0',
+        'outcomes': {
+          'clients': [
+            {
+              'remote_id': remoteId,
+              'status': 'applied',
+            }
+          ],
+          'items': [],
+          'rectangles': [],
+          'default_prices': [],
+          'warranties': [],
+          'proposals': [],
+        },
+        'updates': {
+          'clients': [
+            {
+              'remote_id': remoteId,
+              'franchisee_id': tenant,
+              'name': submitted['name'],
+              'address': submitted['address'],
+              'email': submitted['email'],
+              'phone': submitted['phone'],
+              'latitude': submitted['latitude'],
+              'longitude': submitted['longitude'],
+              'photos': submitted['photos'],
+              'discounted_price': submitted['discounted_price'],
+              'site_address': submitted['site_address'],
+              'updated_at': DateTime.utc(2030).toIso8601String(),
+              'deleted_at': null,
+            },
+          ],
+          'items': [],
+          'rectangles': [],
+          'default_prices': [],
+          'warranties': [],
+          'warranty_tombstones': [],
+          'proposals': [],
+        },
+      };
+    };
+    apiService.v2Handler = (_) async => throw const ApiException(
+          'Not found',
+          statusCode: 404,
+          endpointMissing: true,
+        );
+
+    await SyncService(apiService: apiService, dbService: dbService).sync(
+      v1Session,
+    );
+
+    final client =
+        (await dbService.getClientByRemoteIdForFranchisee(remoteId, tenant))!;
+    expect(client.name, 'Local N+1');
+    expect(client.isDirty, isTrue);
+    final queue = await database.query(
+      'pending_client_photos',
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [tenant, remoteId],
+    );
+    expect(queue.single['status'], 'uploaded');
+    expect(queue.single['canonical_url'], canonical);
   });
 
   test(
