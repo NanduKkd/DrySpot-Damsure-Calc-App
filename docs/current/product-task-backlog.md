@@ -9,7 +9,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-103 | 3 | P1 | T2 | Integrated; device proof required | Android permission minimization | None |
 | APP-104 | 3 | P0 | T2 | Integrated and verified locally | Update manifest and enforcement contract | PD-003; PD-005 |
 | APP-105 | 4 | P1 | T1 | Integrated locally | PDF Unicode font support | None |
-| APP-106 | 4 | P0 | T2 | Implementation active | Shared-device session hardening | PD-010; APP-111 |
+| APP-106 | 4 | P0 | T2 | Integrated and independently verified locally; device proof required | Shared-device session hardening | PD-010; APP-111 |
 | APP-107 | 5 | P0 | T2 | Integrated and independently verified locally; external rollout gated | Update publishing and hosting workflow | APP-104; staging host; signing backup; pilot |
 | APP-108 | 6 | P0 | T3 | Integrated and independently verified locally; operator rollout gated | User provisioning and lifecycle MVP | PD-009; APP-110 integration |
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
@@ -206,7 +206,7 @@ Frozen contract summary:
 | APP-111 | Portfolio manager | Design `019fb3b0-1b41-7971-8506-627611c50f1e`; implementation `019fb435-ca57-7283-8d6d-126cd44965fc`; verifier `019fb459-820a-7d22-adbe-b19787e8e2fb` | Integrated as `ccdf14c` + `e236f26` + `b18af26` + `b782335` + `78ceaeb`; exact candidate `29d0d010` passed independent T3 verification |
 | APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Integrated as `7575cc7`; 8 focused tests and analyze pass |
 | APP-108 | Portfolio manager | Design `019fb3bd-1ebf-7130-8fc2-1458f6351c36`; implementation `019fb437-b9e2-7223-8176-e588dfbe3fd7`; verifier `019fb497-c2fb-70b2-a45b-7a9bc7abb934` | Integrated as `e46c08d` + `e176c21` + `174a58a` + `2305f39` + `0510eec`; exact candidate `82089dbe` passed independent T3 verification; operator installation and production proof remain external |
-| APP-106 | Portfolio manager | Design `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75`; implementation `019fb52b-1c4f-7172-a185-64c970d20ae7` | T2 implementation active from the verified APP-111 integration |
+| APP-106 | Portfolio manager | Design `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75`; implementation `019fb52b-1c4f-7172-a185-64c970d20ae7`; verifier `019fb550-07b7-7961-90d7-da3abd6b5073` | Integrated as `b332ad7` + `c22458f` + `bf89999`; exact candidate `3d4b5ef` passed independent T2 verification; physical two-account device proof remains external |
 | APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
 | APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
 | APP-107 | Portfolio manager | Design `019fb3ee-3c42-79d2-b3d4-1b6a718ec025`; implementation `019fb3f2-1ad3-7062-9093-e35a4404421a`; verifier `019fb3ff-648b-7480-8816-9798720b993f` | Integrated as `7c224ff` + `18e5ee4` + `fe767ca` + `427e207` + `f836f9f` + `7588b5f` + `0202f20` + `7878b9b`; exact candidate `f523ec3` passed independent local verification; staging, signing, pilot, approval, and production activation remain external |
@@ -243,6 +243,13 @@ Current integrated checkpoint after APP-111:
 - Production-flavor Flutter tests pass 167 cases; the staging-only release parser passes under the staging flavor and validated origin; `flutter analyze` reports no issues.
 - APP-111's exact candidate `29d0d010` passed independent T3 review with no findings at any severity. The reviewed matrix includes every four-entity LWW ordering case, strict tenant/parent bounds, cursors above `2^53`, rollback gaps and mixed-protocol concurrency, exact change replay, structured-426 and ambiguous-commit recovery, partial-photo failure/CAS, cross-language PostgreSQL storage canonicalization, migration abort/reapply, and APP-109/APP-110 regressions.
 - A physical two-device offline/concurrent reconnect scenario and production-restored-database upgrade/cutoff rehearsal remain deployment evidence, not local integration blockers.
+
+Current integrated checkpoint after APP-106:
+
+- Backend `npm run verify`: lint exits with warnings and no errors; 24 suites / 119 tests pass; TypeScript build passes.
+- Flutter `flutter test --no-pub`: 190 tests pass with one intentional staging-only skip; the dedicated staging-flavor parser passes; `flutter analyze --no-pub` reports no issues.
+- APP-106's exact final candidate `3d4b5ef` passed independent T2 review with no findings at any severity. The reviewed matrix includes six-entity V1 N→N+1 preservation, V1/V2 in-transaction logout rollback, tenant collision and tombstone isolation, zero stale network requests, synchronous cache invalidation, SQLite-only tenant cursors, media/PDF cleanup, and deferred protected-image fencing.
+- A physical shared Android device with two real non-production accounts must still prove A→logout→B→logout→A retention, zero cross-tenant UI/network visibility, restart behavior, and stale photo/PDF operation invalidation.
 
 ### APP-111 — Last-write-wins synchronization
 
