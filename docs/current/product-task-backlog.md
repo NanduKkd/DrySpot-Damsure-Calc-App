@@ -15,7 +15,7 @@ Weights use a relative 1–10 engineering-effort scale and include implementatio
 | APP-109 | 7 | P1 | T2 | Integrated and verified locally | Durable managed-file cleanup reconciliation | None |
 | APP-110 | 8 | P0 | T3 | Integrated and independently verified locally | Sync-safe permanent warranty deletion | PD-001; PD-006; APP-109 |
 | APP-111 | 8 | P0 | T3 | Integrated and independently verified locally; external rehearsal required | Last-write-wins synchronization | PD-002; PD-008; APP-110 |
-| APP-112 | 8 | P1 | T2 | Contract frozen; queued | Sync status and recovery UX | PD-011; APP-106; APP-111 |
+| APP-112 | 8 | P1 | T2 | Implementation active | Sync status and recovery UX | PD-011; APP-106; APP-111 |
 | APP-113 | 9 | P0 | T3 | Contract frozen; externally gated | Optional and required Android updater | APP-104; APP-107 staging; APP-112; signing backup; pilot |
 
 ## Task contracts
@@ -207,7 +207,7 @@ Frozen contract summary:
 | APP-102 | Portfolio manager | `019fb3c0-7c2f-7ad1-9dd0-97ef9edfaaa8` | Integrated as `7575cc7`; 8 focused tests and analyze pass |
 | APP-108 | Portfolio manager | Design `019fb3bd-1ebf-7130-8fc2-1458f6351c36`; implementation `019fb437-b9e2-7223-8176-e588dfbe3fd7`; verifier `019fb497-c2fb-70b2-a45b-7a9bc7abb934` | Integrated as `e46c08d` + `e176c21` + `174a58a` + `2305f39` + `0510eec`; exact candidate `82089dbe` passed independent T3 verification; operator installation and production proof remain external |
 | APP-106 | Portfolio manager | Design `019fb3c3-fa6c-70e1-8afb-19d2e9f33b75`; implementation `019fb52b-1c4f-7172-a185-64c970d20ae7`; verifier `019fb550-07b7-7961-90d7-da3abd6b5073` | Integrated as `b332ad7` + `c22458f` + `bf89999`; exact candidate `3d4b5ef` passed independent T2 verification; physical two-account device proof remains external |
-| APP-112 | Portfolio manager | `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245` | Read-only T2 contract frozen; implementation follows APP-106 and APP-111 |
+| APP-112 | Portfolio manager | Design `019fb3d0-8e9b-7430-8a7e-0a2a8d7ed245`; implementation `019fb59d-ef05-7431-b3ee-309ce946549c` | T2 implementation active from the independently verified APP-106/111 integration |
 | APP-113 | Portfolio manager | `019fb3d4-7ccd-7952-b35e-91af07a71f5a` | Read-only T3 contract frozen; implementation follows APP-112 and external staging/signing gates |
 | APP-107 | Portfolio manager | Design `019fb3ee-3c42-79d2-b3d4-1b6a718ec025`; implementation `019fb3f2-1ad3-7062-9093-e35a4404421a`; verifier `019fb3ff-648b-7480-8816-9798720b993f` | Integrated as `7c224ff` + `18e5ee4` + `fe767ca` + `427e207` + `f836f9f` + `7588b5f` + `0202f20` + `7878b9b`; exact candidate `f523ec3` passed independent local verification; staging, signing, pilot, approval, and production activation remain external |
 
