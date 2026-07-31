@@ -84,10 +84,17 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
     setState(() => _isProcessing = true);
 
     try {
-      final savedPath = await widget.photoService.addPhoto(
-        clientLocalId: clientLocalId,
-        source: source,
-      );
+      final savedPath = session == null
+          ? await widget.photoService.addPhoto(
+              clientLocalId: clientLocalId,
+              source: source,
+            )
+          : await widget.photoService.addPhotoForSession(
+              clientLocalId: clientLocalId,
+              source: source,
+              session: session,
+              isSessionCurrent: () => auth!.isCurrentSession(session),
+            );
 
       if (savedPath == null) {
         return;
@@ -176,7 +183,15 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
           );
         }
       } else {
-        await widget.photoService.deletePhoto(photoPath);
+        if (session == null) {
+          await widget.photoService.deletePhoto(photoPath);
+        } else {
+          await widget.photoService.deletePhotoForSession(
+            photoPath,
+            session: session,
+            isSessionCurrent: () => auth!.isCurrentSession(session),
+          );
+        }
       }
 
       if (!mounted ||
@@ -323,6 +338,8 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
                                             photoPath,
                                             apiService: apiService,
                                             session: session,
+                                            isSessionCurrent: () =>
+                                                auth!.isCurrentSession(session),
                                           ),
                                     fit: BoxFit.cover,
                                     errorBuilder: (context, error, stackTrace) {

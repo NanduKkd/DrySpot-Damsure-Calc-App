@@ -45,6 +45,11 @@ class DbService {
     List<Object?>? whereArgs,
     bool insert = false,
     bool delete = false,
+    String? markLocalLwwCollection,
+    int? markLocalLwwId,
+    int? syncPendingClientPhotosId,
+    bool useInsertedIdForLocalLww = false,
+    bool syncPendingPhotosForInsertedId = false,
   }) async {
     if (!isSessionCurrent()) throw const StaleSessionException();
     final db = await database;
@@ -60,6 +65,27 @@ class DbService {
                   where: where,
                   whereArgs: whereArgs,
                 );
+      final affectedId = insert ? changed : markLocalLwwId;
+      final clientPhotoId = insert
+          ? (syncPendingPhotosForInsertedId ? changed : null)
+          : syncPendingClientPhotosId;
+      // sqflite returns the inserted primary key for inserts, not an affected
+      // row count, so an inserted id greater than one is still a successful
+      // mutation that needs its dependent bookkeeping.
+      final didMutate = insert || changed == 1;
+      if (didMutate && clientPhotoId != null) {
+        await _syncPendingClientPhotos(transaction, clientPhotoId);
+      }
+      if (didMutate &&
+          markLocalLwwCollection != null &&
+          affectedId != null &&
+          (!insert || useInsertedIdForLocalLww)) {
+        await _markLocalLwwMutation(
+          transaction,
+          markLocalLwwCollection,
+          affectedId,
+        );
+      }
       // Throwing from this callback makes sqflite roll back [changed].
       if (!isSessionCurrent()) throw const StaleSessionException();
       return changed;
@@ -106,6 +132,43 @@ class DbService {
       }
       if (!isSessionCurrent()) throw const StaleSessionException();
       return id;
+    });
+  }
+
+  Future<int> softDeleteClientForSession(
+    int localId, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final rows = await transaction.query(
+        'clients',
+        columns: ['remote_id', 'franchisee_id'],
+        where: 'local_id = ?',
+        whereArgs: [localId],
+        limit: 1,
+      );
+      final changed = await transaction.update(
+        'clients',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        if (rows.isNotEmpty &&
+            await _supportsPendingClientPhotos(transaction)) {
+          await transaction.delete(
+            'pending_client_photos',
+            where: 'franchisee_id = ? AND client_remote_id = ?',
+            whereArgs: [rows.single['franchisee_id'], rows.single['remote_id']],
+          );
+        }
+        await _markLocalLwwMutation(transaction, 'clients', localId);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
     });
   }
 
@@ -1479,9 +1542,32 @@ class DbService {
     });
   }
 
-  Future<void> rebasePendingLwwChangesForBootstrap(String franchiseeId) async {
+  Future<void> rebasePendingLwwChangesForBootstrap(String franchiseeId) =>
+      _rebasePendingLwwChangesForBootstrap(franchiseeId);
+
+  Future<void> rebasePendingLwwChangesForBootstrapForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _rebasePendingLwwChangesForBootstrap(
+        franchiseeId,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _rebasePendingLwwChangesForBootstrap(
+    String franchiseeId, {
+    bool Function()? isSessionCurrent,
+  }) async {
+    void requireCurrent() {
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
+    }
+
+    requireCurrent();
     final db = await database;
     await db.transaction((transaction) async {
+      requireCurrent();
       final tableQueries = <String, String>{
         'clients': '''
           SELECT c.*
@@ -1513,8 +1599,10 @@ class DbService {
       };
       final writerId = await _installationWriterId(transaction);
       for (final entry in tableQueries.entries) {
+        requireCurrent();
         final rows = await transaction.rawQuery(entry.value, [franchiseeId]);
         for (final row in rows) {
+          requireCurrent();
           final serverGeneration = _validLogicalGeneration(
             row['server_generation'],
             allowZero: true,
@@ -1580,6 +1668,7 @@ class DbService {
                 pendingHash,
               ],
             );
+            requireCurrent();
             continue;
           }
 
@@ -1616,8 +1705,12 @@ class DbService {
             where: 'local_id = ?',
             whereArgs: [row['local_id']],
           );
+          requireCurrent();
         }
       }
+      // Final in-transaction generation validation rolls back an entire
+      // bootstrap rebase if logout raced any awaited SQLite operation.
+      requireCurrent();
     });
   }
 
@@ -2166,6 +2259,7 @@ class DbService {
   Future<void> setSyncV1CursorForSession(
     String franchiseeId,
     String cursor, {
+    required String? expectedCursor,
     required bool Function() isSessionCurrent,
   }) async {
     if (!isSessionCurrent()) {
@@ -2175,6 +2269,17 @@ class DbService {
     await db.transaction((transaction) async {
       if (!isSessionCurrent()) {
         throw StateError('A stale session cannot advance a sync cursor.');
+      }
+      final existing = await transaction.query(
+        'sync_state',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [_syncV1CursorKey(franchiseeId)],
+        limit: 1,
+      );
+      final current = existing.isEmpty ? null : existing.single['value'];
+      if (current != expectedCursor) {
+        throw StateError('The V1 sync cursor advanced concurrently.');
       }
       await transaction.insert(
         'sync_state',

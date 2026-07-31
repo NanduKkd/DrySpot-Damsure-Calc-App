@@ -113,7 +113,18 @@ class SettingsProvider with ChangeNotifier {
       franchiseeId: franchiseeId,
       price: price,
     );
-    await _dbService.insertDefaultPrice(newPrice, franchiseeId: franchiseeId);
+    if (session == null) {
+      await _dbService.insertDefaultPrice(newPrice, franchiseeId: franchiseeId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'default_prices',
+        values: newPrice.toMap(),
+        insert: true,
+        markLocalLwwCollection: 'default_prices',
+        useInsertedIdForLocalLww: true,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadSettings();
   }
@@ -126,10 +137,23 @@ class SettingsProvider with ChangeNotifier {
         defaultPrice.franchiseeId != franchiseeId) {
       return;
     }
-    await _dbService.updateDefaultPrice(
-      defaultPrice.copyWith(updatedAt: DateTime.now(), isDirty: true),
-      franchiseeId: franchiseeId,
+    final updated = defaultPrice.copyWith(
+      updatedAt: DateTime.now(),
+      isDirty: true,
     );
+    if (session == null) {
+      await _dbService.updateDefaultPrice(updated, franchiseeId: franchiseeId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'default_prices',
+        values: updated.toMap(),
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [updated.localId, franchiseeId],
+        markLocalLwwCollection: 'default_prices',
+        markLocalLwwId: updated.localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadSettings();
   }
@@ -138,7 +162,22 @@ class SettingsProvider with ChangeNotifier {
     final session = _session;
     final franchiseeId = _activeFranchiseeId;
     if (franchiseeId == null || !_isCurrent(session)) return;
-    await _dbService.deleteDefaultPrice(localId, franchiseeId: franchiseeId);
+    if (session == null) {
+      await _dbService.deleteDefaultPrice(localId, franchiseeId: franchiseeId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'default_prices',
+        values: {
+          'deleted_at': DateTime.now().toIso8601String(),
+          'is_dirty': 1,
+        },
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [localId, franchiseeId],
+        markLocalLwwCollection: 'default_prices',
+        markLocalLwwId: localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadSettings();
   }

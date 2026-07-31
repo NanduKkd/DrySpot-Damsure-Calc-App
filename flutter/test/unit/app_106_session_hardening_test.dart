@@ -93,6 +93,40 @@ final _emptyV1Response = <String, dynamic>{
   },
 };
 
+Map<String, dynamic> _v1Echo({
+  required String collection,
+  required String remoteId,
+  required Map<String, dynamic> update,
+}) {
+  final updates = <String, dynamic>{
+    'clients': <Map<String, dynamic>>[],
+    'items': <Map<String, dynamic>>[],
+    'rectangles': <Map<String, dynamic>>[],
+    'default_prices': <Map<String, dynamic>>[],
+    'warranties': <Map<String, dynamic>>[],
+    'proposals': <Map<String, dynamic>>[],
+    'warranty_tombstones': <Map<String, dynamic>>[],
+  };
+  final outcomes = <String, dynamic>{
+    'clients': <Map<String, dynamic>>[],
+    'items': <Map<String, dynamic>>[],
+    'rectangles': <Map<String, dynamic>>[],
+    'default_prices': <Map<String, dynamic>>[],
+    'warranties': <Map<String, dynamic>>[],
+    'proposals': <Map<String, dynamic>>[],
+  };
+  updates[collection] = [update];
+  outcomes[collection] = [
+    {'remote_id': remoteId, 'status': 'applied'},
+  ];
+  return {
+    'server_time': '2026-07-31T00:00:00.000Z',
+    'warranty_tombstone_cursor': '0',
+    'updates': updates,
+    'outcomes': outcomes,
+  };
+}
+
 Future<Database> _openDb() {
   return openDatabase(
     inMemoryDatabasePath,
@@ -355,8 +389,19 @@ void main() {
     await db.setSyncV1CursorForSession(
       _tenantA,
       'a-retained-v1-cursor',
+      expectedCursor: null,
       isSessionCurrent: () => sessions.isCurrent(a),
     );
+    await expectLater(
+      db.setSyncV1CursorForSession(
+        _tenantA,
+        'stale-concurrent-cursor',
+        expectedCursor: null,
+        isSessionCurrent: () => sessions.isCurrent(a),
+      ),
+      throwsStateError,
+    );
+    expect(await db.getSyncV1Cursor(_tenantA), 'a-retained-v1-cursor');
 
     sessions.invalidate();
     // Session invalidation clears caches in this same synchronous call stack;
@@ -566,6 +611,363 @@ void main() {
     );
     expect(retained!.name, 'N+1');
     expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, _now.add(const Duration(seconds: 1)));
+    await database.close();
+  });
+
+  test('a committed V1 item echo cannot overwrite an intervening N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'item-race-client',
+        franchiseeId: _tenantA,
+        name: 'parent',
+        isDirty: false,
+        updatedAt: _now,
+      ),
+    );
+    final itemId = await db.insertItem(
+      Item(
+        remoteId: 'item-race',
+        clientId: clientId,
+        name: 'N',
+        price: 1,
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final session = sessions.activate(token: 'a', franchiseeId: _tenantA);
+    final running = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    ).sync(session);
+    await api.started.future;
+    final nPlusOne = _now.add(const Duration(seconds: 1));
+    await db.updateItem(
+      Item(
+        localId: itemId,
+        remoteId: 'item-race',
+        clientId: clientId,
+        name: 'N+1',
+        price: 2,
+        isDirty: true,
+        updatedAt: nPlusOne,
+      ),
+    );
+    api.response.complete(
+      _v1Echo(
+        collection: 'items',
+        remoteId: 'item-race',
+        update: {
+          'remote_id': 'item-race',
+          'client_id': 'item-race-client',
+          'name': 'echoed',
+          'price': 99,
+          'enabled': true,
+          'updated_at': _now.toIso8601String(),
+          'deleted_at': null,
+        },
+      ),
+    );
+    await running;
+    final retained = await db.getItemByRemoteIdForFranchisee(
+      'item-race',
+      _tenantA,
+    );
+    expect(retained!.name, 'N+1');
+    expect(retained.price, 2);
+    expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, nPlusOne);
+    await database.close();
+  });
+
+  test('a committed V1 rectangle echo cannot overwrite an intervening N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'rectangle-race-client',
+        franchiseeId: _tenantA,
+        name: 'parent',
+        isDirty: false,
+        updatedAt: _now,
+      ),
+    );
+    final itemId = await db.insertItem(
+      Item(
+        remoteId: 'rectangle-race-item',
+        clientId: clientId,
+        name: 'item',
+        price: 1,
+        isDirty: false,
+        updatedAt: _now,
+      ),
+    );
+    final rectangleId = await db.insertRectangle(
+      Rectangle(
+        remoteId: 'rectangle-race',
+        itemId: itemId,
+        length: 1,
+        width: 2,
+        imageData: 'N',
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final session = sessions.activate(token: 'a', franchiseeId: _tenantA);
+    final running = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    ).sync(session);
+    await api.started.future;
+    final nPlusOne = _now.add(const Duration(seconds: 1));
+    await db.updateRectangle(
+      Rectangle(
+        localId: rectangleId,
+        remoteId: 'rectangle-race',
+        itemId: itemId,
+        length: 3,
+        width: 4,
+        imageData: 'N+1',
+        isDirty: true,
+        updatedAt: nPlusOne,
+      ),
+    );
+    api.response.complete(
+      _v1Echo(
+        collection: 'rectangles',
+        remoteId: 'rectangle-race',
+        update: {
+          'remote_id': 'rectangle-race',
+          'item_id': 'rectangle-race-item',
+          'length': 9,
+          'width': 9,
+          'image_data': 'echoed',
+          'updated_at': _now.toIso8601String(),
+          'deleted_at': null,
+        },
+      ),
+    );
+    await running;
+    final retained = await db.getRectangleByRemoteIdForFranchisee(
+      'rectangle-race',
+      _tenantA,
+    );
+    expect(retained!.imageData, 'N+1');
+    expect(retained.length, 3);
+    expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, nPlusOne);
+    await database.close();
+  });
+
+  test(
+      'a committed V1 default-price echo cannot overwrite an intervening N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final priceId = await db.insertDefaultPrice(
+      DefaultPrice(
+        remoteId: 'price-race',
+        franchiseeId: _tenantA,
+        price: 1,
+        isDirty: true,
+        updatedAt: _now,
+      ),
+      franchiseeId: _tenantA,
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final session = sessions.activate(token: 'a', franchiseeId: _tenantA);
+    final running = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    ).sync(session);
+    await api.started.future;
+    final nPlusOne = _now.add(const Duration(seconds: 1));
+    await db.updateDefaultPrice(
+      DefaultPrice(
+        localId: priceId,
+        remoteId: 'price-race',
+        franchiseeId: _tenantA,
+        price: 2,
+        isDirty: true,
+        updatedAt: nPlusOne,
+      ),
+      franchiseeId: _tenantA,
+    );
+    api.response.complete(
+      _v1Echo(
+        collection: 'default_prices',
+        remoteId: 'price-race',
+        update: {
+          'remote_id': 'price-race',
+          'price': 99,
+          'enabled': true,
+          'updated_at': _now.toIso8601String(),
+          'deleted_at': null,
+        },
+      ),
+    );
+    await running;
+    final retained = await db.getDefaultPriceByRemoteId(
+      'price-race',
+      _tenantA,
+    );
+    expect(retained!.price, 2);
+    expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, nPlusOne);
+    await database.close();
+  });
+
+  test('a committed V1 proposal echo cannot overwrite an intervening N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'proposal-race-client',
+        franchiseeId: _tenantA,
+        name: 'parent',
+        isDirty: false,
+        updatedAt: _now,
+      ),
+    );
+    final proposalId = await db.insertProposal(
+      Proposal(
+        remoteId: 'proposal-race',
+        clientId: clientId,
+        pdfUrl: '/N.pdf',
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final session = sessions.activate(token: 'a', franchiseeId: _tenantA);
+    final running = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    ).sync(session);
+    await api.started.future;
+    final nPlusOne = _now.add(const Duration(seconds: 1));
+    await db.updateProposal(
+      Proposal(
+        localId: proposalId,
+        remoteId: 'proposal-race',
+        clientId: clientId,
+        pdfUrl: '/N+1.pdf',
+        isDirty: true,
+        updatedAt: nPlusOne,
+      ),
+    );
+    api.response.complete(
+      _v1Echo(
+        collection: 'proposals',
+        remoteId: 'proposal-race',
+        update: {
+          'remote_id': 'proposal-race',
+          'client_id': 'proposal-race-client',
+          'pdf_url': '/echoed.pdf',
+          'updated_at': _now.toIso8601String(),
+          'deleted_at': null,
+        },
+      ),
+    );
+    await running;
+    final retained = await db.getProposalByRemoteIdForFranchisee(
+      'proposal-race',
+      _tenantA,
+    );
+    expect(retained!.pdfUrl, '/N+1.pdf');
+    expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, nPlusOne);
+    await database.close();
+  });
+
+  test('a committed V1 warranty echo cannot overwrite an intervening N+1 edit',
+      () async {
+    final database = await _openDb();
+    final db = DbService(database: database);
+    final clientId = await db.insertClient(
+      Client(
+        remoteId: 'warranty-race-client',
+        franchiseeId: _tenantA,
+        name: 'parent',
+        isDirty: false,
+        updatedAt: _now,
+      ),
+    );
+    final warrantyId = await db.insertWarranty(
+      Warranty(
+        remoteId: 'warranty-race',
+        clientId: clientId,
+        warrantyCardNumber: 'N',
+        startDate: _now,
+        durationYears: 1,
+        pdfUrl: '/N.pdf',
+        isDirty: true,
+        updatedAt: _now,
+      ),
+    );
+    final api = _DelayedApi();
+    final sessions = SessionManager();
+    final session = sessions.activate(token: 'a', franchiseeId: _tenantA);
+    final running = SyncService(
+      apiService: api,
+      dbService: db,
+      sessionManager: sessions,
+    ).sync(session);
+    await api.started.future;
+    final nPlusOne = _now.add(const Duration(seconds: 1));
+    await db.updateWarranty(
+      Warranty(
+        localId: warrantyId,
+        remoteId: 'warranty-race',
+        clientId: clientId,
+        warrantyCardNumber: 'N+1',
+        startDate: _now,
+        durationYears: 2,
+        pdfUrl: '/N+1.pdf',
+        isDirty: true,
+        updatedAt: nPlusOne,
+      ),
+    );
+    api.response.complete(
+      _v1Echo(
+        collection: 'warranties',
+        remoteId: 'warranty-race',
+        update: {
+          'remote_id': 'warranty-race',
+          'client_id': 'warranty-race-client',
+          'warranty_card_number': 'echoed',
+          'start_date': _now.toIso8601String(),
+          'duration_years': 9,
+          'pdf_url': '/echoed.pdf',
+          'version': 2,
+          'updated_at': _now.toIso8601String(),
+          'deleted_at': null,
+        },
+      ),
+    );
+    await running;
+    final retained = await db.getWarrantyByRemoteIdForFranchisee(
+      'warranty-race',
+      _tenantA,
+    );
+    expect(retained!.warrantyCardNumber, 'N+1');
+    expect(retained.isDirty, isTrue);
+    expect(retained.updatedAt, nPlusOne);
     await database.close();
   });
 

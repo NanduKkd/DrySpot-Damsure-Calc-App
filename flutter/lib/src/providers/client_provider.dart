@@ -148,7 +148,19 @@ class ClientProvider extends ChangeNotifier {
             client.franchiseeId != session.franchiseeId)) {
       return;
     }
-    await _dbService.insertClient(client);
+    if (session == null) {
+      await _dbService.insertClient(client);
+    } else {
+      await _dbService.writeForSession(
+        table: 'clients',
+        values: client.toMap(),
+        insert: true,
+        markLocalLwwCollection: client.isDirty ? 'clients' : null,
+        useInsertedIdForLocalLww: client.isDirty,
+        syncPendingPhotosForInsertedId: true,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -162,9 +174,21 @@ class ClientProvider extends ChangeNotifier {
     if (!await _ownsClient(client.localId, session) || !_isCurrent(session)) {
       return;
     }
-    await _dbService.updateClient(
-      client.copyWith(isDirty: true, updatedAt: DateTime.now()),
-    );
+    final updated = client.copyWith(isDirty: true, updatedAt: DateTime.now());
+    if (session == null) {
+      await _dbService.updateClient(updated);
+    } else {
+      await _dbService.writeForSession(
+        table: 'clients',
+        values: updated.toMap(),
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [updated.localId, session.franchiseeId],
+        markLocalLwwCollection: 'clients',
+        markLocalLwwId: updated.localId,
+        syncPendingClientPhotosId: updated.localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -172,7 +196,14 @@ class ClientProvider extends ChangeNotifier {
   Future<void> deleteClient(int localId) async {
     final session = _session;
     if (!await _ownsClient(localId, session) || !_isCurrent(session)) return;
-    await _dbService.softDeleteClient(localId);
+    if (session == null) {
+      await _dbService.softDeleteClient(localId);
+    } else {
+      await _dbService.softDeleteClientForSession(
+        localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -182,7 +213,16 @@ class ClientProvider extends ChangeNotifier {
     if (!await _ownsClient(item.clientId, session) || !_isCurrent(session)) {
       return 0;
     }
-    final id = await _dbService.insertItem(item);
+    final id = session == null
+        ? await _dbService.insertItem(item)
+        : await _dbService.writeForSession(
+            table: 'items',
+            values: item.toMap(),
+            insert: true,
+            markLocalLwwCollection: item.isDirty ? 'items' : null,
+            useInsertedIdForLocalLww: item.isDirty,
+            isSessionCurrent: () => _isCurrent(session),
+          );
     if (!_isCurrent(session)) return 0;
     await loadClients();
     return id;
@@ -203,9 +243,20 @@ class ClientProvider extends ChangeNotifier {
   Future<void> updateItem(Item item) async {
     final session = _session;
     if (!await _ownsItem(item.localId, session) || !_isCurrent(session)) return;
-    await _dbService.updateItem(
-      item.copyWith(isDirty: true, updatedAt: DateTime.now()),
-    );
+    final updated = item.copyWith(isDirty: true, updatedAt: DateTime.now());
+    if (session == null) {
+      await _dbService.updateItem(updated);
+    } else {
+      await _dbService.writeForSession(
+        table: 'items',
+        values: updated.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [updated.localId],
+        markLocalLwwCollection: 'items',
+        markLocalLwwId: updated.localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -213,7 +264,22 @@ class ClientProvider extends ChangeNotifier {
   Future<void> deleteItem(int localId) async {
     final session = _session;
     if (!await _ownsItem(localId, session) || !_isCurrent(session)) return;
-    await _dbService.softDeleteItem(localId);
+    if (session == null) {
+      await _dbService.softDeleteItem(localId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'items',
+        values: {
+          'deleted_at': DateTime.now().toIso8601String(),
+          'is_dirty': 1,
+        },
+        where: 'local_id = ?',
+        whereArgs: [localId],
+        markLocalLwwCollection: 'items',
+        markLocalLwwId: localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -223,7 +289,18 @@ class ClientProvider extends ChangeNotifier {
     if (!await _ownsItem(rectangle.itemId, session) || !_isCurrent(session)) {
       return;
     }
-    await _dbService.insertRectangle(rectangle);
+    if (session == null) {
+      await _dbService.insertRectangle(rectangle);
+    } else {
+      await _dbService.writeForSession(
+        table: 'rectangles',
+        values: rectangle.toMap(),
+        insert: true,
+        markLocalLwwCollection: rectangle.isDirty ? 'rectangles' : null,
+        useInsertedIdForLocalLww: rectangle.isDirty,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -234,9 +311,23 @@ class ClientProvider extends ChangeNotifier {
         !_isCurrent(session)) {
       return;
     }
-    await _dbService.updateRectangle(
-      rectangle.copyWith(isDirty: true, updatedAt: DateTime.now()),
+    final updated = rectangle.copyWith(
+      isDirty: true,
+      updatedAt: DateTime.now(),
     );
+    if (session == null) {
+      await _dbService.updateRectangle(updated);
+    } else {
+      await _dbService.writeForSession(
+        table: 'rectangles',
+        values: updated.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [updated.localId],
+        markLocalLwwCollection: 'rectangles',
+        markLocalLwwId: updated.localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -246,7 +337,22 @@ class ClientProvider extends ChangeNotifier {
     if (!await _ownsRectangle(localId, session) || !_isCurrent(session)) {
       return;
     }
-    await _dbService.softDeleteRectangle(localId);
+    if (session == null) {
+      await _dbService.softDeleteRectangle(localId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'rectangles',
+        values: {
+          'deleted_at': DateTime.now().toIso8601String(),
+          'is_dirty': 1,
+        },
+        where: 'local_id = ? AND deleted_at IS NULL',
+        whereArgs: [localId],
+        markLocalLwwCollection: 'rectangles',
+        markLocalLwwId: localId,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadClients();
   }
@@ -259,9 +365,24 @@ class ClientProvider extends ChangeNotifier {
     final client = _clients.firstWhere((c) => c.localId == clientLocalId);
     for (var item in client.items) {
       if (!_isCurrent(session)) return;
-      await _dbService.updateItem(
-        item.copyWith(price: price, isDirty: true, updatedAt: DateTime.now()),
+      final updated = item.copyWith(
+        price: price,
+        isDirty: true,
+        updatedAt: DateTime.now(),
       );
+      if (session == null) {
+        await _dbService.updateItem(updated);
+      } else {
+        await _dbService.writeForSession(
+          table: 'items',
+          values: updated.toMap(),
+          where: 'local_id = ?',
+          whereArgs: [updated.localId],
+          markLocalLwwCollection: 'items',
+          markLocalLwwId: updated.localId,
+          isSessionCurrent: () => _isCurrent(session),
+        );
+      }
     }
     if (!_isCurrent(session)) return;
     await loadClients();
@@ -318,7 +439,16 @@ class ClientProvider extends ChangeNotifier {
         !_isCurrent(session)) {
       return;
     }
-    await _dbService.insertProposal(proposal);
+    if (session == null) {
+      await _dbService.insertProposal(proposal);
+    } else {
+      await _dbService.writeForSession(
+        table: 'proposals',
+        values: proposal.toMap(),
+        insert: true,
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadProposals(proposal.clientId);
   }
@@ -330,7 +460,18 @@ class ClientProvider extends ChangeNotifier {
     }
     // Permanent warranty deletion is online/server-authoritative. This method
     // is called only after the confirmed API request succeeds.
-    await _dbService.hardDeleteWarranty(localId);
+    if (session == null) {
+      await _dbService.hardDeleteWarranty(localId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'warranties',
+        values: const {},
+        delete: true,
+        where: 'local_id = ? AND client_id = ?',
+        whereArgs: [localId, clientLocalId],
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadWarranties(clientLocalId);
   }
@@ -340,7 +481,20 @@ class ClientProvider extends ChangeNotifier {
     if (!await _ownsClient(clientLocalId, session) || !_isCurrent(session)) {
       return;
     }
-    await _dbService.softDeleteProposal(localId);
+    if (session == null) {
+      await _dbService.softDeleteProposal(localId);
+    } else {
+      await _dbService.writeForSession(
+        table: 'proposals',
+        values: {
+          'deleted_at': DateTime.now().toIso8601String(),
+          'is_dirty': 1,
+        },
+        where: 'local_id = ? AND client_id = ?',
+        whereArgs: [localId, clientLocalId],
+        isSessionCurrent: () => _isCurrent(session),
+      );
+    }
     if (!_isCurrent(session)) return;
     await loadProposals(clientLocalId);
   }

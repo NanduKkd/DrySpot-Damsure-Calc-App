@@ -55,6 +55,7 @@ class ClientPhotoPreviewScreen extends StatelessWidget {
                     photoPath,
                     apiService: apiService,
                     session: session,
+                    isSessionCurrent: () => auth!.isCurrentSession(session),
                   ),
             fit: BoxFit.contain,
             errorBuilder: (context, error, stackTrace) {

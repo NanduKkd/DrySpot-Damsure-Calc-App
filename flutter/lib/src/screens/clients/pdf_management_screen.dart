@@ -63,7 +63,11 @@ class _PdfManagementScreenState extends State<PdfManagementScreen> {
         return;
       }
 
-      final file = await _pdfService.generateProposalPdf(widget.client);
+      final file = await _pdfService.generateProposalPdf(
+        widget.client,
+        session: session,
+        isSessionCurrent: () => auth.isCurrentSession(session),
+      );
 
       if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
         return;

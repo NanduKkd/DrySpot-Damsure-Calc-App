@@ -21,6 +21,18 @@ class PdfService {
 
   final ApiService _apiService;
 
+  void _requireCurrentSession(
+    SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
+  ) {
+    if (session != null && isSessionCurrent == null) {
+      throw ArgumentError('Session-bound PDF work requires a current check.');
+    }
+    if (isSessionCurrent?.call() == false) {
+      throw const StaleSessionException();
+    }
+  }
+
   Future<pw.ThemeData> _loadPdfTheme() async {
     final latinFontData = await rootBundle.load(_latinFontAsset);
     final malayalamFontData = await rootBundle.load(_malayalamFontAsset);
@@ -49,7 +61,10 @@ class PdfService {
     required int durationYears,
     required String franchiseeName,
     required String warrantyCardNumber,
+    SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
   }) async {
+    _requireCurrentSession(session, isSessionCurrent);
     // Use a compressed cover asset so warranty uploads stay under proxy limits.
     final blueBgData =
         await rootBundle.load('assets/pdf-images/blueBuildingsBackground.jpg');
@@ -583,9 +598,16 @@ class PdfService {
           ]);
         }));
 
+    final pdfBytes = await pdf.save();
+    _requireCurrentSession(session, isSessionCurrent);
     final output = await getTemporaryDirectory();
+    _requireCurrentSession(session, isSessionCurrent);
     final file = File("${output.path}/warranty_${client.remoteId}.pdf");
-    await file.writeAsBytes(await pdf.save());
+    await file.writeAsBytes(pdfBytes);
+    if (isSessionCurrent?.call() == false) {
+      if (await file.exists()) await file.delete();
+      throw const StaleSessionException();
+    }
     return file;
   }
 
@@ -667,6 +689,9 @@ class PdfService {
     final protectedUri = resolveProtectedPdfUrl(pdfUrl);
 
     if (protectedUri != null) {
+      // Keep this immediately adjacent to the request start. A snapshot can
+      // become stale after URL resolution but before a protected bearer send.
+      requireCurrent();
       final response = await http.get(
         protectedUri,
         headers: _apiService.authenticatedHeadersFor(session),
@@ -710,6 +735,10 @@ class PdfService {
       throw Exception('This PDF cannot be deleted from the server.');
     }
     segments.removeLast();
+    // As above, guard the actual protected send, not merely setup work.
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
     final response = await http.delete(
       uri.replace(pathSegments: segments),
       headers: _apiService.authenticatedHeadersFor(session),
@@ -762,13 +791,21 @@ class PdfService {
     final file = File('${tempDir.path}/$fileName');
     await file.writeAsBytes(bytes, flush: true);
     if (!isSessionCurrent()) {
+      // This is a session-scoped preview cache, not retained tenant media.
+      // Remove a file written by a stale read before surfacing the fence.
+      if (await file.exists()) await file.delete();
       throw const StaleSessionException();
     }
 
     return file;
   }
 
-  Future<File> generateProposalPdf(Client client) async {
+  Future<File> generateProposalPdf(
+    Client client, {
+    SessionSnapshot? session,
+    bool Function()? isSessionCurrent,
+  }) async {
+    _requireCurrentSession(session, isSessionCurrent);
     final pdf = pw.Document(theme: await _loadPdfTheme());
     final grandTotal = client.originalTotalPrice;
 
@@ -910,9 +947,16 @@ class PdfService {
       ),
     );
 
+    final pdfBytes = await pdf.save();
+    _requireCurrentSession(session, isSessionCurrent);
     final output = await getTemporaryDirectory();
+    _requireCurrentSession(session, isSessionCurrent);
     final file = File("${output.path}/proposal_${client.remoteId}.pdf");
-    await file.writeAsBytes(await pdf.save());
+    await file.writeAsBytes(pdfBytes);
+    if (isSessionCurrent?.call() == false) {
+      if (await file.exists()) await file.delete();
+      throw const StaleSessionException();
+    }
     return file;
   }
 }

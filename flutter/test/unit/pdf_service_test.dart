@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:app_client/src/services/pdf_service.dart';
+import 'package:app_client/src/services/session_manager.dart';
 import 'package:app_client/src/models/client.dart';
 import 'package:app_client/src/models/item.dart';
 import 'package:app_client/src/models/rectangle.dart';
@@ -88,5 +89,60 @@ void main() {
 
     // Clean up
     await file.delete();
+  });
+
+  test('stale proposal and warranty generation remove their new files',
+      () async {
+    final service = PdfService();
+    const session = SessionSnapshot(
+      token: 'a',
+      userName: 'A',
+      franchiseeId: 'tenant-a',
+      franchiseeName: 'A',
+      generation: 1,
+    );
+    final client = Client(
+      remoteId: 'app106-stale-pdf',
+      name: 'Retained tenant client',
+      updatedAt: DateTime.now(),
+    );
+    final temp = Directory.systemTemp;
+    final proposalFile = File('${temp.path}/proposal_${client.remoteId}.pdf');
+    final warrantyFile = File('${temp.path}/warranty_${client.remoteId}.pdf');
+    if (await proposalFile.exists()) await proposalFile.delete();
+    if (await warrantyFile.exists()) await warrantyFile.delete();
+
+    var proposalChecks = 0;
+    await expectLater(
+      service.generateProposalPdf(
+        client,
+        session: session,
+        // The fourth check is immediately after writeAsBytes: model logout
+        // racing the generation's final physical file mutation.
+        isSessionCurrent: () => ++proposalChecks < 4,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    expect(await proposalFile.exists(), isFalse);
+
+    var warrantyChecks = 0;
+    await expectLater(
+      service.generateWarrantyPdf(
+        client: client,
+        customerName: client.name,
+        customerAddress: '',
+        siteAddress: '',
+        mobileNumber: '',
+        areaOfApplication: 'Roof',
+        startDate: DateTime.utc(2026, 7, 31),
+        durationYears: 1,
+        franchiseeName: 'Tenant A',
+        warrantyCardNumber: 'A-106',
+        session: session,
+        isSessionCurrent: () => ++warrantyChecks < 4,
+      ),
+      throwsA(isA<StaleSessionException>()),
+    );
+    expect(await warrantyFile.exists(), isFalse);
   });
 }

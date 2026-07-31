@@ -171,7 +171,10 @@ class SyncService {
           includePending: false,
         );
         _requireCurrent(session);
-        await dbService.rebasePendingLwwChangesForBootstrap(franchiseeId);
+        await dbService.rebasePendingLwwChangesForBootstrapForSession(
+          franchiseeId,
+          isSessionCurrent: () => _isCurrent(session),
+        );
         await _syncV2(
           franchiseeId,
           session,
@@ -461,6 +464,18 @@ class SyncService {
     final submittedClientsByRemoteId = {
       for (final client in clientsToMarkSynced) client.remoteId: client,
     };
+    final submittedItemsByRemoteId = {
+      for (final item in itemsToSync) item.remoteId: item,
+    };
+    final submittedRectanglesByRemoteId = {
+      for (final rectangle in rectanglesToSync) rectangle.remoteId: rectangle,
+    };
+    final submittedDefaultPricesByRemoteId = {
+      for (final price in dirtyDefaultPrices) price.remoteId: price,
+    };
+    final submittedProposalsByRemoteId = {
+      for (final proposal in proposalsToSync) proposal.remoteId: proposal,
+    };
 
     if (shouldFilterByFranchise) {
       final nextCursor = response['warranty_tombstone_cursor']?.toString();
@@ -619,6 +634,7 @@ class SyncService {
       // Items
       for (var itemMap in updates['items']) {
         final remoteId = itemMap['remote_id'];
+        final submittedItem = submittedItemsByRemoteId[remoteId];
         final existingItem = shouldFilterByFranchise && enforceSessionBoundary
             ? await dbService.getItemByRemoteIdForFranchisee(
                 remoteId,
@@ -634,7 +650,32 @@ class SyncService {
 
         if (client != null) {
           if (itemMap['deleted_at'] != null) {
-            if (existingItem != null) {
+            if (existingItem != null &&
+                submittedItem != null &&
+                appliedItems.contains(remoteId)) {
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteItem(existingItem.localId!)
+                    : dbService.writeForSession(
+                        table: 'items',
+                        values: {
+                          'deleted_at': itemMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: '''
+                          local_id = ? AND updated_at = ? AND is_dirty = 1
+                        ''',
+                        whereArgs: [
+                          existingItem.localId,
+                          submittedItem.updatedAt.toIso8601String(),
+                        ],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            } else if (existingItem != null &&
+                submittedItem == null &&
+                !existingItem.isDirty) {
               await _writeForCurrent(
                 session,
                 () => sessionManager == null
@@ -656,22 +697,46 @@ class SyncService {
               itemMap,
             ).copyWith(clientId: client.localId, isDirty: false);
             if (existingItem != null) {
-              await _writeForCurrent(
-                session,
-                () => sessionManager == null
-                    ? dbService.updateItem(
-                        item.copyWith(localId: existingItem.localId),
-                      )
-                    : dbService.writeForSession(
-                        table: 'items',
-                        values: item
-                            .copyWith(localId: existingItem.localId)
-                            .toMap(),
-                        where: 'local_id = ?',
-                        whereArgs: [existingItem.localId],
-                        isSessionCurrent: () => _isCurrent(session),
-                      ),
-              );
+              if (submittedItem != null && appliedItems.contains(remoteId)) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateItem(
+                          item.copyWith(localId: existingItem.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'items',
+                          values: item
+                              .copyWith(localId: existingItem.localId)
+                              .toMap(),
+                          where: '''
+                            local_id = ? AND updated_at = ? AND is_dirty = 1
+                          ''',
+                          whereArgs: [
+                            existingItem.localId,
+                            submittedItem.updatedAt.toIso8601String(),
+                          ],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              } else if (submittedItem == null && !existingItem.isDirty) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateItem(
+                          item.copyWith(localId: existingItem.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'items',
+                          values: item
+                              .copyWith(localId: existingItem.localId)
+                              .toMap(),
+                          where: 'local_id = ?',
+                          whereArgs: [existingItem.localId],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              }
             } else {
               await _writeForCurrent(
                 session,
@@ -692,6 +757,7 @@ class SyncService {
       // Rectangles
       for (var rectMap in updates['rectangles']) {
         final remoteId = rectMap['remote_id'];
+        final submittedRectangle = submittedRectanglesByRemoteId[remoteId];
         final existingRect = shouldFilterByFranchise && enforceSessionBoundary
             ? await dbService.getRectangleByRemoteIdForFranchisee(
                 remoteId,
@@ -707,7 +773,32 @@ class SyncService {
 
         if (item != null) {
           if (rectMap['deleted_at'] != null) {
-            if (existingRect != null) {
+            if (existingRect != null &&
+                submittedRectangle != null &&
+                appliedRectangles.contains(remoteId)) {
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteRectangle(existingRect.localId!)
+                    : dbService.writeForSession(
+                        table: 'rectangles',
+                        values: {
+                          'deleted_at': rectMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: '''
+                          local_id = ? AND updated_at = ? AND is_dirty = 1
+                        ''',
+                        whereArgs: [
+                          existingRect.localId,
+                          submittedRectangle.updatedAt.toIso8601String(),
+                        ],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            } else if (existingRect != null &&
+                submittedRectangle == null &&
+                !existingRect.isDirty) {
               await _writeForCurrent(
                 session,
                 () => sessionManager == null
@@ -729,22 +820,47 @@ class SyncService {
               rectMap,
             ).copyWith(itemId: item.localId, isDirty: false);
             if (existingRect != null) {
-              await _writeForCurrent(
-                session,
-                () => sessionManager == null
-                    ? dbService.updateRectangle(
-                        rect.copyWith(localId: existingRect.localId),
-                      )
-                    : dbService.writeForSession(
-                        table: 'rectangles',
-                        values: rect
-                            .copyWith(localId: existingRect.localId)
-                            .toMap(),
-                        where: 'local_id = ?',
-                        whereArgs: [existingRect.localId],
-                        isSessionCurrent: () => _isCurrent(session),
-                      ),
-              );
+              if (submittedRectangle != null &&
+                  appliedRectangles.contains(remoteId)) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateRectangle(
+                          rect.copyWith(localId: existingRect.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'rectangles',
+                          values: rect
+                              .copyWith(localId: existingRect.localId)
+                              .toMap(),
+                          where: '''
+                            local_id = ? AND updated_at = ? AND is_dirty = 1
+                          ''',
+                          whereArgs: [
+                            existingRect.localId,
+                            submittedRectangle.updatedAt.toIso8601String(),
+                          ],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              } else if (submittedRectangle == null && !existingRect.isDirty) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateRectangle(
+                          rect.copyWith(localId: existingRect.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'rectangles',
+                          values: rect
+                              .copyWith(localId: existingRect.localId)
+                              .toMap(),
+                          where: 'local_id = ?',
+                          whereArgs: [existingRect.localId],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              }
             } else {
               await _writeForCurrent(
                 session,
@@ -767,13 +883,59 @@ class SyncService {
         for (final priceMap in updates['default_prices'] ?? []) {
           final remoteId = priceMap['remote_id']?.toString();
           if (remoteId == null || remoteId.isEmpty) continue;
+          final submittedPrice = submittedDefaultPricesByRemoteId[remoteId];
 
           final existing = await dbService.getDefaultPriceByRemoteId(
             remoteId,
             activeFranchiseeId,
           );
           if (priceMap['deleted_at'] != null) {
-            if (existing != null && existing.localId != null) {
+            if (sessionManager == null &&
+                existing != null &&
+                existing.localId != null) {
+              // Historical unbound service tests retain their mock-only V1
+              // surface. The app always supplies SessionManager and takes the
+              // CAS branch below.
+              await _writeForCurrent(
+                session,
+                () => dbService.deleteDefaultPrice(
+                  existing.localId!,
+                  franchiseeId: activeFranchiseeId,
+                ),
+              );
+            } else if (existing != null &&
+                existing.localId != null &&
+                submittedPrice != null &&
+                appliedDefaultPrices.contains(remoteId)) {
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.deleteDefaultPrice(
+                        existing.localId!,
+                        franchiseeId: activeFranchiseeId,
+                      )
+                    : dbService.writeForSession(
+                        table: 'default_prices',
+                        values: {
+                          'deleted_at': priceMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: '''
+                          local_id = ? AND franchisee_id = ?
+                          AND updated_at = ? AND is_dirty = 1
+                        ''',
+                        whereArgs: [
+                          existing.localId,
+                          activeFranchiseeId,
+                          submittedPrice.updatedAt.toIso8601String(),
+                        ],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            } else if (existing != null &&
+                existing.localId != null &&
+                submittedPrice == null &&
+                !existing.isDirty) {
               await _writeForCurrent(
                 session,
                 () => sessionManager == null
@@ -814,7 +976,31 @@ class SyncService {
                       isSessionCurrent: () => _isCurrent(session),
                     ),
             );
-          } else {
+          } else if (submittedPrice != null &&
+              appliedDefaultPrices.contains(remoteId)) {
+            await _writeForCurrent(
+              session,
+              () => sessionManager == null
+                  ? dbService.updateDefaultPrice(
+                      price.copyWith(localId: existing.localId),
+                      franchiseeId: activeFranchiseeId,
+                    )
+                  : dbService.writeForSession(
+                      table: 'default_prices',
+                      values: price.copyWith(localId: existing.localId).toMap(),
+                      where: '''
+                        local_id = ? AND franchisee_id = ?
+                        AND updated_at = ? AND is_dirty = 1
+                      ''',
+                      whereArgs: [
+                        existing.localId,
+                        activeFranchiseeId,
+                        submittedPrice.updatedAt.toIso8601String(),
+                      ],
+                      isSessionCurrent: () => _isCurrent(session),
+                    ),
+            );
+          } else if (submittedPrice == null && !existing.isDirty) {
             await _writeForCurrent(
               session,
               () => sessionManager == null
@@ -869,7 +1055,7 @@ class SyncService {
             ).copyWith(clientId: client.localId!, isDirty: false);
             final submitted = submittedWarrantiesByRemoteId[remoteId];
             if (existingWarranty != null) {
-              if (submitted == null) {
+              if (submitted == null && !existingWarranty.isDirty) {
                 await _writeForCurrent(
                   session,
                   () => sessionManager == null
@@ -886,7 +1072,8 @@ class SyncService {
                           isSessionCurrent: () => _isCurrent(session),
                         ),
                 );
-              } else if (appliedWarranties.contains(remoteId)) {
+              } else if (submitted != null &&
+                  appliedWarranties.contains(remoteId)) {
                 // Applying the server echo is itself compare-and-set. A local
                 // edit made after request capture must survive both response
                 // application and the later dirty-clear acknowledgement.
@@ -934,6 +1121,7 @@ class SyncService {
       // Proposals
       for (var proposalMap in updates['proposals'] ?? []) {
         final remoteId = proposalMap['remote_id'];
+        final submittedProposal = submittedProposalsByRemoteId[remoteId];
         final existingProposal =
             shouldFilterByFranchise && enforceSessionBoundary
                 ? await dbService.getProposalByRemoteIdForFranchisee(
@@ -950,7 +1138,32 @@ class SyncService {
 
         if (client != null) {
           if (proposalMap['deleted_at'] != null) {
-            if (existingProposal != null) {
+            if (existingProposal != null &&
+                submittedProposal != null &&
+                appliedProposals.contains(remoteId)) {
+              await _writeForCurrent(
+                session,
+                () => sessionManager == null
+                    ? dbService.softDeleteProposal(existingProposal.localId!)
+                    : dbService.writeForSession(
+                        table: 'proposals',
+                        values: {
+                          'deleted_at': proposalMap['deleted_at'],
+                          'is_dirty': 0,
+                        },
+                        where: '''
+                          local_id = ? AND updated_at = ? AND is_dirty = 1
+                        ''',
+                        whereArgs: [
+                          existingProposal.localId,
+                          submittedProposal.updatedAt.toIso8601String(),
+                        ],
+                        isSessionCurrent: () => _isCurrent(session),
+                      ),
+              );
+            } else if (existingProposal != null &&
+                submittedProposal == null &&
+                !existingProposal.isDirty) {
               await _writeForCurrent(
                 session,
                 () => sessionManager == null
@@ -972,22 +1185,48 @@ class SyncService {
               proposalMap,
             ).copyWith(clientId: client.localId!, isDirty: false);
             if (existingProposal != null) {
-              await _writeForCurrent(
-                session,
-                () => sessionManager == null
-                    ? dbService.updateProposal(
-                        proposal.copyWith(localId: existingProposal.localId),
-                      )
-                    : dbService.writeForSession(
-                        table: 'proposals',
-                        values: proposal
-                            .copyWith(localId: existingProposal.localId)
-                            .toMap(),
-                        where: 'local_id = ?',
-                        whereArgs: [existingProposal.localId],
-                        isSessionCurrent: () => _isCurrent(session),
-                      ),
-              );
+              if (submittedProposal != null &&
+                  appliedProposals.contains(remoteId)) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateProposal(
+                          proposal.copyWith(localId: existingProposal.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'proposals',
+                          values: proposal
+                              .copyWith(localId: existingProposal.localId)
+                              .toMap(),
+                          where: '''
+                            local_id = ? AND updated_at = ? AND is_dirty = 1
+                          ''',
+                          whereArgs: [
+                            existingProposal.localId,
+                            submittedProposal.updatedAt.toIso8601String(),
+                          ],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              } else if (submittedProposal == null &&
+                  !existingProposal.isDirty) {
+                await _writeForCurrent(
+                  session,
+                  () => sessionManager == null
+                      ? dbService.updateProposal(
+                          proposal.copyWith(localId: existingProposal.localId),
+                        )
+                      : dbService.writeForSession(
+                          table: 'proposals',
+                          values: proposal
+                              .copyWith(localId: existingProposal.localId)
+                              .toMap(),
+                          where: 'local_id = ?',
+                          whereArgs: [existingProposal.localId],
+                          isSessionCurrent: () => _isCurrent(session),
+                        ),
+                );
+              }
             } else {
               await _writeForCurrent(
                 session,
@@ -1127,6 +1366,7 @@ class SyncService {
         () => dbService.setSyncV1CursorForSession(
           activeFranchiseeId,
           serverTime,
+          expectedCursor: lastSyncTime,
           isSessionCurrent: () => _isCurrent(session),
         ),
       );

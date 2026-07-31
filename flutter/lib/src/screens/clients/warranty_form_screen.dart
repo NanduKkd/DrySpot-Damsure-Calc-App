@@ -148,6 +148,8 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         durationYears: _durationYears,
         franchiseeName: franchiseeName,
         warrantyCardNumber: _cardNumberController.text,
+        session: session,
+        isSessionCurrent: () => auth.isCurrentSession(session),
       );
 
       if (!mounted || auth.sessionSnapshot?.generation != session.generation) {

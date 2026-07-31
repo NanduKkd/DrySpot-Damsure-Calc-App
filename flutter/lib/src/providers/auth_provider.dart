@@ -211,4 +211,7 @@ class AuthProvider extends ChangeNotifier {
 
 extension AuthProviderSessionAccess on AuthProvider {
   SessionSnapshot? get sessionSnapshot => _sessionManager.current;
+
+  bool isCurrentSession(SessionSnapshot snapshot) =>
+      _sessionManager.isCurrent(snapshot);
 }

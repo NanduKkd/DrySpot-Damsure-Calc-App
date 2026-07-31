@@ -1,3 +1,5 @@
+import 'package:flutter/widgets.dart';
+
 /// An immutable capability for exactly one authenticated app session.
 ///
 /// Callers must capture this value before starting asynchronous work and ask
@@ -63,6 +65,13 @@ class SessionManager {
     for (final listener in List<void Function()>.from(_invalidationListeners)) {
       listener();
     }
+    // Image providers are asynchronous visible caches too. Clear both pending
+    // and live entries before logout performs any awaited preference work.
+    // This is idempotent in the running app and also supplies a painting
+    // binding for non-widget service callers before touching the image cache.
+    WidgetsFlutterBinding.ensureInitialized();
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
   }
 
   bool isCurrent(SessionSnapshot snapshot) {
