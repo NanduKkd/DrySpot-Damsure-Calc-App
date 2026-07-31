@@ -5,7 +5,8 @@ import 'package:app_client/src/updates/release_manifest.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  const isStaging = String.fromEnvironment('FLUTTER_APP_FLAVOR') == 'staging';
+  const isStaging =
+      String.fromEnvironment('DAMSURE_RELEASE_FLAVOR') == 'staging';
 
   test('staging flavor binds only its compile-time release origin', () {
     const origin = 'https://staging.example.test';

@@ -63,16 +63,26 @@ fun stagingOriginFromDartDefines(): String? {
         ?.removePrefix("DAMSURE_STAGING_ORIGIN=")
 }
 
-fun flutterAppFlavorFromDartDefines(): String? {
+fun releaseFlavorFromDartDefines(): String? {
     val encoded = project.findProperty("dart-defines")?.toString() ?: return null
     return encoded.split(',').mapNotNull { value ->
         runCatching { String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8) }.getOrNull()
-    }.firstOrNull { value -> value.startsWith("FLUTTER_APP_FLAVOR=") }
-        ?.removePrefix("FLUTTER_APP_FLAVOR=")
+    }.firstOrNull { value -> value.startsWith("DAMSURE_RELEASE_FLAVOR=") }
+        ?.removePrefix("DAMSURE_RELEASE_FLAVOR=")
+}
+
+fun dartDefine(name: String): String? {
+    val encoded = project.findProperty("dart-defines")?.toString() ?: return null
+    return encoded.split(',').mapNotNull { value ->
+        runCatching { String(Base64.getDecoder().decode(value), StandardCharsets.UTF_8) }.getOrNull()
+    }.firstOrNull { value -> value.startsWith("$name=") }?.removePrefix("$name=")
 }
 
 fun requireStagingOriginAtCompileTime() {
     val origin = stagingOriginFromDartDefines()
+    check(releaseFlavorFromDartDefines() == "staging") {
+        "Staging builds require --dart-define=DAMSURE_RELEASE_FLAVOR=staging"
+    }
     check(!origin.isNullOrBlank()) {
         "Staging builds require --dart-define=DAMSURE_STAGING_ORIGIN=https://staging-host"
     }
@@ -82,6 +92,20 @@ fun requireStagingOriginAtCompileTime() {
         uri.userInfo == null) {
         "DAMSURE_STAGING_ORIGIN must be an HTTPS origin without path, port, credentials, query, or fragment"
     }
+}
+
+fun requireProductionDefinesAtCompileTime() {
+    val flavor = releaseFlavorFromDartDefines()
+    check(flavor == null || flavor == "production") {
+        "Production builds must not be compiled with a staging Flutter flavor"
+    }
+    check(dartDefine("DAMSURE_STAGING_ORIGIN").isNullOrBlank()) {
+        "Production builds must not contain a staging release origin"
+    }
+}
+
+fun stagingVariantWasRequested(): Boolean = gradle.startParameter.taskNames.any {
+    it.contains("staging", ignoreCase = true)
 }
 
 android {
@@ -104,6 +128,10 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     signingConfigs {
@@ -131,12 +159,24 @@ android {
             dimension = "environment"
             applicationId = "com.dryspotuppala"
             resValue("string", "app_name", "DrySpot Uppala")
+            buildConfigField("String", "UPDATE_EXPECTED_PACKAGE_ID", "\"com.dryspotuppala\"")
+            buildConfigField(
+                "String",
+                "UPDATE_PINNED_CERTIFICATE_SHA256",
+                "\"$normalizedProductionCertificate\"",
+            )
             if (hasCompleteProductionSigning) signingConfig = signingConfigs.getByName("productionRelease")
         }
         create("staging") {
             dimension = "environment"
             applicationId = "com.dryspotuppala.staging"
             resValue("string", "app_name", "DrySpot Uppala Staging")
+            buildConfigField("String", "UPDATE_EXPECTED_PACKAGE_ID", "\"com.dryspotuppala.staging\"")
+            buildConfigField(
+                "String",
+                "UPDATE_PINNED_CERTIFICATE_SHA256",
+                "\"${normalizedStagingCertificate ?: ""}\"",
+            )
             if (hasCompleteStagingSigning) signingConfig = signingConfigs.getByName("stagingRelease")
         }
     }
@@ -148,15 +188,26 @@ android {
     }
 }
 
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+}
+
 // Do not silently produce an unsigned/debug-signed release artifact.  Values
 // are intentionally never included in this diagnostic.
 tasks.configureEach {
     if (name.startsWith("compileFlutterBuildStaging")) {
         doFirst {
-            if (flutterAppFlavorFromDartDefines() == "staging") {
+            // Flutter invokes this intermediate task while assembling a
+            // production variant too. A requested staging variant, however,
+            // must carry the matching Dart flavor and a staging-only origin.
+            if (stagingVariantWasRequested() ||
+                releaseFlavorFromDartDefines() == "staging") {
                 requireStagingOriginAtCompileTime()
             }
         }
+    }
+    if (name.startsWith("compileFlutterBuildProduction")) {
+        doFirst { requireProductionDefinesAtCompileTime() }
     }
     if (Regex("(?i)^(assemble|bundle|package|sign).*release").containsMatchIn(name)) {
         doFirst {

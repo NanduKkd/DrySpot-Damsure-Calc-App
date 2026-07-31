@@ -1,7 +1,7 @@
 class AppConfig {
   static const String productionServerUrl = 'https://damsure.nandakrishnan.in';
   static const String _flavor = String.fromEnvironment(
-    'FLUTTER_APP_FLAVOR',
+    'DAMSURE_RELEASE_FLAVOR',
     defaultValue: 'production',
   );
   static const String _stagingServerUrl = String.fromEnvironment(
@@ -15,6 +15,9 @@ class AppConfig {
   static void validateBuildConfiguration() {
     if (_flavor != 'production' && _flavor != 'staging') {
       throw StateError('Unsupported Android application flavor.');
+    }
+    if (_flavor == 'production' && _stagingServerUrl.isNotEmpty) {
+      throw StateError('Production builds must not contain a staging origin.');
     }
     final origin = Uri.tryParse(_stagingServerUrl);
     if (_flavor == 'staging' &&

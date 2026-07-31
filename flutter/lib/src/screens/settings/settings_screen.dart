@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/theme_provider.dart';
+import '../../updates/update_coordinator.dart';
 import 'default_prices_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -30,6 +31,13 @@ class SettingsScreen extends StatelessWidget {
                 ),
               );
             },
+          ),
+          ListTile(
+            leading: const Icon(Icons.system_update),
+            title: const Text('Check for updates'),
+            subtitle: const Text('Check the approved release service'),
+            onTap: () =>
+                context.read<UpdateCoordinator>().checkForUpdates(manual: true),
           ),
           ListTile(
             leading: const Icon(Icons.logout),

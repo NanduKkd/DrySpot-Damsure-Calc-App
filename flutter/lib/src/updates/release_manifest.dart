@@ -4,7 +4,7 @@ import 'dart:convert';
 /// base URL. It is a release-policy trust boundary, not an API route.
 const String _productionReleaseOrigin = 'https://damsure.nandakrishnan.in';
 const String _releaseFlavor = String.fromEnvironment(
-  'FLUTTER_APP_FLAVOR',
+  'DAMSURE_RELEASE_FLAVOR',
   defaultValue: 'production',
 );
 const String _stagingReleaseOrigin = String.fromEnvironment(
@@ -16,9 +16,33 @@ const String _stagingReleaseOrigin = String.fromEnvironment(
 String get releaseManifestEndpoint =>
     '${_releaseOriginForFlavor()}/releases/manifest.json';
 
-String _releaseOriginForFlavor() => _releaseFlavor == 'staging'
-    ? _stagingReleaseOrigin
-    : _productionReleaseOrigin;
+String _releaseOriginForFlavor() {
+  if (_releaseFlavor == 'production') {
+    if (_stagingReleaseOrigin.isNotEmpty) {
+      throw StateError('Production builds must not contain a staging origin.');
+    }
+    return _productionReleaseOrigin;
+  }
+  if (_releaseFlavor == 'staging') {
+    final origin = Uri.tryParse(_stagingReleaseOrigin);
+    if (origin == null ||
+        origin.scheme != 'https' ||
+        origin.host.isEmpty ||
+        origin.hasPort ||
+        origin.userInfo.isNotEmpty ||
+        origin.hasQuery ||
+        origin.hasFragment ||
+        (origin.path.isNotEmpty && origin.path != '/')) {
+      throw StateError('Staging builds require an exact HTTPS release origin.');
+    }
+    if (origin.origin == _productionReleaseOrigin) {
+      throw StateError('Staging builds must not use the production origin.');
+    }
+    return origin.origin;
+  }
+  throw StateError('Unsupported Android application flavor.');
+}
+
 const int _schemaVersion = 1;
 const int _maxSignedInt32 = 2147483647;
 const int _maxReasonLength = 500;
@@ -491,6 +515,31 @@ class ReleaseManifestHighWaterMark {
   /// policy cannot regress either version-code threshold.
   final int? latestVersionCode;
   final int? minimumSupportedVersionCode;
+
+  /// Restores a persisted strict-v1 high-water record. APP-113 must compare
+  /// this value with a freshly parsed policy before treating storage as valid.
+  factory ReleaseManifestHighWaterMark.restore({
+    required int manifestRevision,
+    required String canonicalFingerprint,
+    required int? latestVersionCode,
+    required int? minimumSupportedVersionCode,
+  }) {
+    if (manifestRevision <= 0 ||
+        canonicalFingerprint.isEmpty ||
+        (latestVersionCode != null &&
+            (latestVersionCode <= 0 || latestVersionCode > _maxSignedInt32)) ||
+        (minimumSupportedVersionCode != null &&
+            (minimumSupportedVersionCode <= 0 ||
+                minimumSupportedVersionCode > _maxSignedInt32))) {
+      throw ArgumentError('Invalid persisted release-policy high-water mark.');
+    }
+    return ReleaseManifestHighWaterMark._(
+      manifestRevision: manifestRevision,
+      canonicalFingerprint: canonicalFingerprint,
+      latestVersionCode: latestVersionCode,
+      minimumSupportedVersionCode: minimumSupportedVersionCode,
+    );
+  }
 
   /// Creates the next persisted high-water value from an accepted strict v1
   /// policy. Callers must validate it first with [validateManifestHighWater].

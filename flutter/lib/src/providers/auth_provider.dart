@@ -209,6 +209,14 @@ class AuthProvider extends ChangeNotifier {
   }
 }
 
+final Expando<Future<void>> _autoLoginFlights = Expando<Future<void>>();
+
+/// APP-113 creates auth only after the updater permits normal flow. Keeping
+/// this as an extension preserves the provider's existing mockable interface.
+extension AuthProviderAutoLoginOnce on AuthProvider {
+  Future<void> tryAutoLoginOnce() => _autoLoginFlights[this] ??= tryAutoLogin();
+}
+
 extension AuthProviderSessionAccess on AuthProvider {
   SessionSnapshot? get sessionSnapshot => _sessionManager.current;
 

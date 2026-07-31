@@ -9,9 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FLUTTER_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$FLUTTER_DIR"
-flutter build apk --debug
+flutter build apk --debug --flavor production \
+  --dart-define=DAMSURE_RELEASE_FLAVOR=production
 
-MERGED_MANIFEST=$(find "$FLUTTER_DIR/build/app/intermediates/merged_manifests/debug" \
+MERGED_MANIFEST=$(find "$FLUTTER_DIR/build/app/intermediates/merged_manifests/productionDebug" \
   -path '*/AndroidManifest.xml' -print -quit)
 
 if [[ -z "$MERGED_MANIFEST" || ! -f "$MERGED_MANIFEST" ]]; then
@@ -21,8 +22,10 @@ fi
 
 required_permissions=(
   "android.permission.INTERNET"
+  "android.permission.ACCESS_NETWORK_STATE"
   "android.permission.ACCESS_COARSE_LOCATION"
   "android.permission.ACCESS_FINE_LOCATION"
+  "android.permission.REQUEST_INSTALL_PACKAGES"
 )
 
 # Photo capture and gallery selection use Android intents/photo picker; no
@@ -67,5 +70,6 @@ if [[ "$actual_permissions" != "$expected_permissions" ]]; then
   exit 1
 fi
 
-echo "Android permissions verified: INTERNET (API sync/photo transfer),"
-echo "ACCESS_COARSE_LOCATION and ACCESS_FINE_LOCATION (current client location)."
+echo "Android permissions verified: INTERNET (API sync/photo transfer), ACCESS_NETWORK_STATE (sync reconnect status),"
+echo "ACCESS_COARSE_LOCATION and ACCESS_FINE_LOCATION (current client location),"
+echo "REQUEST_INSTALL_PACKAGES (user-initiated verified private-APK handoff)."
