@@ -9,6 +9,56 @@ const { test: nodeTest } = require('node:test');
 function test(name, ...args) { return nodeTest(name, ...args); }
 const { PACKAGE_IDS, LocalReleaseTarget, basicArtifactMetadata, buildManifest, canonicalManifestIdentity, emptyLedger, publishToLocalFixture, readLedger, recoverLedgerLock, recoverPublication, resolveRecoveryGuard, reserveVersionCodeAtPath, verifyApkArtifact, withLedgerLock } = require('../lib.cjs');
 const origin = 'https://staging.example.test'; const time = '2026-07-30T12:00:00Z';
+
+test('canonical staging parser command supplies the staging flavor define', async () => {
+  const packageJson = JSON.parse(
+    await fs.readFile(path.resolve(__dirname, '../../../package.json'), 'utf8'),
+  );
+  const command = packageJson.scripts['test:update-parser:staging'];
+  assert.equal(command, './tools/update-publishing/test-staging-parser.sh');
+  const script = await fs.readFile(
+    path.resolve(__dirname, '../test-staging-parser.sh'),
+    'utf8',
+  );
+  assert.match(script, /--flavor staging/);
+  assert.match(script, /--dart-define=DAMSURE_RELEASE_FLAVOR=staging/);
+  assert.match(
+    script,
+    /--dart-define=DAMSURE_STAGING_ORIGIN=https:\/\/staging\.example\.test/,
+  );
+  assert.match(script, /release_manifest_staging_test\.dart/);
+  assert.match(script, /Staging parser gate did not execute its required test/);
+});
+
+test('staging parser wrapper rejects a false-green skipped test', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'damsure-staging-gate-'));
+  try {
+    const bin = path.join(root, 'bin');
+    await fs.mkdir(bin);
+    const flutter = path.join(bin, 'flutter');
+    await fs.writeFile(
+      flutter,
+      '#!/usr/bin/env bash\nprintf "00:00 +0: staging flavor binds only its compile-time release origin\\n  Skip: Requires staging compile-time defines.\\n00:00 +0 ~1: All tests passed!\\n"\n',
+    );
+    await fs.chmod(flutter, 0o755);
+    const script = path.resolve(__dirname, '../test-staging-parser.sh');
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(script, [], {
+        cwd: path.resolve(__dirname, '../../..'),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stderr }));
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /did not execute its required test/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 async function fixture() { const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'damsure-publish-'))); return { root, remote: path.join(root, 'remote'), ledgerPath: path.join(root, 'ledger.json') }; }
 async function fakeTools(root) { const aapt = path.join(root, 'aapt'); const apksigner = path.join(root, 'apksigner'); const stagingCertificate = 'AA'.repeat(32); const productionCertificate = 'BB'.repeat(32); await fs.writeFile(aapt, "#!/usr/bin/env node\nconsole.log(\"package: name='com.dryspotuppala.staging' versionCode='2' versionName='1.0.2'\")\n"); await fs.writeFile(apksigner, `#!/usr/bin/env node\nconsole.log('Signer #1 certificate SHA-256 digest: ${stagingCertificate}')\n`); await fs.chmod(aapt, 0o755); await fs.chmod(apksigner, 0o755); const hash = async (file) => crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex'); const toolManifest = path.join(root, 'tool-manifest.json'); await fs.writeFile(toolManifest, `${JSON.stringify({ schemaVersion: 1, tools: { aapt: { path: aapt, sha256: await hash(aapt) }, apksigner: { path: apksigner, sha256: await hash(apksigner) } }, certificates: { production: productionCertificate, staging: stagingCertificate } })}\n`, { mode: 0o600 }); return { aapt, apksigner, toolManifest, stagingCertificate, productionCertificate }; }
 async function candidate(root) { const artifact = path.join(root, 'candidate.apk'); await fs.writeFile(artifact, Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('fixture')])); return { artifact, ...(await basicArtifactMetadata(artifact, { requireApkZip: true })) }; }

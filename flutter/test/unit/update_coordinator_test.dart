@@ -65,6 +65,12 @@ void main() {
         trustedResponseAt: trusted,
       );
 
+  TrustedManifestResponse disabledResponse(DateTime trustedResponseAt) =>
+      TrustedManifestResponse(
+        document: fixture('disabled_v1'),
+        trustedResponseAt: trustedResponseAt,
+      );
+
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
   test('persists a required policy before it can be presented', () async {
@@ -92,7 +98,6 @@ void main() {
     await store.accept(
       parsed,
       trustedResponseAt: trusted,
-      previous: null,
     );
     final coordinator = UpdateCoordinator(
       platform: const _Platform(10299),
@@ -104,6 +109,66 @@ void main() {
     expect(coordinator.state.policyStatus, UpdatePolicyStatus.required);
     expect(coordinator.state.failure, UpdateFailureKind.network);
     expect(coordinator.state.blocksNormalFlow, isTrue);
+  });
+
+  test(
+      'a corrupt policy record stays blocking and cannot be replaced by strict disabled metadata',
+      () async {
+    const corruptRecord = '{"recordVersion":1,"truncated":true}';
+    SharedPreferences.setMockInitialValues({
+      'app113.accepted_policy.v1': corruptRecord,
+    });
+    final coordinator = UpdateCoordinator(
+      platform: const _Platform(10299),
+      transport:
+          _Transport(disabledResponse(trusted.add(const Duration(hours: 1)))),
+    );
+
+    await coordinator.initialize();
+
+    expect(coordinator.state.policyStatus, UpdatePolicyStatus.storageFailure);
+    expect(coordinator.state.failure, UpdateFailureKind.storage);
+    expect(coordinator.state.blocksNormalFlow, isTrue);
+    expect(
+      (await SharedPreferences.getInstance())
+          .getString('app113.accepted_policy.v1'),
+      corruptRecord,
+      reason: 'no unprovable network recovery may overwrite unknown high-water',
+    );
+    expect(
+        (await UpdatePolicyStore().load()).kind, UpdatePolicyLoadKind.corrupt);
+  });
+
+  test('an older trusted Date cannot change accepted policy or dismissal time',
+      () async {
+    final acceptedAt = trusted.add(const Duration(hours: 1));
+    final store = UpdatePolicyStore();
+    final accepted = await store.accept(
+      ReleaseManifestParser.parse(
+        fixture('available_current'),
+        trustedNowUtc: acceptedAt,
+      ) as AvailableReleaseManifestResult,
+      trustedResponseAt: acceptedAt,
+    );
+    await store.dismissOptional(
+      (accepted!.policy as AvailableReleaseManifestResult)
+          .manifest
+          .latestVersionCode,
+      acceptedAt,
+    );
+    final coordinator = UpdateCoordinator(
+      platform: const _Platform(10350),
+      transport: _Transport(availableResponse()),
+    );
+
+    await coordinator.initialize();
+
+    expect(coordinator.state.policyStatus, UpdatePolicyStatus.optional);
+    expect(coordinator.state.failure, UpdateFailureKind.rollback);
+    expect(coordinator.state.trustedResponseAt, acceptedAt);
+    expect(coordinator.state.showOptionalPrompt, isFalse);
+    final reloaded = await store.load();
+    expect(reloaded.acceptedPolicy!.trustedResponseAt, acceptedAt);
   });
 
   test(

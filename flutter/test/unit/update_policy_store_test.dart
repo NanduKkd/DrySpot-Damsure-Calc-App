@@ -32,7 +32,6 @@ void main() {
     final accepted = await store.accept(
       available(),
       trustedResponseAt: trusted,
-      previous: null,
     );
 
     final loaded = await store.load();
@@ -69,18 +68,38 @@ void main() {
         (await UpdatePolicyStore().load()).kind, UpdatePolicyLoadKind.corrupt);
   });
 
+  test('never overwrites a corrupt atomic policy record during acceptance',
+      () async {
+    const corruptRecord = '{"recordVersion":1,"truncated":true}';
+    SharedPreferences.setMockInitialValues({
+      'app113.accepted_policy.v1': corruptRecord,
+    });
+
+    await expectLater(
+      UpdatePolicyStore().accept(
+        disabled(),
+        trustedResponseAt: trusted.add(const Duration(hours: 1)),
+      ),
+      throwsA(isA<UpdatePolicyStoreException>()),
+    );
+
+    expect(
+      (await SharedPreferences.getInstance())
+          .getString('app113.accepted_policy.v1'),
+      corruptRecord,
+    );
+  });
+
   test('newer disabled policy retains previous version maxima', () async {
     SharedPreferences.setMockInitialValues({});
     final store = UpdatePolicyStore();
-    final availablePolicy = await store.accept(
+    await store.accept(
       available(),
       trustedResponseAt: trusted,
-      previous: null,
     );
     final disabledPolicy = await store.accept(
       disabled(),
       trustedResponseAt: trusted.add(const Duration(minutes: 5)),
-      previous: availablePolicy!.highWater,
     );
 
     expect(disabledPolicy!.highWater.latestVersionCode, 10400);
@@ -91,6 +110,30 @@ void main() {
       reloaded.acceptedPolicy!.highWater.minimumSupportedVersionCode,
       10300,
     );
+  });
+
+  test('rejects an accepted policy response whose trusted time moves backward',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = UpdatePolicyStore();
+    final acceptedAt = trusted.add(const Duration(hours: 1));
+    await store.accept(
+      available(),
+      trustedResponseAt: acceptedAt,
+    );
+
+    await expectLater(
+      store.accept(
+        disabled(),
+        trustedResponseAt: trusted,
+      ),
+      throwsA(isA<UpdatePolicyStoreException>()),
+    );
+
+    final reloaded = await store.load();
+    expect(reloaded.kind, UpdatePolicyLoadKind.valid);
+    expect(reloaded.acceptedPolicy!.trustedResponseAt, acceptedAt);
+    expect(reloaded.acceptedPolicy!.highWater.manifestRevision, 42);
   });
 
   test('optional dismissal uses the supplied trusted response time', () async {

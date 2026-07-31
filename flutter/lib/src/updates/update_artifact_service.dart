@@ -231,21 +231,19 @@ class UpdateArtifactService {
         onPhase(UpdateOperationPhase.verifying);
         await _verify(finalFile, manifest);
         return finalFile;
-      } on UpdateArtifactException {
-        await _deleteIfExists(finalFile);
-        await _artifactStore.clear();
-        rethrow;
+      } on Object catch (error) {
+        await _rejectArtifact(finalFile);
+        if (error is UpdateArtifactException) rethrow;
+        throw const UpdateArtifactException(UpdateFailureKind.unexpected);
       }
     }
-    await _deleteIfExists(finalFile);
-    await _artifactStore.clear();
+    await _rejectArtifact(finalFile);
     return _download(root, manifest, onPhase);
   }
 
   Future<void> discard(AvailableReleaseManifest manifest) async {
     final root = await _root();
-    await _deleteIfExists(_finalFile(root, manifest.latestVersionCode));
-    await _artifactStore.clear();
+    await _rejectArtifact(_finalFile(root, manifest.latestVersionCode));
   }
 
   Future<File> _download(
@@ -264,14 +262,15 @@ class UpdateArtifactService {
     await _deleteIfExists(destination);
     ArtifactDownloadResponse? response;
     IOSink? sink;
+    var accepted = false;
     try {
       onPhase(UpdateOperationPhase.downloading);
       response = await _transport.open(manifest.artifactUrl);
       if (response.statusCode != HttpStatus.ok ||
           response.redirected ||
           !_isApkContentType(response.contentType) ||
-          (response.contentLength != null &&
-              response.contentLength != manifest.sizeBytes)) {
+          response.contentLength == null ||
+          response.contentLength != manifest.sizeBytes) {
         throw const UpdateArtifactException(UpdateFailureKind.transport);
       }
       sink = part.openWrite(mode: FileMode.writeOnly);
@@ -300,6 +299,7 @@ class UpdateArtifactService {
       onPhase(UpdateOperationPhase.verifying);
       await _verify(destination, manifest);
       await _artifactStore.save(manifest);
+      accepted = true;
       return destination;
     } on TimeoutException {
       throw const UpdateArtifactException(UpdateFailureKind.timeout);
@@ -312,8 +312,23 @@ class UpdateArtifactService {
     } finally {
       await sink?.close();
       await response?.close();
-      if (!await _isRegularFile(destination)) {
-        await _deleteIfExists(part);
+      if (!accepted) {
+        // Once the atomic rename has occurred, Dart metadata/hash validation
+        // and native package/signer validation are still rejection points.
+        // Neither a rejected final APK nor its "ready" record may survive.
+        await _rejectArtifact(destination, part: part);
+      }
+    }
+  }
+
+  Future<void> _rejectArtifact(File finalFile, {File? part}) async {
+    try {
+      await _deleteIfExists(finalFile);
+    } finally {
+      try {
+        if (part != null) await _deleteIfExists(part);
+      } finally {
+        await _artifactStore.clear();
       }
     }
   }

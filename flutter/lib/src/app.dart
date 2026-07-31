@@ -70,51 +70,49 @@ class _AppState extends State<App> with WidgetsBindingObserver {
           value: _updateCoordinator,
         ),
       ],
-      child: Consumer<ThemeProvider>(
-        builder: (context, theme, _) => MaterialApp(
-          title: 'DrySpot Uppala',
-          theme: ThemeData.light(useMaterial3: true),
-          darkTheme: ThemeData.dark(useMaterial3: true),
-          themeMode: theme.themeMode,
-          home: _UpdateBootstrap(
+      child: Consumer2<ThemeProvider, UpdateCoordinator>(
+        builder: (context, theme, update, _) {
+          final state = update.state;
+          if (state.isStartupPending) {
+            return _materialApp(theme, const SplashScreen());
+          }
+          if (state.blocksNormalFlow) {
+            return _materialApp(theme, const UpdateGateScreen());
+          }
+          // The provider graph wraps the navigator, rather than just its
+          // home route, so normal pushed routes retain their app-scoped
+          // dependencies.  Transitioning back to a blocking state removes
+          // this entire subtree (and every pushed normal route) before the
+          // updater gate is rendered.
+          return _NormalApplication(
             apiService: widget.apiService,
             sessionManager: _sessionManager,
-          ),
-        ),
+            child: _materialApp(theme, const _AuthRestoreGate()),
+          );
+        },
       ),
     );
   }
-}
 
-class _UpdateBootstrap extends StatelessWidget {
-  const _UpdateBootstrap({
-    required this.apiService,
-    required this.sessionManager,
-  });
-
-  final ApiService apiService;
-  final SessionManager sessionManager;
-
-  @override
-  Widget build(BuildContext context) {
-    final update = context.watch<UpdateCoordinator>().state;
-    if (update.isStartupPending) return const SplashScreen();
-    if (update.blocksNormalFlow) return const UpdateGateScreen();
-    return _NormalApplication(
-      apiService: apiService,
-      sessionManager: sessionManager,
-    );
-  }
+  Widget _materialApp(ThemeProvider theme, Widget home) => MaterialApp(
+        title: 'DrySpot Uppala',
+        theme: ThemeData.light(useMaterial3: true),
+        darkTheme: ThemeData.dark(useMaterial3: true),
+        themeMode: theme.themeMode,
+        home: home,
+      );
 }
 
 class _NormalApplication extends StatelessWidget {
   const _NormalApplication({
     required this.apiService,
     required this.sessionManager,
+    required this.child,
   });
 
   final ApiService apiService;
   final SessionManager sessionManager;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
@@ -169,7 +167,7 @@ class _NormalApplication extends StatelessWidget {
         ),
         Provider<ApiService>.value(value: apiService),
       ],
-      child: const _AuthRestoreGate(),
+      child: child,
     );
   }
 }

@@ -70,9 +70,31 @@ class UpdatePolicyStore {
   Future<UpdateAcceptedPolicy?> accept(
     ValidReleaseManifestResult candidate, {
     required DateTime trustedResponseAt,
-    required ReleaseManifestHighWaterMark? previous,
   }) async {
-    if (!validateManifestHighWater(candidate, previous: previous).isAccepted) {
+    // Re-read the one atomic policy record at the commit boundary.  This keeps
+    // high-water and trusted-time validation coupled even if a future caller
+    // forgets to retain its own in-memory snapshot.
+    final loaded = await load();
+    if (loaded.kind == UpdatePolicyLoadKind.corrupt ||
+        loaded.kind == UpdatePolicyLoadKind.unavailable) {
+      throw const UpdatePolicyStoreException();
+    }
+    final previous = loaded.acceptedPolicy;
+    if (!validateManifestHighWater(
+      candidate,
+      previous: previous?.highWater,
+    ).isAccepted) {
+      throw const UpdatePolicyStoreException();
+    }
+    final normalizedTrustedResponseAt = trustedResponseAt.toUtc();
+    // A response Date is part of the policy's anti-rollback boundary.  The
+    // same atomically accepted snapshot as its high-water mark. Accepting an
+    // older Date would let a replayed response alter dismissal or policy
+    // evaluation time.
+    if (previous != null &&
+        normalizedTrustedResponseAt.isBefore(
+          previous.trustedResponseAt.toUtc(),
+        )) {
       throw const UpdatePolicyStoreException();
     }
     // The exact legacy disabled response deliberately has no persisted state.
@@ -80,12 +102,12 @@ class UpdatePolicyStore {
 
     final highWater = ReleaseManifestHighWaterMark.fromAcceptedPolicy(
       candidate,
-      previous: previous,
+      previous: previous?.highWater,
     );
     final accepted = UpdateAcceptedPolicy(
       policy: candidate,
       highWater: highWater,
-      trustedResponseAt: trustedResponseAt.toUtc(),
+      trustedResponseAt: normalizedTrustedResponseAt,
     );
     final body = _policyRecordBody(accepted);
     final encoded = jsonEncode(<String, Object?>{

@@ -25,7 +25,7 @@
     "test:backend:integration": "./scripts/test-summary.sh backend integration",
     "test:update-publishing": "node --test tools/update-publishing/test/*.test.cjs",
     "test:update-parser:production": "cd flutter && flutter test --no-pub test/unit/release_manifest_test.dart",
-    "test:update-parser:staging": "cd flutter && flutter test --no-pub --flavor staging --dart-define=DAMSURE_STAGING_ORIGIN=https://staging.example.test test/unit/release_manifest_staging_test.dart",
+    "test:update-parser:staging": "./tools/update-publishing/test-staging-parser.sh",
     "check:update-nginx": "./tools/update-publishing/check-nginx-release-template.sh",
     "check:gradle-release-guard": "./tools/update-publishing/check-gradle-release-guard.sh",
     "check:production-isolation": "./tools/update-publishing/check-production-isolation.sh",

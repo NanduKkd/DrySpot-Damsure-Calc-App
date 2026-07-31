@@ -6,6 +6,8 @@ import 'package:app_client/src/providers/auth_provider.dart';
 import 'package:app_client/src/providers/client_provider.dart';
 import 'package:app_client/src/providers/settings_provider.dart';
 import 'package:app_client/src/providers/sync_provider.dart';
+import 'package:app_client/src/screens/settings/settings_screen.dart';
+import 'package:app_client/src/screens/splash_screen.dart';
 import 'package:app_client/src/screens/update/update_gate_screen.dart';
 import 'package:app_client/src/services/api_service.dart';
 import 'package:app_client/src/updates/android_update_bridge.dart';
@@ -14,6 +16,7 @@ import 'package:app_client/src/updates/update_coordinator.dart';
 import 'package:app_client/src/updates/update_policy_store.dart';
 import 'package:app_client/src/updates/update_state.dart';
 import 'package:app_client/src/updates/update_transport.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -50,6 +53,46 @@ class _OfflineTransport implements ReleaseManifestTransport {
       );
 }
 
+class _ControllableCoordinator extends UpdateCoordinator {
+  _ControllableCoordinator() : super(platform: _Platform());
+
+  UpdateViewState _controlledState = const UpdateViewState(
+    policyStatus: UpdatePolicyStatus.disabled,
+    isChecking: false,
+  );
+
+  @override
+  UpdateViewState get state => _controlledState;
+
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  Future<void> reconcileInstalledVersionAfterResume() async {}
+
+  void requireUpdate() {
+    _controlledState = UpdateViewState(
+      policyStatus: UpdatePolicyStatus.required,
+      manifest: AvailableReleaseManifest(
+        manifestRevision: 42,
+        latestVersion: '1.4.0',
+        latestVersionCode: 10400,
+        minimumSupportedVersionCode: 10300,
+        artifactUrl: Uri.parse(
+          'https://damsure.nandakrishnan.in/releases/damsure-10400.apk',
+        ),
+        sha256: 'a' * 64,
+        sizeBytes: 1024,
+        publishedAt: DateTime.utc(2026, 7, 30, 10),
+        releaseNotes: 'Required release.',
+        requiredUpdateReason: 'Update to continue.',
+      ),
+      isChecking: false,
+    );
+    notifyListeners();
+  }
+}
+
 void main() {
   testWidgets(
       'required updater exists before auth/client providers are constructed',
@@ -69,7 +112,6 @@ void main() {
     await UpdatePolicyStore().accept(
       parsed,
       trustedResponseAt: trusted,
-      previous: null,
     );
     final coordinator = UpdateCoordinator(
       platform: _Platform(),
@@ -102,5 +144,42 @@ void main() {
       () => gateContext.read<SyncProvider>(),
       throwsA(isA<ProviderNotFoundException>()),
     );
+  });
+
+  testWidgets(
+      'pushed normal routes retain app providers and are removed by a live required gate',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final coordinator = _ControllableCoordinator();
+    await tester.pumpWidget(
+      App(
+        apiService: ApiService(serverUrl: 'https://damsure.nandakrishnan.in'),
+        updateCoordinator: coordinator,
+      ),
+    );
+    await tester.pump();
+
+    final normalContext = tester.element(find.byType(SplashScreen));
+    Navigator.of(normalContext).push(
+      MaterialPageRoute<void>(builder: (_) => const SettingsScreen()),
+    );
+    await tester.pumpAndSettle();
+
+    final settingsContext = tester.element(find.byType(SettingsScreen));
+    expect(settingsContext.read<AuthProvider>(), isA<AuthProvider>());
+    expect(settingsContext.read<ClientProvider>(), isA<ClientProvider>());
+    expect(settingsContext.read<SettingsProvider>(), isA<SettingsProvider>());
+    expect(settingsContext.read<SyncProvider>(), isA<SyncProvider>());
+
+    // Let the deliberately delayed auth restore finish while the normal route
+    // is still permitted, so the test does not leave its timer pending.
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
+
+    coordinator.requireUpdate();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(UpdateGateScreen), findsOneWidget);
+    expect(find.byType(SettingsScreen), findsNothing);
   });
 }

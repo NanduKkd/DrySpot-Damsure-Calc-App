@@ -138,11 +138,12 @@ class UpdateCoordinator extends ChangeNotifier {
         await _finishRejected(UpdateFailureKind.malformed);
         return;
       }
-      // A corrupt/unavailable persisted record may not be replaced by legacy
-      // disabled metadata because it would erase an unknown required policy.
-      if (parsed.isLegacyDisabled &&
-          (_loadKind == UpdatePolicyLoadKind.corrupt ||
-              _loadKind == UpdatePolicyLoadKind.unavailable)) {
+      // There is no valid high-water mark to compare against after a corrupt
+      // or unavailable atomic record.  Every network policy, including a
+      // strict disabled v1 record, must therefore be rejected: replacing it
+      // would make an unknown cached required policy disappear.
+      if (_loadKind == UpdatePolicyLoadKind.corrupt ||
+          _loadKind == UpdatePolicyLoadKind.unavailable) {
         await _finishRejected(UpdateFailureKind.rollback);
         return;
       }
@@ -151,10 +152,17 @@ class UpdateCoordinator extends ChangeNotifier {
         await _finishRejected(UpdateFailureKind.rollback);
         return;
       }
+      final previousTrustedResponseAt = _accepted?.trustedResponseAt;
+      if (previousTrustedResponseAt != null &&
+          response.trustedResponseAt.toUtc().isBefore(
+                previousTrustedResponseAt.toUtc(),
+              )) {
+        await _finishRejected(UpdateFailureKind.rollback);
+        return;
+      }
       final persisted = await _policyStore.accept(
         parsed,
         trustedResponseAt: response.trustedResponseAt,
-        previous: highWater,
       );
       // Strict v1 persistence happens before classification, auth restoration,
       // or any download. Legacy disabled is intentionally the sole null case.
@@ -311,6 +319,7 @@ class UpdateCoordinator extends ChangeNotifier {
             _state.policyStatus != UpdatePolicyStatus.required)) {
       return;
     }
+    var hasInstallerCandidate = false;
     try {
       if (!await _platform.canRequestPackageInstalls()) {
         _setState(
@@ -327,6 +336,7 @@ class UpdateCoordinator extends ChangeNotifier {
         onPhase: (phase) =>
             _setState(_state.copyWith(operation: phase, clearFailure: true)),
       );
+      hasInstallerCandidate = true;
       _setState(
         _state.copyWith(
           operation: UpdateOperationPhase.readyToInstall,
@@ -349,13 +359,15 @@ class UpdateCoordinator extends ChangeNotifier {
       );
       final result = await _platform.launchInstaller(file, manifest);
       if (!result.isSuccess) {
-        await _artifactService.discard(manifest);
+        await _discardArtifactSafely(manifest);
+        hasInstallerCandidate = false;
         throw UpdateArtifactException(_nativeFailure(result.failure));
       }
       // Keep the verified app-private file until a post-installer process
       // launch observes the upgraded installed version and recovery removes it.
       _setState(_state.copyWith(operation: UpdateOperationPhase.idle));
     } on UpdateArtifactException catch (error) {
+      if (hasInstallerCandidate) await _discardArtifactSafely(manifest);
       _setState(
         _state.copyWith(
           operation: UpdateOperationPhase.idle,
@@ -363,12 +375,23 @@ class UpdateCoordinator extends ChangeNotifier {
         ),
       );
     } on Object {
+      if (hasInstallerCandidate) await _discardArtifactSafely(manifest);
       _setState(
         _state.copyWith(
           operation: UpdateOperationPhase.idle,
           failure: UpdateFailureKind.unexpected,
         ),
       );
+    }
+  }
+
+  Future<void> _discardArtifactSafely(AvailableReleaseManifest manifest) async {
+    try {
+      await _artifactService.discard(manifest);
+    } on Object {
+      // A rejected installer handoff is never reusable.  Keep reporting the
+      // original verification/installer failure even if disposable-cache
+      // cleanup encounters an OS error; recovery retries on the next launch.
     }
   }
 
