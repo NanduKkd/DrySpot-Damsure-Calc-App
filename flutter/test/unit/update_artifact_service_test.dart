@@ -75,11 +75,12 @@ ArtifactDownloadResponse _response(
   List<int> bytes, {
   int? length,
   bool omitContentLength = false,
+  String? contentType = 'application/vnd.android.package-archive',
 }) =>
     ArtifactDownloadResponse(
       statusCode: HttpStatus.ok,
       redirected: false,
-      contentType: 'application/vnd.android.package-archive',
+      contentType: contentType,
       contentLength: omitContentLength ? null : length ?? bytes.length,
       bytes: Stream<List<int>>.fromIterable(<List<int>>[bytes]),
       close: () async {},
@@ -159,6 +160,45 @@ void main() {
         ),
       ),
     );
+    final root = Directory('${cache.path}${Platform.pathSeparator}updates');
+    expect(await root.list().toList(), isEmpty);
+    expect(await VerifiedArtifactStore().load(), isNull);
+  });
+
+  test('accepts exact APK MIME and rejects parameters without artifacts',
+      () async {
+    final bytes = <int>[0x50, 0x4b, 0x03, 0x04, 1, 2, 3];
+    final manifest = _manifest(bytes);
+    final exactService = UpdateArtifactService(
+      platform: _Platform(),
+      transport: _Transport(_response(bytes)),
+      cacheDirectory: () async => cache,
+    );
+    await exactService.obtain(manifest, onPhase: (_) {});
+    await exactService.discard(manifest);
+
+    final parameterizedService = UpdateArtifactService(
+      platform: _Platform(),
+      transport: _Transport(
+        _response(
+          bytes,
+          contentType:
+              'application/vnd.android.package-archive; charset=binary',
+        ),
+      ),
+      cacheDirectory: () async => cache,
+    );
+    await expectLater(
+      parameterizedService.obtain(manifest, onPhase: (_) {}),
+      throwsA(
+        isA<UpdateArtifactException>().having(
+          (error) => error.kind,
+          'kind',
+          UpdateFailureKind.transport,
+        ),
+      ),
+    );
+
     final root = Directory('${cache.path}${Platform.pathSeparator}updates');
     expect(await root.list().toList(), isEmpty);
     expect(await VerifiedArtifactStore().load(), isNull);

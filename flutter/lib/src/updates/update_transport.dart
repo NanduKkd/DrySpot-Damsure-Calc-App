@@ -35,7 +35,7 @@ class NetworkReleaseManifestTransport implements ReleaseManifestTransport {
     this.bodyTimeout = const Duration(seconds: 15),
   }) : _clientFactory = clientFactory ?? HttpClient.new;
 
-  static const _maximumManifestBytes = 64 * 1024;
+  static const _maximumManifestBytes = 32 * 1024;
   final HttpClient Function() _clientFactory;
   final Duration connectionTimeout;
   final Duration bodyTimeout;

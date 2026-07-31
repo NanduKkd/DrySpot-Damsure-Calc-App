@@ -100,6 +100,17 @@ class _AppState extends State<App> with WidgetsBindingObserver {
         darkTheme: ThemeData.dark(useMaterial3: true),
         themeMode: theme.themeMode,
         home: home,
+        // This builder wraps the Navigator rather than only its home route.
+        // An optional manual check from Settings or any other pushed route is
+        // therefore presented above the initiating route. Required policy
+        // still replaces the whole normal application subtree above.
+        builder: (context, child) => Stack(
+          fit: StackFit.expand,
+          children: [
+            child ?? const SizedBox.shrink(),
+            const OptionalUpdatePrompt(),
+          ],
+        ),
       );
 }
 
@@ -191,16 +202,11 @@ class _AuthRestoreGateState extends State<_AuthRestoreGate> {
   @override
   Widget build(BuildContext context) {
     return Consumer<AuthProvider>(
-      builder: (context, auth, _) => Stack(
-        children: [
-          auth.isRestoringSession
-              ? const SplashScreen()
-              : auth.isAuthenticated
-                  ? const ClientListScreen()
-                  : const LoginScreen(),
-          const OptionalUpdatePrompt(),
-        ],
-      ),
+      builder: (context, auth, _) => auth.isRestoringSession
+          ? const SplashScreen()
+          : auth.isAuthenticated
+              ? const ClientListScreen()
+              : const LoginScreen(),
     );
   }
 }

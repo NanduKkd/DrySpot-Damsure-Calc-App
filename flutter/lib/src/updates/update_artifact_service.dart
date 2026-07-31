@@ -429,8 +429,7 @@ class UpdateArtifactService {
 
 bool _isApkContentType(String? value) =>
     value != null &&
-    value.split(';').first.trim().toLowerCase() ==
-        'application/vnd.android.package-archive';
+    value.trim().toLowerCase() == 'application/vnd.android.package-archive';
 
 class _DigestSink implements Sink<Digest> {
   Digest? digest;

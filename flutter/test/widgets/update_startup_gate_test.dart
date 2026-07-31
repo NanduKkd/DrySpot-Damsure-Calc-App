@@ -56,6 +56,10 @@ class _OfflineTransport implements ReleaseManifestTransport {
 class _ControllableCoordinator extends UpdateCoordinator {
   _ControllableCoordinator() : super(platform: _Platform());
 
+  int manualChecks = 0;
+  int optionalDismissals = 0;
+  int installRequests = 0;
+
   UpdateViewState _controlledState = const UpdateViewState(
     policyStatus: UpdatePolicyStatus.disabled,
     isChecking: false,
@@ -70,10 +74,7 @@ class _ControllableCoordinator extends UpdateCoordinator {
   @override
   Future<void> reconcileInstalledVersionAfterResume() async {}
 
-  void requireUpdate() {
-    _controlledState = UpdateViewState(
-      policyStatus: UpdatePolicyStatus.required,
-      manifest: AvailableReleaseManifest(
+  AvailableReleaseManifest get _manifest => AvailableReleaseManifest(
         manifestRevision: 42,
         latestVersion: '1.4.0',
         latestVersionCode: 10400,
@@ -86,7 +87,37 @@ class _ControllableCoordinator extends UpdateCoordinator {
         publishedAt: DateTime.utc(2026, 7, 30, 10),
         releaseNotes: 'Required release.',
         requiredUpdateReason: 'Update to continue.',
-      ),
+      );
+
+  @override
+  Future<void> checkForUpdates({bool manual = false}) async {
+    if (manual) manualChecks++;
+    _controlledState = UpdateViewState(
+      policyStatus: UpdatePolicyStatus.optional,
+      manifest: _manifest,
+      trustedResponseAt: DateTime.utc(2026, 7, 30, 10),
+      showOptionalPrompt: true,
+      isChecking: false,
+    );
+    notifyListeners();
+  }
+
+  @override
+  Future<void> dismissOptional() async {
+    optionalDismissals++;
+    _controlledState = _controlledState.copyWith(showOptionalPrompt: false);
+    notifyListeners();
+  }
+
+  @override
+  Future<void> downloadAndInstall() async {
+    installRequests++;
+  }
+
+  void requireUpdate() {
+    _controlledState = UpdateViewState(
+      policyStatus: UpdatePolicyStatus.required,
+      manifest: _manifest,
       isChecking: false,
     );
     notifyListeners();
@@ -181,5 +212,47 @@ void main() {
 
     expect(find.byType(UpdateGateScreen), findsOneWidget);
     expect(find.byType(SettingsScreen), findsNothing);
+  });
+
+  testWidgets('manual Settings checks show optional actions above Settings',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final coordinator = _ControllableCoordinator();
+    await tester.pumpWidget(
+      App(
+        apiService: ApiService(serverUrl: 'https://damsure.nandakrishnan.in'),
+        updateCoordinator: coordinator,
+      ),
+    );
+    await tester.pump();
+    final normalContext = tester.element(find.byType(SplashScreen));
+    Navigator.of(normalContext).push(
+      MaterialPageRoute<void>(builder: (_) => const SettingsScreen()),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Check for updates'));
+    await tester.pumpAndSettle();
+
+    expect(coordinator.manualChecks, 1);
+    expect(find.byType(SettingsScreen), findsOneWidget);
+    expect(find.text('Update available'), findsOneWidget);
+    expect(find.text('Later'), findsOneWidget);
+    expect(find.text('Update now'), findsOneWidget);
+
+    await tester.tap(find.text('Later'));
+    await tester.pumpAndSettle();
+    expect(coordinator.optionalDismissals, 1);
+    expect(find.text('Update available'), findsNothing);
+    expect(find.byType(SettingsScreen), findsOneWidget);
+
+    await tester.tap(find.text('Check for updates'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Update now'));
+    await tester.pump();
+    expect(coordinator.installRequests, 1);
+
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump();
   });
 }

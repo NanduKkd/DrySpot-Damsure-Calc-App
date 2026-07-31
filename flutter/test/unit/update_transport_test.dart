@@ -16,6 +16,16 @@ void main() {
         'date': [date ?? 'Thu, 30 Jul 2026 10:00:00 GMT'],
       };
 
+  List<int> validJsonBodyOfLength(int length) {
+    const prefix = '{"payload":"';
+    const suffix = '"}';
+    final padding =
+        length - utf8.encode(prefix).length - utf8.encode(suffix).length;
+    assert(padding >= 0);
+    return utf8
+        .encode('$prefix${List<String>.filled(padding, 'a').join()}$suffix');
+  }
+
   test('accepts only a no-store JSON response with a trusted Date', () {
     final result = ReleaseManifestTransportValidator.validate(
       statusCode: HttpStatus.ok,
@@ -61,6 +71,40 @@ void main() {
             UpdateFailureKind.transport,
           ),
         ),
+      );
+    }
+  });
+
+  test('allows a 32 KiB manifest body and rejects every larger body', () {
+    const maximumBytes = 32 * 1024;
+    final atLimit = validJsonBodyOfLength(maximumBytes);
+    expect(atLimit.length, maximumBytes);
+    expect(
+      ReleaseManifestTransportValidator.validate(
+        statusCode: HttpStatus.ok,
+        redirected: false,
+        headers: headers(),
+        body: atLimit,
+      ).document,
+      isA<Map>(),
+    );
+
+    for (final length in <int>[maximumBytes + 1, 40 * 1024]) {
+      expect(
+        () => ReleaseManifestTransportValidator.validate(
+          statusCode: HttpStatus.ok,
+          redirected: false,
+          headers: headers(),
+          body: validJsonBodyOfLength(length),
+        ),
+        throwsA(
+          isA<UpdateTransportException>().having(
+            (error) => error.kind,
+            'kind',
+            UpdateFailureKind.transport,
+          ),
+        ),
+        reason: '$length-byte manifest must be rejected',
       );
     }
   });
