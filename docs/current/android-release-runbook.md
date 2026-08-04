@@ -71,9 +71,38 @@ defines:
 
 ```bash
 flutter build apk --release --flavor staging \
+  --build-name=1.0.2 --build-number=2 \
   --dart-define=DAMSURE_RELEASE_FLAVOR=staging \
   --dart-define=DAMSURE_STAGING_ORIGIN=https://staging.damsure.nandakrishnan.in
 ```
+
+The command above reproduces the currently published staging artifact's package
+version. Every later staging build must use the next reserved version code and
+the corresponding version name from the protected staging ledger; never rely
+on `pubspec.yaml` defaults for a publication candidate.
+
+After every staging build, run the protected verifier before upload. This step
+is mandatory because Gradle validates the declared production/staging
+fingerprints are distinct, while the verifier binds the actual signed APK to
+the committed staging fingerprint:
+
+```bash
+APK=build/app/outputs/flutter-apk/app-staging-release.apk
+SHA256="$(shasum -a 256 "$APK" | awk '{print $1}')"
+SIZE_BYTES="$(stat -f %z "$APK")"
+node ../tools/update-publishing/verify-apk.cjs \
+  --artifact "$APK" --environment staging \
+  --package-id com.dryspotuppala.staging \
+  --version-code 2 --version-name 1.0.2 \
+  --certificate-sha256 87:EB:D5:D8:7E:CD:4F:91:AA:F7:BF:37:24:7B:7F:94:81:03:FA:48:24:CD:3C:79:65:AE:66:73:EF:55:66:50 \
+  --tool-manifest /Users/nandakrishnan/.damsure-staging-signing/android-tool-manifest.json \
+  --sha256 "$SHA256" --size-bytes "$SIZE_BYTES"
+```
+
+For the current revision-1 artifact, the verifier must report version `1.0.2`
+/ code `2`, the fingerprint above, size `61,571,654`, and SHA-256
+`020c155b37d8dacd73faed58aa7e194a1e225db11043a804c70cc44c403373d5`.
+Do not upload if any field differs.
 
 Never use the staging key for a production artifact or publish a staging APK
 under the production release origin.
