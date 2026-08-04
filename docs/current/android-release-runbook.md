@@ -52,3 +52,28 @@ release record before uploading it anywhere.
 
 Release builds prohibit cleartext HTTP. Debug builds alone permit it for a local
 development server. Use HTTPS for every release API, APK, and update-manifest URL.
+
+## Staging signing and origin
+
+Staging uses the separate Android application ID `com.dryspotuppala.staging`,
+origin `https://staging.damsure.nandakrishnan.in`, and signing alias
+`damsure-staging-release-2026`. Its signing files are
+`flutter/android/app/damsure-staging-release.jks` and
+`flutter/android/staging-key.properties`; both are ignored and must remain mode
+`0600`. The matching local backup is under
+`/Users/nandakrishnan/.damsure-staging-signing/` with a `0700` directory and
+`0600` contents.
+
+The staging certificate SHA-256 fingerprint is recorded in
+`flutter/android/release-certificates.properties`. It must remain distinct from
+the production certificate. Build staging explicitly with both compile-time
+defines:
+
+```bash
+flutter build apk --release --flavor staging \
+  --dart-define=DAMSURE_RELEASE_FLAVOR=staging \
+  --dart-define=DAMSURE_STAGING_ORIGIN=https://staging.damsure.nandakrishnan.in
+```
+
+Never use the staging key for a production artifact or publish a staging APK
+under the production release origin.
