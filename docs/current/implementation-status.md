@@ -60,6 +60,13 @@ The local `codex/product-roadmap` integration lane now includes APP-101 measurem
 - Current manager-branch gate after APP-113 integration: backend lint exits with warnings and no errors, all 25 suites / 128 tests pass, and the TypeScript build passes. Flutter passes 233 default tests with one intentional staging-only skip; production parser 18/18, staging parser 1/1, publication/security 26/26, analysis, Nginx, updater, permission, production-isolation, and Gradle release guards pass. The manager production-debug APK is 187,064,656 bytes with SHA-256 `090f9fd5f17a18e7a0b2982f2280fdd9e0a96ccf076e6c806e8e2c0e6f014fea`; it is debug-only local evidence.
 - APP-113's exact candidate `906c6ca` passed independent T3 verification with zero P0-P3 findings. Ten independent hostile probes, provider/navigation teardown, offline required-policy persistence, trusted-time/high-water enforcement, strict transport/body/MIME rules, streamed artifact cleanup, package/version/signer checks, optional/required UI, anti-skip staging proof, cross-flavor rejection, and all inherited APP-104/106/107/111/112 regressions pass. A production-signed and hosted exact artifact, staging HTTPS proof, signing-backup restoration, and the physical N-to-N+1 upgrade pilot remain mandatory external gates.
 
+### Staging release rollout (2026-08-05)
+
+- `staging.damsure.nandakrishnan.in` resolves to the production host but uses a separate HTTPS-only Nginx virtual host and `/var/www/damsure-staging-releases`; it proxies no API traffic.
+- Its dedicated Let's Encrypt certificate is valid through 2026-11-02. Root, API, directory, missing-artifact, and trailing-slash artifact routes return `404`; non-GET manifest/artifact requests return `405`.
+- Staging manifest revision `1` publishes the separately signed `com.dryspotuppala.staging` version `1.0.2` / code `2` artifact. Public HTTPS re-download matched the expected 61,571,654-byte size and SHA-256 `020c155b37d8dacd73faed58aa7e194a1e225db11043a804c70cc44c403373d5`.
+- Production health remained `200` and its disabled manifest stayed byte-for-byte unchanged. A physical Android device pilot, approved production signing-backup restoration, and operator identity/tenant configuration remain external blockers.
+
 ## Historical snapshot: Fix Tests and Complete PDF Generation
 
 ## Files Changed

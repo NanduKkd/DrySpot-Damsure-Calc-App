@@ -41,3 +41,25 @@ To stop guided updates immediately, atomically restore the disabled manifest abo
 For any Nginx change, first save the current Damsure site configuration in `/root/nginx-config-backups/`, run `nginx -t`, and reload Nginx only when that command succeeds. Re-check the manifest, directory-listing rejection, missing-artifact rejection, and API health after reload. A validated configuration backup can be restored and tested before another reload if recovery is needed.
 
 This hosting endpoint does not itself authorize an update. APK publication and manifest activation are separate, deliberate release actions.
+
+## Staging release host
+
+`https://staging.damsure.nandakrishnan.in/releases/manifest.json` is the
+isolated staging release endpoint. Nginx serves it from
+`/var/www/damsure-staging-releases/`; it does not proxy API traffic and all
+non-release paths return `404`. The staging release root, manifest history,
+ledger, APKs, certificate, signing identity, and receipts must remain separate
+from production.
+
+Staging currently serves strict manifest revision `1` and immutable artifact
+`damsure-2.apk`, package `com.dryspotuppala.staging`, version `1.0.2` / code `2`.
+The artifact is 61,571,654 bytes with SHA-256
+`020c155b37d8dacd73faed58aa7e194a1e225db11043a804c70cc44c403373d5`.
+The protected local ledger, receipt, signer backup, and exact publication
+fixture are under `/Users/nandakrishnan/.damsure-staging-signing/`.
+
+The staging artifact and manifest were uploaded using no-overwrite and atomic
+replacement semantics, then independently downloaded over public HTTPS and
+verified byte-for-byte. Production remained unchanged. Future staging releases
+must reserve a new version code and manifest revision and must never overwrite
+`damsure-2.apk` or restore an older manifest.
