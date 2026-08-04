@@ -10,6 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
+  crypto: ^3.0.3
+  connectivity_plus: ^6.1.4
   http: ^1.2.1
   http_parser: ^4.1.2
   provider: ^6.1.2
@@ -44,3 +46,4 @@ flutter:
 
   assets:
     - assets/pdf-images/
+    - assets/fonts/

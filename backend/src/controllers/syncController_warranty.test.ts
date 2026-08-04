@@ -3,8 +3,7 @@ import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import app from '../app';
-import { Client, Franchisee, Proposal, User, Warranty } from '../models';
-import * as uploadMiddleware from '../middleware/uploadMiddleware';
+import { Client, Franchisee, ManagedFileCleanup, Proposal, User, Warranty } from '../models';
 
 const JWT_SECRET = process.env.JWT_SECRET!;
 const uploadsDirectory = path.join(__dirname, '../../uploads');
@@ -72,26 +71,35 @@ describe('syncController warranty and PDF server invariants', () => {
 		expect(stored?.pdfUrl).toMatch(/^\/api\/warranty\/[0-9a-f-]+\/download$/);
 	});
 
-	it('rejects an offline active-warranty conflict without partial writes', async () => {
+	it('reports an offline active-warranty conflict without partial writes', async () => {
 		const response = await sync({ warranties: [warranty(replacementWarrantyId)] });
-		expect(response.status).toBe(409);
+		expect(response.status).toBe(200);
+		expect(response.body.outcomes.warranties).toEqual([
+			{
+				remote_id: replacementWarrantyId,
+				status: 'rejected',
+				code: 'active_warranty_exists',
+			},
+		]);
 		expect(await Warranty.findByPk(replacementWarrantyId, { paranoid: false })).toBeNull();
 		expect((await Warranty.findByPk(firstWarrantyId))?.activeClientId).toBe(clientId);
 	});
 
-	it('only replaces an active warranty when explicitly requested', async () => {
+	it('never infers destructive replacement from generic sync metadata', async () => {
 		const response = await sync({
 			warranties: [warranty(replacementWarrantyId, { replace_existing: true })],
 		});
 		expect(response.status).toBe(200);
-		expect(await Warranty.findByPk(firstWarrantyId)).toBeNull();
-		expect(
-			(await Warranty.findByPk(firstWarrantyId, { paranoid: false }))?.activeClientId,
-		).toBeNull();
-		expect((await Warranty.findByPk(replacementWarrantyId))?.activeClientId).toBe(clientId);
+		expect(response.body.outcomes.warranties[0]).toEqual({
+			remote_id: replacementWarrantyId,
+			status: 'rejected',
+			code: 'active_warranty_exists',
+		});
+		expect((await Warranty.findByPk(firstWarrantyId))?.activeClientId).toBe(clientId);
+		expect(await Warranty.findByPk(replacementWarrantyId, { paranoid: false })).toBeNull();
 	});
 
-	it('replaces after an old process leaves a historical active marker', async () => {
+	it('backfills a rollout-window soft delete without allowing sync replacement', async () => {
 		await Client.create({
 			id: rolloutClientId,
 			franchiseeId,
@@ -129,21 +137,23 @@ describe('syncController warranty and PDF server invariants', () => {
 		});
 
 		expect(response.status).toBe(200);
-		expect(await Warranty.findByPk(rolloutWarrantyId)).toBeNull();
+		expect(response.body.outcomes.warranties[0]).toEqual({
+			remote_id: rolloutReplacementId,
+			status: 'rejected',
+			code: 'active_warranty_exists',
+		});
+		expect(await Warranty.findByPk(rolloutWarrantyId)).not.toBeNull();
 		expect(
-			(await Warranty.findByPk(rolloutHistoricalWarrantyId, { paranoid: false }))
-				?.activeClientId,
+			await Warranty.findByPk(rolloutHistoricalWarrantyId, { paranoid: false }),
 		).toBeNull();
-		expect((await Warranty.findByPk(rolloutReplacementId))?.activeClientId).toBe(
-			rolloutClientId,
-		);
+		expect(await Warranty.findByPk(rolloutReplacementId)).toBeNull();
 	});
 
 	it('does not allow camelCase PDF metadata to mutate an existing warranty', async () => {
-		const before = await Warranty.findByPk(replacementWarrantyId);
+		const before = await Warranty.findByPk(firstWarrantyId);
 		const response = await sync({
 			warranties: [
-				warranty(replacementWarrantyId, {
+				warranty(firstWarrantyId, {
 					pdfUrl: 'https://attacker.invalid/api/warranty/reassigned/download',
 					pdfFileName: '../reassigned.pdf',
 				}),
@@ -151,7 +161,7 @@ describe('syncController warranty and PDF server invariants', () => {
 		});
 
 		expect(response.status).toBe(200);
-		const stored = await Warranty.findByPk(replacementWarrantyId);
+		const stored = await Warranty.findByPk(firstWarrantyId);
 		expect(stored?.pdfUrl).toBe(before?.pdfUrl);
 		expect(stored?.pdfFileName).toBe(before?.pdfFileName);
 	});
@@ -190,7 +200,7 @@ describe('syncController warranty and PDF server invariants', () => {
 		expect(updated?.pdfFileName).toBe(stored?.pdfFileName);
 	});
 
-	it('cleans only trusted server PDF filenames after sync deletion commits', async () => {
+	it('rejects warranty sync deletion while still deleting proposal metadata safely', async () => {
 		await Client.create({ id: fileClientId, franchiseeId, name: 'File lifecycle client' });
 		await Warranty.create({
 			id: fileWarrantyId,
@@ -208,20 +218,21 @@ describe('syncController warranty and PDF server invariants', () => {
 			pdfUrl: 'http://localhost/api/proposal/file/download',
 			pdfFileName: 'proposal-owned.pdf',
 		});
-		const removal = jest.spyOn(uploadMiddleware, 'removeStoredPdf').mockResolvedValue();
-
 		const response = await sync({
 			warranties: [{ remote_id: fileWarrantyId, deleted_at: new Date().toISOString() }],
 			proposals: [{ remote_id: fileProposalId, deleted_at: new Date().toISOString() }],
 		});
 
 		expect(response.status).toBe(200);
-		expect(removal).toHaveBeenCalledWith('', 'server-owned.pdf');
-		expect(removal).toHaveBeenCalledWith('', 'proposal-owned.pdf');
+		expect(response.body.outcomes.warranties[0]).toEqual({
+			remote_id: fileWarrantyId,
+			status: 'rejected',
+			code: 'online_delete_required',
+		});
+		expect(await Warranty.findByPk(fileWarrantyId)).not.toBeNull();
 		expect(
-			(await Warranty.findByPk(fileWarrantyId, { paranoid: false }))?.activeClientId,
-		).toBeNull();
-		removal.mockRestore();
+			await ManagedFileCleanup.count({ where: { storageKey: 'proposal-owned.pdf' } }),
+		).toBe(0);
 	});
 
 	it('client tombstone cleans only its managed photo and PDF files after commit', async () => {
@@ -290,9 +301,7 @@ describe('syncController warranty and PDF server invariants', () => {
 		expect(await Client.findByPk(deletedClientId)).toBeNull();
 		expect(await Warranty.findByPk(deletedWarrantyId)).toBeNull();
 		expect(await Proposal.findByPk(deletedProposalId)).toBeNull();
-		expect(
-			(await Warranty.findByPk(deletedWarrantyId, { paranoid: false }))?.activeClientId,
-		).toBeNull();
+		expect(await Warranty.findByPk(deletedWarrantyId, { paranoid: false })).toBeNull();
 		expect(fs.existsSync(path.join(uploadsDirectory, photoFilename))).toBe(false);
 		expect(fs.existsSync(path.join(uploadsDirectory, warrantyFilename))).toBe(false);
 		expect(fs.existsSync(path.join(uploadsDirectory, proposalFilename))).toBe(false);

@@ -24,12 +24,15 @@ class ItemDetailScreen extends StatefulWidget {
 }
 
 class _ItemDetailScreenState extends State<ItemDetailScreen> {
+  static const double _maxMeasurement = 10000;
+
   final _priceController = TextEditingController();
   final _newLengthController = TextEditingController();
   final _newWidthController = TextEditingController();
   final _newLengthFocus = FocusNode();
   final _newWidthFocus = FocusNode();
   final Map<Object, _RectangleInputControllers> _rectangleInputs = {};
+  final Map<Object, _RectangleValidationErrors> _rectangleErrors = {};
 
   late final RectangleImageService _rectangleImageService;
 
@@ -37,9 +40,12 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
   bool _isLoading = true;
   bool _didAutofocusNewLength = false;
   bool _isProcessingImage = false;
+  bool _isDeletingMeasurement = false;
   double? _selectedPrice;
   bool _isCustomPrice = false;
   String? _pendingRectangleImageData;
+  String? _newLengthError;
+  String? _newWidthError;
 
   @override
   void initState() {
@@ -71,6 +77,19 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     return value.toString();
   }
 
+  String? _measurementError(String value, String label) {
+    if (value.trim().isEmpty) return 'Enter $label';
+
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Enter a valid number';
+    if (!parsed.isFinite) return '$label must be finite';
+    if (parsed <= 0) return '$label must be greater than 0';
+    if (parsed > _maxMeasurement) {
+      return '$label must be 10,000 ft or less';
+    }
+    return null;
+  }
+
   void _syncRectangleInputs(List<Rectangle> rectangles) {
     final activeKeys = rectangles.map(_rectangleKey).toSet();
     final staleKeys = _rectangleInputs.keys
@@ -79,6 +98,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
 
     for (final key in staleKeys) {
       _rectangleInputs.remove(key)?.dispose();
+      _rectangleErrors.remove(key);
     }
 
     for (final rect in rectangles) {
@@ -174,12 +194,19 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
   Future<void> _submitNewRectangle() async {
     if (_item == null) return;
 
-    final length = double.tryParse(_newLengthController.text);
-    final width = double.tryParse(_newWidthController.text);
+    final lengthError = _measurementError(_newLengthController.text, 'Length');
+    final widthError = _measurementError(_newWidthController.text, 'Width');
 
-    if (length == null || width == null || length <= 0 || width <= 0) {
+    if (lengthError != null || widthError != null) {
+      setState(() {
+        _newLengthError = lengthError;
+        _newWidthError = widthError;
+      });
       return;
     }
+
+    final length = double.parse(_newLengthController.text.trim());
+    final width = double.parse(_newWidthController.text.trim());
 
     final rectangle = Rectangle(
       itemId: _item!.localId!,
@@ -194,6 +221,8 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     setState(() {
       _newLengthController.clear();
       _newWidthController.clear();
+      _newLengthError = null;
+      _newWidthError = null;
       _pendingRectangleImageData = null;
     });
     await _loadItem();
@@ -375,19 +404,49 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     );
   }
 
-  Future<void> _saveRectangleFromInputs(Rectangle rect) async {
+  void _clearRectangleError(
+    Rectangle rect, {
+    bool length = false,
+    bool width = false,
+  }) {
+    final key = _rectangleKey(rect);
+    final errors = _rectangleErrors[key];
+    if (errors == null) return;
+
+    setState(() {
+      _rectangleErrors[key] = _RectangleValidationErrors(
+        length: length ? null : errors.length,
+        width: width ? null : errors.width,
+      );
+    });
+  }
+
+  Future<bool> _saveRectangleFromInputs(Rectangle rect) async {
     final input = _rectangleInputs[_rectangleKey(rect)];
-    if (input == null) return;
+    if (input == null) return false;
 
-    final length = double.tryParse(input.lengthController.text);
-    final width = double.tryParse(input.widthController.text);
+    final lengthError =
+        _measurementError(input.lengthController.text, 'Length');
+    final widthError = _measurementError(input.widthController.text, 'Width');
 
-    if (length == null || width == null || length <= 0 || width <= 0) {
-      return;
+    if (lengthError != null || widthError != null) {
+      setState(() {
+        _rectangleErrors[_rectangleKey(rect)] = _RectangleValidationErrors(
+          length: lengthError,
+          width: widthError,
+        );
+      });
+      return false;
     }
 
+    final length = double.parse(input.lengthController.text.trim());
+    final width = double.parse(input.widthController.text.trim());
+
     if (length == rect.length && width == rect.width) {
-      return;
+      setState(() {
+        _rectangleErrors.remove(_rectangleKey(rect));
+      });
+      return true;
     }
 
     final updatedRect = rect.copyWith(
@@ -400,6 +459,45 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
 
     if (mounted) {
       await _loadItem();
+    }
+    return true;
+  }
+
+  Future<void> _confirmAndDeleteMeasurement(Rectangle rect) async {
+    if (_isDeletingMeasurement || rect.localId == null) return;
+    _isDeletingMeasurement = true;
+
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Delete Measurement?'),
+          content: Text(
+            'Delete ${_formatMeasurement(rect.length)} ft × '
+            '${_formatMeasurement(rect.width)} ft measurement?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              style: TextButton.styleFrom(
+                foregroundColor: Theme.of(dialogContext).colorScheme.error,
+              ),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Confirm'),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmed != true || !mounted) return;
+
+      await context.read<ClientProvider>().deleteRectangle(rect.localId!);
+      if (mounted) await _loadItem();
+    } finally {
+      _isDeletingMeasurement = false;
     }
   }
 
@@ -417,6 +515,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
 
   Widget _buildMeasurementRow(Rectangle rect, int index) {
     final input = _rectangleInputs[_rectangleKey(rect)]!;
+    final errors = _rectangleErrors[_rectangleKey(rect)];
     final hasImage = _rectangleImageService.hasImage(rect.imageData);
 
     return Padding(
@@ -434,10 +533,12 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
                   ),
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: 'Length (ft)',
-                    border: OutlineInputBorder(),
+                    border: const OutlineInputBorder(),
+                    errorText: errors?.length,
                   ),
+                  onChanged: (_) => _clearRectangleError(rect, length: true),
                   textInputAction: TextInputAction.next,
                   onEditingComplete: () {},
                   onSubmitted: (_) => input.widthFocus.requestFocus(),
@@ -452,15 +553,17 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
                   ),
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: 'Width (ft)',
-                    border: OutlineInputBorder(),
+                    border: const OutlineInputBorder(),
+                    errorText: errors?.width,
                   ),
+                  onChanged: (_) => _clearRectangleError(rect, width: true),
                   textInputAction: TextInputAction.next,
                   onEditingComplete: () {},
                   onSubmitted: (_) async {
-                    await _saveRectangleFromInputs(rect);
-                    if (mounted) {
+                    final saved = await _saveRectangleFromInputs(rect);
+                    if (saved && mounted) {
                       _focusNextAfterRectangle(index);
                     }
                   },
@@ -484,14 +587,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                 color: Colors.red,
                 onPressed: rect.localId == null
                     ? null
-                    : () async {
-                        await context
-                            .read<ClientProvider>()
-                            .deleteRectangle(rect.localId!);
-                        if (mounted) {
-                          await _loadItem();
-                        }
-                      },
+                    : () => _confirmAndDeleteMeasurement(rect),
               ),
             ],
           ),
@@ -525,10 +621,12 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
               keyboardType: const TextInputType.numberWithOptions(
                 decimal: true,
               ),
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'Length (ft)',
-                border: OutlineInputBorder(),
+                border: const OutlineInputBorder(),
+                errorText: _newLengthError,
               ),
+              onChanged: (_) => setState(() => _newLengthError = null),
               textInputAction: TextInputAction.next,
               onEditingComplete: () {},
               onSubmitted: (_) => _newWidthFocus.requestFocus(),
@@ -542,10 +640,12 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
               keyboardType: const TextInputType.numberWithOptions(
                 decimal: true,
               ),
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'Width (ft)',
-                border: OutlineInputBorder(),
+                border: const OutlineInputBorder(),
+                errorText: _newWidthError,
               ),
+              onChanged: (_) => setState(() => _newWidthError = null),
               textInputAction: TextInputAction.next,
               onEditingComplete: () {},
               onSubmitted: (_) => _submitNewRectangle(),
@@ -771,4 +871,11 @@ class _RectangleInputControllers {
     lengthFocus.dispose();
     widthFocus.dispose();
   }
+}
+
+class _RectangleValidationErrors {
+  final String? length;
+  final String? width;
+
+  const _RectangleValidationErrors({this.length, this.width});
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/client_provider.dart';
+import '../../providers/sync_provider.dart';
 import '../../models/client.dart';
 import 'client_form_screen.dart';
 import 'measurement_screen.dart';
@@ -26,15 +27,37 @@ class _ClientListScreenState extends State<ClientListScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final syncState = context.watch<SyncProvider?>()?.viewState;
+    final syncNeedsAttention = syncState?.needsAttention ?? false;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Clients'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.sync),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const SyncScreen()),
+          Semantics(
+            button: true,
+            label: syncNeedsAttention
+                ? 'Open sync status. Sync needs attention.'
+                : 'Open sync status',
+            child: IconButton(
+              tooltip: syncNeedsAttention
+                  ? 'Sync status needs attention'
+                  : 'Sync status',
+              icon: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  const Icon(Icons.sync),
+                  if (syncNeedsAttention)
+                    const Positioned(
+                      right: -5,
+                      top: -5,
+                      child: Icon(Icons.priority_high, size: 16),
+                    ),
+                ],
+              ),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const SyncScreen()),
+              ),
             ),
           ),
           IconButton(
@@ -108,13 +131,15 @@ class _ClientListScreenState extends State<ClientListScreen> {
                             onTap: () => Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (_) => MeasurementScreen(client: client),
+                                builder: (_) =>
+                                    MeasurementScreen(client: client),
                               ),
                             ),
                             onLongPress: () => Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (_) => ClientFormScreen(client: client),
+                                builder: (_) =>
+                                    ClientFormScreen(client: client),
                               ),
                             ),
                           );

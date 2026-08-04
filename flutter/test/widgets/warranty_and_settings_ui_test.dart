@@ -175,6 +175,18 @@ void main() {
     expect(find.text('Sign Out'), findsOneWidget);
 
     await tester.tap(find.text('Sign Out'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Sign out?'), findsOneWidget);
+    expect(
+      find.text(
+        'Downloaded and unsynced work stays on this device for this account. Other accounts cannot view or sync it.',
+      ),
+      findsOneWidget,
+    );
+    expect(authProvider.logoutCalled, isFalse);
+
+    await tester.tap(find.text('Sign out'));
     await tester.pump();
 
     expect(authProvider.logoutCalled, isTrue);

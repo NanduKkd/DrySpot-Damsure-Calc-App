@@ -4,13 +4,15 @@ import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
 import { Franchisee } from '../models/Franchisee';
 import { JWT_SECRET } from '../config/jwt';
+import { normalizeUserEmail, normalizedEmailWhere } from '../utils/userEmail';
 
 export const login = async (req: Request, res: Response) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  const email = typeof req.body.email === 'string' ? normalizeUserEmail(req.body.email) : '';
 
   try {
     const user = await User.findOne({ 
-      where: { email },
+      where: normalizedEmailWhere(email),
       include: [{ model: Franchisee }]
     });
 

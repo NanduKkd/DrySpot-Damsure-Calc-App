@@ -1,0 +1,21 @@
+# Install only through the APP-107 operational runbook. This template is never
+# activated by repository scripts. Keep this location separate from the API.
+location = /releases/manifest.json {
+    if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+    alias /var/www/damsure-releases/manifest.json;
+    default_type application/json;
+    add_header Cache-Control "no-store, max-age=0" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+
+location ~ ^/releases/(damsure-[1-9][0-9]*\.apk)$ {
+    if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+    alias /var/www/damsure-releases/$1;
+    default_type application/vnd.android.package-archive;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+
+location /releases/ {
+    return 404;
+}

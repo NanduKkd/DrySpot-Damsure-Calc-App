@@ -1,11 +1,17 @@
+import 'dart:convert';
+
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'package:uuid/uuid.dart';
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/rectangle.dart';
 import '../models/default_price.dart';
 import '../models/warranty.dart';
+import '../models/warranty_deletion_tombstone.dart';
 import '../models/proposal.dart';
+import 'lww_protocol.dart';
+import 'session_manager.dart';
 
 class DbService {
   static final DbService _instance = DbService._internal();
@@ -26,18 +32,161 @@ class DbService {
     return _database!;
   }
 
+  /// Performs one session-bound SQLite mutation.  The final generation
+  /// validation deliberately lives inside the transaction callback, after the
+  /// last awaited write and before commit.  That is the rollback fence used by
+  /// V1 response application for mutations that do not need model-specific
+  /// local-LWW bookkeeping.
+  Future<int> writeForSession({
+    required String table,
+    required bool Function() isSessionCurrent,
+    required Map<String, dynamic> values,
+    String? where,
+    List<Object?>? whereArgs,
+    bool insert = false,
+    bool delete = false,
+    String? markLocalLwwCollection,
+    int? markLocalLwwId,
+    int? syncPendingClientPhotosId,
+    bool useInsertedIdForLocalLww = false,
+    bool syncPendingPhotosForInsertedId = false,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = delete
+          ? await transaction.delete(table, where: where, whereArgs: whereArgs)
+          : insert
+              ? await transaction.insert(table, values)
+              : await transaction.update(
+                  table,
+                  values,
+                  where: where,
+                  whereArgs: whereArgs,
+                );
+      final affectedId = insert ? changed : markLocalLwwId;
+      final clientPhotoId = insert
+          ? (syncPendingPhotosForInsertedId ? changed : null)
+          : syncPendingClientPhotosId;
+      // sqflite returns the inserted primary key for inserts, not an affected
+      // row count, so an inserted id greater than one is still a successful
+      // mutation that needs its dependent bookkeeping.
+      final didMutate = insert || changed == 1;
+      if (didMutate && clientPhotoId != null) {
+        await _syncPendingClientPhotos(transaction, clientPhotoId);
+      }
+      if (didMutate &&
+          markLocalLwwCollection != null &&
+          affectedId != null &&
+          (!insert || useInsertedIdForLocalLww)) {
+        await _markLocalLwwMutation(
+          transaction,
+          markLocalLwwCollection,
+          affectedId,
+        );
+      }
+      // Throwing from this callback makes sqflite roll back [changed].
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> updateClientForSession(
+    Client client, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = await transaction.update(
+        'clients',
+        client.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [client.localId],
+      );
+      if (changed == 1 && client.localId != null) {
+        await _syncPendingClientPhotos(transaction, client.localId!);
+      }
+      if (changed == 1 && client.isDirty && client.localId != null) {
+        await _markLocalLwwMutation(transaction, 'clients', client.localId!);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> insertClientForSession(
+    Client client, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final id = await transaction.insert('clients', client.toMap());
+      await _syncPendingClientPhotos(transaction, id);
+      if (client.isDirty) {
+        await _markLocalLwwMutation(transaction, 'clients', id);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return id;
+    });
+  }
+
+  Future<int> softDeleteClientForSession(
+    int localId, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final rows = await transaction.query(
+        'clients',
+        columns: ['remote_id', 'franchisee_id'],
+        where: 'local_id = ?',
+        whereArgs: [localId],
+        limit: 1,
+      );
+      final changed = await transaction.update(
+        'clients',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        if (rows.isNotEmpty &&
+            await _supportsPendingClientPhotos(transaction)) {
+          await transaction.delete(
+            'pending_client_photos',
+            where: 'franchisee_id = ? AND client_remote_id = ?',
+            whereArgs: [rows.single['franchisee_id'], rows.single['remote_id']],
+          );
+        }
+        await _markLocalLwwMutation(transaction, 'clients', localId);
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
   Future<Database> _initDatabase() async {
     String path = join(await getDatabasesPath(), 'damsure.db');
     return await openDatabase(
       path,
-      version: 8,
+      version: 14,
       onCreate: _onCreate,
       onUpgrade: migrateSchema,
     );
   }
 
   static Future<void> migrateSchema(
-      Database db, int oldVersion, int newVersion) async {
+    Database db,
+    int oldVersion,
+    int newVersion,
+  ) async {
     if (oldVersion < 2) {
       await _createDefaultPricesTable(db);
     }
@@ -58,8 +207,43 @@ class DbService {
       await db.execute('ALTER TABLE rectangles ADD COLUMN image_data TEXT');
     }
     if (oldVersion < 8) {
-      await db
-          .execute('ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT');
+      await db.execute(
+        'ALTER TABLE default_prices ADD COLUMN franchisee_id TEXT',
+      );
+    }
+    if (oldVersion < 9 && newVersion >= 9) {
+      final warrantyColumns = await db.rawQuery(
+        'PRAGMA table_info(warranties)',
+      );
+      if (!warrantyColumns.any(
+        (column) => column['name'] == 'server_version',
+      )) {
+        await db.execute(
+          'ALTER TABLE warranties ADD COLUMN server_version INTEGER NOT NULL DEFAULT 1',
+        );
+      }
+      await _createWarrantyDeletionTombstonesTable(db);
+      // Pre-APP-110 local soft deletes are not authoritative deletion requests.
+      // Removing them prevents an old device from initiating deletion through
+      // sync; the server's live row or permanent tombstone will converge later.
+      await db.delete('warranties', where: 'deleted_at IS NOT NULL');
+    }
+    if (oldVersion < 10 && newVersion >= 10) {
+      await _createSyncStateTable(db);
+    }
+    if (oldVersion < 11 && newVersion >= 11) {
+      await _addLwwSyncColumns(db);
+      await _createSyncStateTable(db);
+    }
+    if (oldVersion < 12 && newVersion >= 12) {
+      await _createPendingClientPhotosTable(db);
+      await _backfillPendingClientPhotos(db);
+    }
+    if (oldVersion < 13 && newVersion >= 13) {
+      await _addPendingLwwSnapshots(db);
+    }
+    if (oldVersion < 14 && newVersion >= 14) {
+      await _upgradeSyncRecoveryState(db);
     }
   }
 
@@ -80,7 +264,21 @@ class DbService {
         discounted_price REAL,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
-        deleted_at TEXT
+        deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT
       )
     ''');
 
@@ -95,6 +293,20 @@ class DbService {
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT,
         FOREIGN KEY (client_id) REFERENCES clients (local_id) ON DELETE CASCADE
       )
     ''');
@@ -110,12 +322,31 @@ class DbService {
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT,
         FOREIGN KEY (item_id) REFERENCES items (local_id) ON DELETE CASCADE
       )
     ''');
 
     await _createDefaultPricesTable(db);
     await _createWarrantiesTable(db);
+    await _createWarrantyDeletionTombstonesTable(db);
+    await _createSyncStateTable(db);
+    await _createPendingClientPhotosTable(db, durableUploads: true);
+    await _createPendingPhotoUploadIndexes(db);
+    await _createSyncNoticesTable(db);
     await _createProposalsTable(db);
   }
 
@@ -129,9 +360,244 @@ class DbService {
         enabled INTEGER DEFAULT 1,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
-        deleted_at TEXT
+        deleted_at TEXT,
+        server_generation TEXT NOT NULL DEFAULT '0',
+        server_branch_seq INTEGER NOT NULL DEFAULT 0,
+        server_operation_rank INTEGER NOT NULL DEFAULT 0,
+        server_writer_id TEXT,
+        server_change_id TEXT,
+        server_payload_hash TEXT,
+        server_cursor TEXT NOT NULL DEFAULT '0',
+        pending_base_generation TEXT,
+        pending_generation TEXT,
+        pending_branch_seq INTEGER,
+        pending_writer_id TEXT,
+        pending_change_id TEXT,
+        pending_operation_rank INTEGER,
+        pending_payload_hash TEXT
       )
     ''');
+  }
+
+  static const _lwwTables = <String>[
+    'clients',
+    'items',
+    'rectangles',
+    'default_prices',
+  ];
+
+  static const _lwwColumnDefinitions = <String, String>{
+    'server_generation': "TEXT NOT NULL DEFAULT '0'",
+    'server_branch_seq': 'INTEGER NOT NULL DEFAULT 0',
+    'server_operation_rank': 'INTEGER NOT NULL DEFAULT 0',
+    'server_writer_id': 'TEXT',
+    'server_change_id': 'TEXT',
+    'server_payload_hash': 'TEXT',
+    'server_cursor': "TEXT NOT NULL DEFAULT '0'",
+    'pending_base_generation': 'TEXT',
+    'pending_generation': 'TEXT',
+    'pending_branch_seq': 'INTEGER',
+    'pending_writer_id': 'TEXT',
+    'pending_change_id': 'TEXT',
+  };
+
+  static const _pendingLwwSnapshotColumnDefinitions = <String, String>{
+    'pending_operation_rank': 'INTEGER',
+    'pending_payload_hash': 'TEXT',
+  };
+
+  static final _uuidV4 = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  );
+  static final _payloadHashPattern = RegExp(r'^[0-9a-f]{64}$');
+  static final _canonicalDecimal = RegExp(r'^(0|[1-9][0-9]*)$');
+  static final _canonicalClientPhoto = RegExp(
+    r'^/api/photos/client/([^/]+)/'
+    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    r'\.(jpg|png|webp)$',
+  );
+  static final _maxLogicalGeneration = BigInt.parse('9223372036854775807');
+
+  static int _operationRankForRow(Map<String, Object?> row) =>
+      row['deleted_at'] == null ? 0 : 1;
+
+  static Map<String, dynamic> _lwwMutablePayload(
+    String collection,
+    Map<String, Object?> row,
+    int operationRank,
+  ) {
+    if (operationRank == 1) return <String, dynamic>{};
+    final payload = switch (collection) {
+      'clients' => {
+          'name': row['name'],
+          'address': row['address'],
+          'site_address': row['site_address'],
+          'email': row['email'],
+          'phone': row['phone'],
+          'latitude': row['latitude'],
+          'longitude': row['longitude'],
+          'discounted_price': row['discounted_price'],
+        },
+      'items' => {
+          'name': row['name'],
+          'price': double.parse(row['price'].toString()),
+          'enabled': row['enabled'] == 1 || row['enabled'] == true,
+        },
+      'rectangles' => {
+          'length': double.parse(row['length'].toString()),
+          'width': double.parse(row['width'].toString()),
+        },
+      'default_prices' => {
+          'price': double.parse(row['price'].toString()),
+          'enabled': row['enabled'] == 1 || row['enabled'] == true,
+        },
+      _ => throw StateError('Unsupported LWW collection: $collection'),
+    };
+    return canonicalLwwMutablePayload(collection, payload);
+  }
+
+  static String _currentLwwPayloadHash(
+    String collection,
+    Map<String, Object?> row,
+    int operationRank,
+  ) =>
+      canonicalLwwPayloadHash(
+        _lwwMutablePayload(collection, row, operationRank),
+      );
+
+  static BigInt? _validLogicalGeneration(
+    Object? value, {
+    required bool allowZero,
+  }) {
+    final encoded = value?.toString();
+    if (encoded == null || !_canonicalDecimal.hasMatch(encoded)) return null;
+    final parsed = BigInt.parse(encoded);
+    if ((!allowZero && parsed == BigInt.zero) ||
+        parsed > _maxLogicalGeneration) {
+      return null;
+    }
+    return parsed;
+  }
+
+  static Future<void> _addLwwSyncColumns(Database db) async {
+    await db.transaction((transaction) async {
+      for (final table in _lwwTables) {
+        final tableExists = (await transaction.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          [table],
+        ))
+            .isNotEmpty;
+        if (!tableExists) {
+          throw StateError('APP-111 requires the existing $table table.');
+        }
+        final columns = await transaction.rawQuery('PRAGMA table_info($table)');
+        final names = columns.map((column) => column['name']).toSet();
+        for (final definition in _lwwColumnDefinitions.entries) {
+          if (!names.contains(definition.key)) {
+            await transaction.execute(
+              'ALTER TABLE $table ADD COLUMN ${definition.key} ${definition.value}',
+            );
+          }
+        }
+        await transaction.execute(
+          'CREATE INDEX IF NOT EXISTS ${table}_pending_lww '
+          'ON $table (is_dirty, pending_change_id)',
+        );
+      }
+    });
+  }
+
+  static Future<void> _addPendingLwwSnapshots(Database db) async {
+    await db.transaction((transaction) async {
+      for (final table in _lwwTables) {
+        final tableExists = (await transaction.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          [table],
+        ))
+            .isNotEmpty;
+        if (!tableExists) {
+          throw StateError('APP-111 requires the existing $table table.');
+        }
+        final columns = await transaction.rawQuery('PRAGMA table_info($table)');
+        final names = columns.map((column) => column['name']).toSet();
+        for (final definition in _pendingLwwSnapshotColumnDefinitions.entries) {
+          if (!names.contains(definition.key)) {
+            await transaction.execute(
+              'ALTER TABLE $table ADD COLUMN '
+              '${definition.key} ${definition.value}',
+            );
+          }
+        }
+
+        final rows = await transaction.query(table);
+        for (final row in rows) {
+          const pendingCore = [
+            'pending_base_generation',
+            'pending_generation',
+            'pending_branch_seq',
+            'pending_writer_id',
+            'pending_change_id',
+          ];
+          final presentCore =
+              pendingCore.where((column) => row[column] != null).length;
+          final snapshotRank = row['pending_operation_rank'];
+          final snapshotHash = row['pending_payload_hash']?.toString();
+          if (presentCore == 0) {
+            if (snapshotRank != null || snapshotHash != null) {
+              throw StateError(
+                'APP-111 found orphaned pending state in $table.',
+              );
+            }
+            continue;
+          }
+          final pendingBase = _validLogicalGeneration(
+            row['pending_base_generation'],
+            allowZero: true,
+          );
+          final pendingGeneration = _validLogicalGeneration(
+            row['pending_generation'],
+            allowZero: false,
+          );
+          if (presentCore != pendingCore.length ||
+              row['is_dirty'] != 1 ||
+              pendingBase == null ||
+              pendingGeneration == null ||
+              pendingGeneration <= pendingBase ||
+              row['pending_branch_seq'] is! int ||
+              (row['pending_branch_seq'] as int) < 1 ||
+              (row['pending_branch_seq'] as int) > 1000000 ||
+              !_uuidV4.hasMatch(row['pending_writer_id'].toString()) ||
+              !_uuidV4.hasMatch(row['pending_change_id'].toString())) {
+            throw StateError(
+              'APP-111 found inconsistent pending state in $table.',
+            );
+          }
+          final expectedRank = _operationRankForRow(row);
+          final expectedHash = _currentLwwPayloadHash(table, row, expectedRank);
+          if (snapshotRank == null && snapshotHash == null) {
+            await transaction.update(
+              table,
+              {
+                'pending_operation_rank': expectedRank,
+                'pending_payload_hash': expectedHash,
+              },
+              where: 'local_id = ?',
+              whereArgs: [row['local_id']],
+            );
+            continue;
+          }
+          if (snapshotRank != expectedRank ||
+              snapshotHash == null ||
+              !_payloadHashPattern.hasMatch(snapshotHash) ||
+              snapshotHash != expectedHash) {
+            throw StateError(
+              'APP-111 found a changed pending payload in $table.',
+            );
+          }
+        }
+      }
+    });
   }
 
   static Future<void> _createWarrantiesTable(Database db) async {
@@ -144,12 +610,181 @@ class DbService {
         start_date TEXT,
         duration_years INTEGER,
         pdf_url TEXT,
+        server_version INTEGER NOT NULL DEFAULT 1,
         is_dirty INTEGER DEFAULT 1,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
         FOREIGN KEY (client_id) REFERENCES clients (local_id) ON DELETE CASCADE
       )
     ''');
+  }
+
+  static Future<void> _createWarrantyDeletionTombstonesTable(
+    Database db,
+  ) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS warranty_deletion_tombstones (
+        warranty_id TEXT NOT NULL,
+        franchisee_id TEXT NOT NULL,
+        deletion_sequence TEXT NOT NULL,
+        deleted_at TEXT NOT NULL,
+        PRIMARY KEY (franchisee_id, warranty_id)
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS warranty_deletion_tombstones_tenant_cursor
+      ON warranty_deletion_tombstones (franchisee_id, deletion_sequence)
+    ''');
+  }
+
+  static Future<void> _createSyncStateTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
+  }
+
+  static Future<void> _createPendingClientPhotosTable(
+    DatabaseExecutor db, {
+    bool durableUploads = false,
+  }) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS pending_client_photos (
+        franchisee_id TEXT NOT NULL,
+        client_remote_id TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        ${durableUploads ? '''
+        upload_id TEXT NOT NULL,
+        file_sha256 TEXT,
+        canonical_url TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        ''' : ''}
+        PRIMARY KEY (franchisee_id, client_remote_id, local_path)
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS pending_client_photos_client
+      ON pending_client_photos (franchisee_id, client_remote_id)
+    ''');
+  }
+
+  static Future<void> _createPendingPhotoUploadIndexes(
+    DatabaseExecutor db,
+  ) async {
+    await db.execute('''
+      CREATE UNIQUE INDEX IF NOT EXISTS pending_client_photos_tenant_upload
+      ON pending_client_photos (franchisee_id, upload_id)
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS pending_client_photos_status
+      ON pending_client_photos (franchisee_id, status, client_remote_id)
+    ''');
+  }
+
+  /// APP-112 keeps the existing APP-111 photo queue, then adds the durable
+  /// transport identity needed to retry an ambiguous upload safely.  The
+  /// schema remains additive so an interrupted upgrade can be reapplied.
+  static Future<void> _upgradeSyncRecoveryState(Database db) async {
+    await _createPendingClientPhotosTable(db);
+    final columns =
+        await db.rawQuery('PRAGMA table_info(pending_client_photos)');
+    final names = columns.map((column) => column['name']).toSet();
+    if (!names.contains('upload_id')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN upload_id TEXT');
+    }
+    if (!names.contains('canonical_url')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN canonical_url TEXT');
+    }
+    if (!names.contains('file_sha256')) {
+      await db.execute(
+          'ALTER TABLE pending_client_photos ADD COLUMN file_sha256 TEXT');
+    }
+    if (!names.contains('status')) {
+      await db.execute(
+        "ALTER TABLE pending_client_photos ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+      );
+    }
+    final rows = await db.query(
+      'pending_client_photos',
+      columns: ['rowid', 'upload_id'],
+      where: 'upload_id IS NULL OR upload_id = ?',
+      whereArgs: [''],
+    );
+    for (final row in rows) {
+      await db.update(
+        'pending_client_photos',
+        {'upload_id': const Uuid().v4()},
+        where: 'rowid = ?',
+        whereArgs: [row['rowid']],
+      );
+    }
+    await _createPendingPhotoUploadIndexes(db);
+    await _createSyncNoticesTable(db);
+  }
+
+  static Future<void> _createSyncNoticesTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_notices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        franchisee_id TEXT NOT NULL,
+        code TEXT NOT NULL,
+        collection_name TEXT,
+        entity_id TEXT,
+        created_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS sync_notices_tenant_created
+      ON sync_notices (franchisee_id, created_at DESC, id DESC)
+    ''');
+  }
+
+  static bool _isCanonicalClientPhotoPath(String path, {String? remoteId}) {
+    final match = _canonicalClientPhoto.firstMatch(path);
+    return match != null && (remoteId == null || match.group(1) == remoteId);
+  }
+
+  static List<String> _decodeClientPhotos(Object? value) {
+    final decoded = jsonDecode(value?.toString() ?? '[]');
+    if (decoded is! List || decoded.any((photo) => photo is! String)) {
+      throw const FormatException('Local client photo metadata is invalid.');
+    }
+    return decoded.cast<String>();
+  }
+
+  static Future<void> _backfillPendingClientPhotos(DatabaseExecutor db) async {
+    final rows = await db.query(
+      'clients',
+      columns: ['remote_id', 'franchisee_id', 'photos', 'deleted_at'],
+    );
+    for (final row in rows) {
+      final remoteId = row['remote_id']?.toString();
+      final franchiseeId = row['franchisee_id']?.toString();
+      final photos = _decodeClientPhotos(row['photos']);
+      if (row['deleted_at'] != null ||
+          remoteId == null ||
+          remoteId.isEmpty ||
+          franchiseeId == null ||
+          franchiseeId.isEmpty) {
+        continue;
+      }
+      for (final path in photos.where(
+        (photo) => !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
+      )) {
+        await db.insert(
+            'pending_client_photos',
+            {
+              'franchisee_id': franchiseeId,
+              'client_remote_id': remoteId,
+              'local_path': path,
+            },
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+    }
   }
 
   static Future<void> _createProposalsTable(Database db) async {
@@ -167,16 +802,230 @@ class DbService {
     ''');
   }
 
+  Future<bool> _supportsLww(DatabaseExecutor executor, String table) async {
+    final columns = await executor.rawQuery('PRAGMA table_info($table)');
+    return columns.any((column) => column['name'] == 'pending_change_id');
+  }
+
+  Future<String> _installationWriterId(DatabaseExecutor executor) async {
+    const key = 'lww_installation_writer_id';
+    final rows = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isNotEmpty) return rows.first['value'] as String;
+    final writerId = const Uuid().v4();
+    await executor.insert(
+        'sync_state',
+        {
+          'key': key,
+          'value': writerId,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    final stored = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    return stored.first['value'] as String;
+  }
+
+  Future<void> _markLocalLwwMutation(
+    DatabaseExecutor executor,
+    String table,
+    int localId,
+  ) async {
+    if (!await _supportsLww(executor, table)) return;
+    final rows = await executor.query(
+      table,
+      where: 'local_id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return;
+    final row = rows.first;
+    final hasPending = row['pending_generation'] != null;
+    final base = BigInt.parse(
+      (hasPending
+              ? row['pending_base_generation']
+              : row['server_generation'] ?? '0')
+          .toString(),
+    );
+    final generation = hasPending
+        ? BigInt.parse(row['pending_generation'].toString())
+        : base + BigInt.one;
+    if (generation > BigInt.parse('9223372036854775807')) {
+      throw StateError('The local logical generation is exhausted.');
+    }
+    final branch =
+        hasPending ? (row['pending_branch_seq'] as int? ?? 0) + 1 : 1;
+    if (branch > 1000000) {
+      throw StateError('The local logical branch sequence is exhausted.');
+    }
+    final operationRank = _operationRankForRow(row);
+    final payloadHash = _currentLwwPayloadHash(table, row, operationRank);
+    await executor.update(
+      table,
+      {
+        'is_dirty': 1,
+        'pending_base_generation': base.toString(),
+        'pending_generation': generation.toString(),
+        'pending_branch_seq': branch,
+        'pending_writer_id': await _installationWriterId(executor),
+        'pending_change_id': const Uuid().v4(),
+        'pending_operation_rank': operationRank,
+        'pending_payload_hash': payloadHash,
+      },
+      where: 'local_id = ?',
+      whereArgs: [localId],
+    );
+  }
+
+  static const _clearPendingLww = <String, Object?>{
+    'pending_base_generation': null,
+    'pending_generation': null,
+    'pending_branch_seq': null,
+    'pending_writer_id': null,
+    'pending_change_id': null,
+    'pending_operation_rank': null,
+    'pending_payload_hash': null,
+  };
+
+  Future<bool> _supportsPendingClientPhotos(DatabaseExecutor executor) async {
+    final rows = await executor.rawQuery(
+      "SELECT name FROM sqlite_master "
+      "WHERE type = 'table' AND name = 'pending_client_photos'",
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<bool> _supportsDurablePhotoUploads(DatabaseExecutor executor) async {
+    if (!await _supportsPendingClientPhotos(executor)) return false;
+    final columns =
+        await executor.rawQuery('PRAGMA table_info(pending_client_photos)');
+    final names = columns.map((column) => column['name']).toSet();
+    return names.containsAll({
+      'upload_id',
+      'canonical_url',
+      'file_sha256',
+      'status',
+    });
+  }
+
+  Future<bool> _supportsSyncNotices(DatabaseExecutor executor) async {
+    final rows = await executor.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_notices'",
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<void> _syncPendingClientPhotos(
+    DatabaseExecutor executor,
+    int localId,
+  ) async {
+    if (!await _supportsPendingClientPhotos(executor)) return;
+    final rows = await executor.query(
+      'clients',
+      columns: ['remote_id', 'franchisee_id', 'photos', 'deleted_at'],
+      where: 'local_id = ?',
+      whereArgs: [localId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return;
+    final row = rows.single;
+    final remoteId = row['remote_id']?.toString();
+    final franchiseeId = row['franchisee_id']?.toString();
+    if (remoteId == null ||
+        remoteId.isEmpty ||
+        franchiseeId == null ||
+        franchiseeId.isEmpty) {
+      return;
+    }
+    final durableUploads = await _supportsDurablePhotoUploads(executor);
+    final pendingRows = await executor.query(
+      'pending_client_photos',
+      columns: durableUploads
+          ? ['local_path', 'canonical_url', 'status']
+          : ['local_path'],
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [franchiseeId, remoteId],
+    );
+    final currentPhotos = row['deleted_at'] == null
+        ? _decodeClientPhotos(row['photos'])
+        : const <String>[];
+    final desired = row['deleted_at'] == null
+        ? currentPhotos
+            .where(
+              (photo) =>
+                  !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
+            )
+            .toSet()
+        : const <String>{};
+    for (final pending in pendingRows) {
+      final path = pending['local_path'] as String;
+      final uploadedCanonical =
+          durableUploads ? pending['canonical_url']?.toString() : null;
+      final isUploaded = durableUploads && pending['status'] == 'uploaded';
+      // An uploaded row remains only while its canonical replacement is still
+      // selected on the client. Removing that canonical URL is an explicit
+      // local removal, including a one-transaction remove/re-add of the same
+      // local path. Delete the old operation before inserting the new path so
+      // the replacement receives a fresh upload_id and digest binding.
+      final retainsUploadedCanonical = isUploaded &&
+          uploadedCanonical != null &&
+          _isCanonicalClientPhotoPath(uploadedCanonical, remoteId: remoteId) &&
+          currentPhotos.contains(uploadedCanonical);
+      final shouldRemove =
+          isUploaded ? !retainsUploadedCanonical : !desired.contains(path);
+      if (shouldRemove) {
+        await executor.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, path],
+        );
+      }
+    }
+    for (final path in desired) {
+      await executor.insert(
+          'pending_client_photos',
+          {
+            'franchisee_id': franchiseeId,
+            'client_remote_id': remoteId,
+            'local_path': path,
+            if (durableUploads) ...{
+              'upload_id': const Uuid().v4(),
+              'status': 'pending',
+            },
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+  }
+
   // Client CRUD
   Future<int> insertClient(Client client) async {
     final db = await database;
-    return await db.insert('clients', client.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('clients', client.toMap());
+      await _syncPendingClientPhotos(transaction, id);
+      if (client.isDirty) {
+        await _markLocalLwwMutation(transaction, 'clients', id);
+      }
+      return id;
+    });
   }
 
   Future<List<Client>> getClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('clients', where: 'deleted_at IS NULL');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'deleted_at IS NULL',
+    );
 
     List<Client> clients = [];
     for (var map in maps) {
@@ -186,45 +1035,734 @@ class DbService {
     return clients;
   }
 
+  /// Returns only records owned by [franchiseeId].  Child rows are resolved
+  /// through the already tenant-filtered parent, never after a device-wide
+  /// client read.
+  Future<List<Client>> getClientsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'franchisee_id = ? AND deleted_at IS NULL',
+      whereArgs: [franchiseeId],
+    );
+    final clients = <Client>[];
+    for (final map in maps) {
+      final items = await getItemsByClientIdForFranchisee(
+        map['local_id'] as int,
+        franchiseeId,
+      );
+      clients.add(Client.fromMap(map, items: items));
+    }
+    return clients;
+  }
+
   Future<Client?> getClientByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('clients', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     final items = await getItemsByClientId(maps.first['local_id']);
     return Client.fromMap(maps.first, items: items);
   }
 
+  Future<Client?> getClientByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'remote_id = ? AND franchisee_id = ?',
+      whereArgs: [remoteId, franchiseeId],
+      limit: 1,
+    );
+    if (maps.isEmpty) return null;
+    final items = await getItemsByClientIdForFranchisee(
+      maps.first['local_id'] as int,
+      franchiseeId,
+    );
+    return Client.fromMap(maps.first, items: items);
+  }
+
+  Future<bool> ownsClient(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'clients',
+      columns: ['local_id'],
+      where: 'local_id = ? AND franchisee_id = ?',
+      whereArgs: [localId, franchiseeId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
+  }
+
   Future<int> updateClient(Client client) async {
     final db = await database;
-    return await db.update(
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'clients',
+        client.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [client.localId],
+      );
+      if (changed == 1 && client.localId != null) {
+        await _syncPendingClientPhotos(transaction, client.localId!);
+      }
+      if (changed == 1 && client.isDirty && client.localId != null) {
+        await _markLocalLwwMutation(transaction, 'clients', client.localId!);
+      }
+      return changed;
+    });
+  }
+
+  /// Applies a v1 server echo only when the exact dirty revision that was
+  /// submitted is still present. This prevents an in-flight N response from
+  /// overwriting a user edit made locally as N+1.
+  Future<int> applyClientFromServerIfUnchanged(
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    List<String>? confirmedCanonicalPhotos,
+  }) async {
+    final db = await database;
+    return db.transaction(
+        (transaction) => _applyClientFromServerIfUnchangedWithExecutor(
+              transaction,
+              client,
+              franchiseeId: franchiseeId,
+              submittedUpdatedAt: submittedUpdatedAt,
+              confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+            ));
+  }
+
+  Future<int> applyClientFromServerIfUnchangedForSession(
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required bool Function() isSessionCurrent,
+    List<String>? confirmedCanonicalPhotos,
+  }) async {
+    if (!isSessionCurrent()) {
+      throw const StaleSessionException();
+    }
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) {
+        throw const StaleSessionException();
+      }
+      final changed = await _applyClientFromServerIfUnchangedWithExecutor(
+        transaction,
+        client,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+      // The last validation occurs in the transaction callback, immediately
+      // before SQLite commits. A logout during the awaited update rolls back.
+      if (!isSessionCurrent()) {
+        throw const StaleSessionException();
+      }
+      return changed;
+    });
+  }
+
+  Future<int> _applyClientFromServerIfUnchangedWithExecutor(
+    DatabaseExecutor executor,
+    Client client, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    List<String>? confirmedCanonicalPhotos,
+  }) async {
+    final changed = await executor.update(
       'clients',
       client.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [client.localId],
+      where: '''
+          remote_id = ? AND franchisee_id = ?
+          AND updated_at = ? AND is_dirty = 1
+        ''',
+      whereArgs: [client.remoteId, franchiseeId, submittedUpdatedAt],
     );
+    if (changed == 1 && confirmedCanonicalPhotos != null) {
+      await _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+        executor,
+        franchiseeId: franchiseeId,
+        remoteId: client.remoteId,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+    }
+    return changed;
+  }
+
+  Future<List<Map<String, String>>> getPendingClientPhotos(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsPendingClientPhotos(db)) return const [];
+    final durableUploads = await _supportsDurablePhotoUploads(db);
+    final rows = await db.rawQuery(
+      '''
+      SELECT p.client_remote_id, p.local_path
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND c.deleted_at IS NULL
+        ${durableUploads ? "AND p.status = 'pending'" : ''}
+      ORDER BY c.local_id, p.rowid
+      ''',
+      [franchiseeId],
+    );
+    return [
+      for (final row in rows)
+        {
+          'client_remote_id': row['client_remote_id'] as String,
+          'local_path': row['local_path'] as String,
+        },
+    ];
+  }
+
+  /// Returns only uploads that still need an HTTP request.  The stable
+  /// [upload_id] survives app restart and an ambiguous response, while the
+  /// public legacy helper above deliberately keeps its historical shape.
+  Future<List<Map<String, String>>> getPendingClientPhotoUploads(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsPendingClientPhotos(db)) return const [];
+    if (!await _supportsDurablePhotoUploads(db)) {
+      return getPendingClientPhotos(franchiseeId);
+    }
+    final rows = await db.rawQuery(
+      '''
+      SELECT p.client_remote_id, p.local_path, p.upload_id, p.file_sha256
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND p.status = 'pending'
+        AND c.deleted_at IS NULL
+      ORDER BY c.local_id, p.rowid
+      ''',
+      [franchiseeId],
+    );
+    return [
+      for (final row in rows)
+        {
+          'client_remote_id': row['client_remote_id'] as String,
+          'local_path': row['local_path'] as String,
+          'upload_id': row['upload_id'] as String,
+          if (row['file_sha256'] != null)
+            'file_sha256': row['file_sha256'] as String,
+        },
+    ];
+  }
+
+  /// Writes the immutable content digest before the first multipart request.
+  /// A path whose bytes change must be deliberately removed and re-added,
+  /// creating a fresh upload ID rather than rebinding an existing receipt.
+  Future<void> persistPendingPhotoUploadDigest({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+  }) =>
+      _persistPendingPhotoUploadDigest(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        uploadId: uploadId,
+        localPath: localPath,
+        fileSha256: fileSha256,
+      );
+
+  Future<void> persistPendingPhotoUploadDigestForSession({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _persistPendingPhotoUploadDigest(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        uploadId: uploadId,
+        localPath: localPath,
+        fileSha256: fileSha256,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _persistPendingPhotoUploadDigest({
+    required String franchiseeId,
+    required String remoteId,
+    required String uploadId,
+    required String localPath,
+    required String fileSha256,
+    bool Function()? isSessionCurrent,
+  }) async {
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(fileSha256)) {
+      throw const FormatException('A photo digest is invalid.');
+    }
+    if (isSessionCurrent?.call() == false) {
+      throw const StaleSessionException();
+    }
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
+      if (!await _supportsDurablePhotoUploads(transaction)) {
+        throw StateError('The durable photo queue is unavailable.');
+      }
+      final rows = await transaction.query(
+        'pending_client_photos',
+        columns: ['file_sha256'],
+        where: '''
+          franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+          AND upload_id = ? AND status = 'pending'
+        ''',
+        whereArgs: [franchiseeId, remoteId, localPath, uploadId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        throw StateError('The pending photo upload is no longer current.');
+      }
+      final existing = rows.single['file_sha256']?.toString();
+      if (existing != null && existing != fileSha256) {
+        throw const FormatException(
+          'The selected photo changed. Remove and add it again before retrying.',
+        );
+      }
+      await transaction.update(
+        'pending_client_photos',
+        {'file_sha256': fileSha256},
+        where: '''
+          franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+          AND upload_id = ? AND status = 'pending'
+        ''',
+        whereArgs: [franchiseeId, remoteId, localPath, uploadId],
+      );
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
+    });
+  }
+
+  Future<Map<String, dynamic>> getSyncRecoveryState(String franchiseeId) async {
+    final db = await database;
+    final statusRows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncRecoveryStateKey(franchiseeId)],
+      limit: 1,
+    );
+    Map<String, dynamic> status = const {};
+    if (statusRows.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(statusRows.single['value'] as String);
+        if (decoded is Map) status = Map<String, dynamic>.from(decoded);
+      } on FormatException {
+        // A recovery projection must never make the APP-111 cursor unreadable.
+      }
+    }
+    final currentNotices = status['current_notices'];
+    return {
+      'last_attempt_at': status['last_attempt_at'],
+      'last_successful_at': status['last_successful_at'],
+      'notices': [
+        if (currentNotices is List)
+          for (final notice in currentNotices)
+            if (notice is Map && notice['code'] is String)
+              {
+                'code': notice['code'],
+                if (notice['collection'] is String)
+                  'collection': notice['collection'],
+              },
+      ],
+    };
+  }
+
+  Future<Map<String, int>> getSyncRecoveryCounts(String franchiseeId) async {
+    final db = await database;
+    final dirty = await db.rawQuery(
+      '''
+      SELECT COUNT(*) AS count FROM (
+        SELECT c.local_id FROM clients c
+          WHERE c.franchisee_id = ? AND c.is_dirty = 1
+        UNION ALL
+        SELECT i.local_id FROM items i JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ? AND i.is_dirty = 1
+        UNION ALL
+        SELECT r.local_id FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ? AND r.is_dirty = 1
+        UNION ALL
+        SELECT d.local_id FROM default_prices d
+          WHERE d.franchisee_id = ? AND d.is_dirty = 1
+        UNION ALL
+        SELECT w.local_id FROM warranties w JOIN clients c ON c.local_id = w.client_id
+          WHERE c.franchisee_id = ? AND w.is_dirty = 1
+        UNION ALL
+        SELECT p.local_id FROM proposals p JOIN clients c ON c.local_id = p.client_id
+          WHERE c.franchisee_id = ? AND p.is_dirty = 1
+      )
+      ''',
+      List.filled(6, franchiseeId),
+    );
+    if (!await _supportsPendingClientPhotos(db)) {
+      return {
+        'dirty_records': (dirty.single['count'] as num).toInt(),
+        'pending_photos': 0,
+      };
+    }
+    final durableUploads = await _supportsDurablePhotoUploads(db);
+    final photo = await db.rawQuery(
+      '''
+      SELECT COUNT(DISTINCT p.local_path) AS count
+      FROM pending_client_photos p
+      JOIN clients c
+        ON c.remote_id = p.client_remote_id
+       AND c.franchisee_id = p.franchisee_id
+      WHERE p.franchisee_id = ?
+        AND c.deleted_at IS NULL
+        ${durableUploads ? "AND p.status = 'pending'" : ''}
+      ''',
+      [franchiseeId],
+    );
+    return {
+      'dirty_records': (dirty.single['count'] as num).toInt(),
+      'pending_photos': (photo.single['count'] as num).toInt(),
+    };
+  }
+
+  Future<void> recordSyncAttemptForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+    DateTime? at,
+  }) =>
+      _recordSyncRecoveryForSession(
+        franchiseeId,
+        attemptedAt: at ?? DateTime.now().toUtc(),
+        notices: null,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> recordSyncRecoveryForSession(
+    String franchiseeId, {
+    DateTime? successfulAt,
+    List<Map<String, String>> notices = const [],
+    required bool Function() isSessionCurrent,
+  }) =>
+      _recordSyncRecoveryForSession(
+        franchiseeId,
+        successfulAt: successfulAt,
+        notices: notices,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  static String _syncRecoveryStateKey(String franchiseeId) =>
+      'sync_recovery:$franchiseeId';
+
+  Future<void> _recordSyncRecoveryForSession(
+    String franchiseeId, {
+    DateTime? attemptedAt,
+    DateTime? successfulAt,
+    List<Map<String, String>>? notices,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final key = _syncRecoveryStateKey(franchiseeId);
+      final rows = await transaction.query(
+        'sync_state',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [key],
+        limit: 1,
+      );
+      Map<String, dynamic> current = const {};
+      if (rows.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(rows.single['value'] as String);
+          if (decoded is Map) current = Map<String, dynamic>.from(decoded);
+        } on FormatException {
+          current = const {};
+        }
+      }
+      final next = <String, dynamic>{
+        if (current['last_attempt_at'] is String)
+          'last_attempt_at': current['last_attempt_at'],
+        if (current['last_successful_at'] is String)
+          'last_successful_at': current['last_successful_at'],
+        if (attemptedAt != null)
+          'last_attempt_at': attemptedAt.toUtc().toIso8601String(),
+        if (successfulAt != null)
+          'last_successful_at': successfulAt.toUtc().toIso8601String(),
+        // Recovery state is a current, tenant-scoped projection. Historical
+        // notices live separately for bounded diagnostics, but may never
+        // resurrect a resolved action after provider hydration.
+        if (current['current_notices'] is List && notices == null)
+          'current_notices': current['current_notices'],
+        if (notices != null)
+          'current_notices': _safeCurrentRecoveryNotices(notices),
+      };
+      await transaction.insert(
+        'sync_state',
+        {'key': key, 'value': jsonEncode(next)},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      if (notices != null &&
+          notices.isNotEmpty &&
+          await _supportsSyncNotices(transaction)) {
+        for (final notice in notices) {
+          await transaction.insert('sync_notices', {
+            'franchisee_id': franchiseeId,
+            'code': notice['code'],
+            'collection_name': notice['collection'],
+            'entity_id': null,
+            'created_at': DateTime.now().toUtc().toIso8601String(),
+          });
+        }
+        await transaction.rawDelete(
+          '''
+          DELETE FROM sync_notices
+          WHERE franchisee_id = ? AND id NOT IN (
+            SELECT id FROM sync_notices
+            WHERE franchisee_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+          )
+          ''',
+          [franchiseeId, franchiseeId],
+        );
+      }
+      if (!isSessionCurrent()) throw const StaleSessionException();
+    });
+  }
+
+  static List<Map<String, String>> _safeCurrentRecoveryNotices(
+    List<Map<String, String>> notices,
+  ) =>
+      [
+        for (final notice in notices.take(20))
+          if (notice['code'] != null &&
+              RegExp(r'^[a-z_]{1,64}$').hasMatch(notice['code']!))
+            {
+              'code': notice['code']!,
+              if (notice['collection'] != null &&
+                  RegExp(r'^[a-z_]{1,64}$').hasMatch(notice['collection']!))
+                'collection': notice['collection']!,
+            },
+      ];
+
+  Future<bool> acknowledgeClientPhotoUpload({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+  }) =>
+      _acknowledgeClientPhotoUpload(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        localPath: localPath,
+        canonicalPath: canonicalPath,
+      );
+
+  Future<bool> acknowledgeClientPhotoUploadForSession({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+    String? uploadId,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _acknowledgeClientPhotoUpload(
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        localPath: localPath,
+        canonicalPath: canonicalPath,
+        uploadId: uploadId,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<bool> _acknowledgeClientPhotoUpload({
+    required String franchiseeId,
+    required String remoteId,
+    required String localPath,
+    required String canonicalPath,
+    String? uploadId,
+    bool Function()? isSessionCurrent,
+  }) async {
+    if (isSessionCurrent?.call() == false) {
+      throw StateError('A stale session cannot acknowledge a photo upload.');
+    }
+    if (!_isCanonicalClientPhotoPath(canonicalPath, remoteId: remoteId)) {
+      throw const FormatException(
+        'Photo acknowledgement does not belong to the requested client.',
+      );
+    }
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot acknowledge a photo upload.');
+      }
+      if (!await _supportsPendingClientPhotos(transaction)) return false;
+      final durableUploads = await _supportsDurablePhotoUploads(transaction);
+      final pending = await transaction.query(
+        'pending_client_photos',
+        columns: durableUploads
+            ? ['local_path', 'upload_id', 'status']
+            : ['local_path'],
+        where: durableUploads && uploadId != null
+            ? '''
+                franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+                AND upload_id = ? AND status = 'pending'
+              '''
+            : durableUploads
+                ? '''
+                    franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+                    AND status = 'pending'
+                  '''
+                : 'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+        whereArgs: durableUploads && uploadId != null
+            ? [franchiseeId, remoteId, localPath, uploadId]
+            : [franchiseeId, remoteId, localPath],
+        limit: 1,
+      );
+      if (pending.isEmpty) return false;
+      final rows = await transaction.query(
+        'clients',
+        columns: ['local_id', 'photos', 'deleted_at'],
+        where: 'remote_id = ? AND franchisee_id = ?',
+        whereArgs: [remoteId, franchiseeId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        return false;
+      }
+      final currentPhotos = _decodeClientPhotos(rows.first['photos']);
+      if (rows.first['deleted_at'] != null ||
+          !currentPhotos.contains(localPath)) {
+        await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        return false;
+      }
+      final nextPhotos = currentPhotos
+          .map((photo) => photo == localPath ? canonicalPath : photo)
+          .toSet()
+          .toList();
+      if (durableUploads) {
+        final effectiveUploadId =
+            uploadId ?? pending.single['upload_id']?.toString();
+        if (effectiveUploadId == null ||
+            pending.single['upload_id'] != effectiveUploadId) {
+          return false;
+        }
+        final changed = await transaction.update(
+          'pending_client_photos',
+          {'canonical_url': canonicalPath, 'status': 'uploaded'},
+          where: '''
+            franchisee_id = ? AND client_remote_id = ? AND local_path = ?
+            AND upload_id = ? AND status = 'pending'
+          ''',
+          whereArgs: [franchiseeId, remoteId, localPath, effectiveUploadId],
+        );
+        if (changed != 1) return false;
+      } else {
+        final removed = await transaction.delete(
+          'pending_client_photos',
+          where:
+              'franchisee_id = ? AND client_remote_id = ? AND local_path = ?',
+          whereArgs: [franchiseeId, remoteId, localPath],
+        );
+        if (removed != 1) return false;
+      }
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot acknowledge a photo upload.');
+      }
+      await transaction.update(
+        'clients',
+        {'photos': jsonEncode(nextPhotos)},
+        where: 'local_id = ?',
+        whereArgs: [rows.first['local_id']],
+      );
+      // The acknowledgement removes a queue row and rewrites the client.
+      // Check after both writes, still inside this transaction, so logout
+      // cannot commit either half of a stale upload outcome.
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
+      return true;
+    });
   }
 
   Future<int> softDeleteClient(int localId) async {
     final db = await database;
-    return await db.update(
-      'clients',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final rows = await transaction.query(
+        'clients',
+        columns: ['remote_id', 'franchisee_id'],
+        where: 'local_id = ?',
+        whereArgs: [localId],
+        limit: 1,
+      );
+      final changed = await transaction.update(
+        'clients',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        if (rows.isNotEmpty &&
+            await _supportsPendingClientPhotos(transaction)) {
+          await transaction.delete(
+            'pending_client_photos',
+            where: 'franchisee_id = ? AND client_remote_id = ?',
+            whereArgs: [rows.single['franchisee_id'], rows.single['remote_id']],
+          );
+        }
+        await _markLocalLwwMutation(transaction, 'clients', localId);
+      }
+      return changed;
+    });
   }
 
   // Item CRUD
   Future<int> insertItem(Item item) async {
     final db = await database;
-    return await db.insert('items', item.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('items', item.toMap());
+      if (item.isDirty) await _markLocalLwwMutation(transaction, 'items', id);
+      return id;
+    });
   }
 
   Future<List<Item>> getItemsByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('items',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
 
     List<Item> items = [];
     for (var map in maps) {
@@ -234,107 +1772,502 @@ class DbService {
     return items;
   }
 
+  Future<List<Item>> getItemsByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.*
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND i.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    final items = <Item>[];
+    for (final map in maps) {
+      final rectangles = await getRectanglesByItemIdForFranchisee(
+        map['local_id'] as int,
+        franchiseeId,
+      );
+      items.add(Item.fromMap(map, rectangles: rectangles));
+    }
+    return items;
+  }
+
   Future<Item?> getItemByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(maps.first['local_id']);
     return Item.fromMap(maps.first, rectangles: rectangles);
   }
 
+  Future<Item?> getItemByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    if (maps.isEmpty) return null;
+    final rectangles = await getRectanglesByItemIdForFranchisee(
+      maps.first['local_id'] as int,
+      franchiseeId,
+    );
+    return Item.fromMap(maps.first, rectangles: rectangles);
+  }
+
   Future<Item?> getItemByLocalId(int localId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'local_id = ?', whereArgs: [localId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'local_id = ?',
+      whereArgs: [localId],
+    );
     if (maps.isEmpty) return null;
     final rectangles = await getRectanglesByItemId(localId);
     return Item.fromMap(maps.first, rectangles: rectangles);
   }
 
+  Future<Item?> getItemByLocalIdForFranchisee(
+    int localId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.local_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    if (maps.isEmpty) return null;
+    return Item.fromMap(
+      maps.first,
+      rectangles: await getRectanglesByItemIdForFranchisee(
+        localId,
+        franchiseeId,
+      ),
+    );
+  }
+
+  Future<bool> ownsItem(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT i.local_id FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.local_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    return rows.isNotEmpty;
+  }
+
   Future<int> updateItem(Item item) async {
     final db = await database;
-    return await db.update(
-      'items',
-      item.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [item.localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'items',
+        item.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [item.localId],
+      );
+      if (changed == 1 && item.isDirty && item.localId != null) {
+        await _markLocalLwwMutation(transaction, 'items', item.localId!);
+      }
+      return changed;
+    });
   }
 
   Future<int> softDeleteItem(int localId) async {
     final db = await database;
-    return await db.update(
-      'items',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'items',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ?',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'items', localId);
+      }
+      return changed;
+    });
   }
 
   // Rectangle CRUD
   Future<int> insertRectangle(Rectangle rectangle) async {
     final db = await database;
-    return await db.insert('rectangles', rectangle.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert('rectangles', rectangle.toMap());
+      if (rectangle.isDirty) {
+        await _markLocalLwwMutation(transaction, 'rectangles', id);
+      }
+      return id;
+    });
   }
 
   Future<List<Rectangle>> getRectanglesByItemId(int itemId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('rectangles',
-        where: 'item_id = ? AND deleted_at IS NULL', whereArgs: [itemId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'item_id = ? AND deleted_at IS NULL',
+      whereArgs: [itemId],
+    );
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
+  }
+
+  Future<List<Rectangle>> getRectanglesByItemIdForFranchisee(
+    int itemId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.*
+      FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.item_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND i.deleted_at IS NULL AND r.deleted_at IS NULL
+      ''',
+      [itemId, franchiseeId],
+    );
+    return [for (final map in maps) Rectangle.fromMap(map)];
   }
 
   Future<Rectangle?> getRectangleByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('rectangles', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Rectangle.fromMap(maps.first);
   }
 
+  Future<Rectangle?> getRectangleByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.* FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Rectangle.fromMap(maps.first);
+  }
+
+  Future<bool> ownsRectangle(int localId, String franchiseeId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT r.local_id FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE r.local_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [localId, franchiseeId],
+    );
+    return rows.isNotEmpty;
+  }
+
   Future<int> updateRectangle(Rectangle rectangle) async {
     final db = await database;
-    return await db.update(
-      'rectangles',
-      rectangle.toMap(),
-      where: 'local_id = ?',
-      whereArgs: [rectangle.localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'rectangles',
+        rectangle.toMap(),
+        where: 'local_id = ?',
+        whereArgs: [rectangle.localId],
+      );
+      if (changed == 1 && rectangle.isDirty && rectangle.localId != null) {
+        await _markLocalLwwMutation(
+          transaction,
+          'rectangles',
+          rectangle.localId!,
+        );
+      }
+      return changed;
+    });
   }
 
   Future<int> softDeleteRectangle(int localId) async {
     final db = await database;
-    return await db.update(
-      'rectangles',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'rectangles',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ? AND deleted_at IS NULL',
+        whereArgs: [localId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'rectangles', localId);
+      }
+      return changed;
+    });
   }
 
   // DefaultPrice CRUD
   Future<int> claimLegacyDefaultPrices(String franchiseeId) async {
+    return _claimLegacyDefaultPrices(franchiseeId);
+  }
+
+  /// Claims the one-time legacy price rows only while the caller's immutable
+  /// session remains current. A stale login or logout therefore cannot make a
+  /// tenant-visible mutation after the session boundary has moved.
+  Future<int> claimLegacyDefaultPricesForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+  }) async {
+    return _claimLegacyDefaultPrices(
+      franchiseeId,
+      isSessionCurrent: isSessionCurrent,
+    );
+  }
+
+  Future<int> _claimLegacyDefaultPrices(
+    String franchiseeId, {
+    bool Function()? isSessionCurrent,
+  }) async {
     final normalizedFranchiseeId = franchiseeId.trim();
     if (normalizedFranchiseeId.isEmpty) {
       throw ArgumentError('A franchisee is required to claim legacy prices');
     }
+    if (isSessionCurrent != null && !isSessionCurrent()) return 0;
     final db = await database;
-    return db.update(
-      'default_prices',
-      {'franchisee_id': normalizedFranchiseeId, 'is_dirty': 1},
-      where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''",
-    );
+    return db.transaction((transaction) async {
+      if (isSessionCurrent != null && !isSessionCurrent()) return 0;
+      return transaction.update(
+        'default_prices',
+        {
+          'franchisee_id': normalizedFranchiseeId,
+          'is_dirty': 1,
+        },
+        where: "franchisee_id IS NULL OR TRIM(franchisee_id) = ''",
+      );
+    });
   }
 
-  Future<int> insertDefaultPrice(DefaultPrice defaultPrice,
-      {required String franchiseeId}) async {
+  Future<void> rebasePendingLwwChangesForBootstrap(String franchiseeId) =>
+      _rebasePendingLwwChangesForBootstrap(franchiseeId);
+
+  Future<void> rebasePendingLwwChangesForBootstrapForSession(
+    String franchiseeId, {
+    required bool Function() isSessionCurrent,
+  }) =>
+      _rebasePendingLwwChangesForBootstrap(
+        franchiseeId,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _rebasePendingLwwChangesForBootstrap(
+    String franchiseeId, {
+    bool Function()? isSessionCurrent,
+  }) async {
+    void requireCurrent() {
+      if (isSessionCurrent?.call() == false) {
+        throw const StaleSessionException();
+      }
+    }
+
+    requireCurrent();
+    final db = await database;
+    await db.transaction((transaction) async {
+      requireCurrent();
+      final tableQueries = <String, String>{
+        'clients': '''
+          SELECT c.*
+          FROM clients c
+          WHERE c.franchisee_id = ?
+            AND c.is_dirty = 1
+        ''',
+        'items': '''
+          SELECT i.*
+          FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ?
+            AND i.is_dirty = 1
+        ''',
+        'rectangles': '''
+          SELECT r.*
+          FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE c.franchisee_id = ?
+            AND r.is_dirty = 1
+        ''',
+        'default_prices': '''
+          SELECT d.*
+          FROM default_prices d
+          WHERE d.franchisee_id = ?
+            AND d.is_dirty = 1
+        ''',
+      };
+      final writerId = await _installationWriterId(transaction);
+      for (final entry in tableQueries.entries) {
+        requireCurrent();
+        final rows = await transaction.rawQuery(entry.value, [franchiseeId]);
+        for (final row in rows) {
+          requireCurrent();
+          final serverGeneration = _validLogicalGeneration(
+            row['server_generation'],
+            allowZero: true,
+          );
+          if (serverGeneration == null) {
+            throw StateError(
+              'The authoritative logical generation cannot be rebased.',
+            );
+          }
+          final currentRank = _operationRankForRow(row);
+          final currentHash = _currentLwwPayloadHash(
+            entry.key,
+            row,
+            currentRank,
+          );
+          final pendingRank = row['pending_operation_rank'] as int?;
+          final pendingHash = row['pending_payload_hash']?.toString();
+          final pendingWriter = row['pending_writer_id']?.toString();
+          final pendingChange = row['pending_change_id']?.toString();
+          final pendingSnapshotMatchesCurrent = pendingRank == currentRank &&
+              pendingHash == currentHash &&
+              pendingHash != null &&
+              _payloadHashPattern.hasMatch(pendingHash);
+          final pendingGeneration = _validLogicalGeneration(
+            row['pending_generation'],
+            allowZero: false,
+          );
+          final pendingBranch = row['pending_branch_seq'] as int?;
+          final pendingIdentityIsValid = pendingWriter != null &&
+              pendingChange != null &&
+              _uuidV4.hasMatch(pendingWriter) &&
+              _uuidV4.hasMatch(pendingChange);
+
+          final exactCommitted = pendingGeneration == serverGeneration &&
+              pendingBranch == row['server_branch_seq'] &&
+              pendingRank == row['server_operation_rank'] &&
+              pendingWriter == row['server_writer_id'] &&
+              pendingChange == row['server_change_id'] &&
+              pendingHash == row['server_payload_hash'] &&
+              pendingIdentityIsValid &&
+              pendingSnapshotMatchesCurrent;
+          if (exactCommitted) {
+            await transaction.update(
+              entry.key,
+              {'is_dirty': 0, ..._clearPendingLww},
+              where: '''
+                local_id = ?
+                AND is_dirty = 1
+                AND pending_generation = ?
+                AND pending_branch_seq = ?
+                AND pending_operation_rank = ?
+                AND pending_writer_id = ?
+                AND pending_change_id = ?
+                AND pending_payload_hash = ?
+              ''',
+              whereArgs: [
+                row['local_id'],
+                pendingGeneration.toString(),
+                pendingBranch,
+                pendingRank,
+                pendingWriter,
+                pendingChange,
+                pendingHash,
+              ],
+            );
+            requireCurrent();
+            continue;
+          }
+
+          if (serverGeneration >= _maxLogicalGeneration) {
+            throw StateError(
+              'The authoritative logical generation cannot be rebased.',
+            );
+          }
+          final rebasedGeneration = serverGeneration + BigInt.one;
+          final pendingBase = _validLogicalGeneration(
+            row['pending_base_generation'],
+            allowZero: true,
+          );
+          final alreadyRebased = pendingBase == serverGeneration &&
+              pendingGeneration == rebasedGeneration &&
+              pendingBranch != null &&
+              pendingBranch >= 1 &&
+              pendingBranch <= 1000000 &&
+              pendingIdentityIsValid &&
+              pendingSnapshotMatchesCurrent;
+          if (alreadyRebased) continue;
+          await transaction.update(
+            entry.key,
+            {
+              'is_dirty': 1,
+              'pending_base_generation': serverGeneration.toString(),
+              'pending_generation': rebasedGeneration.toString(),
+              'pending_branch_seq': 1,
+              'pending_writer_id': writerId,
+              'pending_change_id': const Uuid().v4(),
+              'pending_operation_rank': currentRank,
+              'pending_payload_hash': currentHash,
+            },
+            where: 'local_id = ?',
+            whereArgs: [row['local_id']],
+          );
+          requireCurrent();
+        }
+      }
+      // Final in-transaction generation validation rolls back an entire
+      // bootstrap rebase if logout raced any awaited SQLite operation.
+      requireCurrent();
+    });
+  }
+
+  Future<int> insertDefaultPrice(
+    DefaultPrice defaultPrice, {
+    required String franchiseeId,
+  }) async {
     if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
       throw ArgumentError(
-          'Default prices must belong to the active franchisee');
+        'Default prices must belong to the active franchisee',
+      );
     }
     final db = await database;
-    return await db.insert('default_prices', defaultPrice.toMap());
+    return db.transaction((transaction) async {
+      final id = await transaction.insert(
+        'default_prices',
+        defaultPrice.toMap(),
+      );
+      if (defaultPrice.isDirty) {
+        await _markLocalLwwMutation(transaction, 'default_prices', id);
+      }
+      return id;
+    });
   }
 
   Future<List<DefaultPrice>> getDefaultPrices(String franchiseeId) async {
@@ -348,30 +2281,53 @@ class DbService {
     return List.generate(maps.length, (i) => DefaultPrice.fromMap(maps[i]));
   }
 
-  Future<int> updateDefaultPrice(DefaultPrice defaultPrice,
-      {required String franchiseeId}) async {
+  Future<int> updateDefaultPrice(
+    DefaultPrice defaultPrice, {
+    required String franchiseeId,
+  }) async {
     if (franchiseeId.isEmpty || defaultPrice.franchiseeId != franchiseeId) {
       throw ArgumentError(
-          'Default prices must belong to the active franchisee');
+        'Default prices must belong to the active franchisee',
+      );
     }
     final db = await database;
-    return await db.update(
-      'default_prices',
-      defaultPrice.toMap(),
-      where: 'local_id = ? AND franchisee_id = ?',
-      whereArgs: [defaultPrice.localId, franchiseeId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'default_prices',
+        defaultPrice.toMap(),
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [defaultPrice.localId, franchiseeId],
+      );
+      if (changed == 1 &&
+          defaultPrice.isDirty &&
+          defaultPrice.localId != null) {
+        await _markLocalLwwMutation(
+          transaction,
+          'default_prices',
+          defaultPrice.localId!,
+        );
+      }
+      return changed;
+    });
   }
 
-  Future<int> deleteDefaultPrice(int localId,
-      {required String franchiseeId}) async {
+  Future<int> deleteDefaultPrice(
+    int localId, {
+    required String franchiseeId,
+  }) async {
     final db = await database;
-    return await db.update(
-      'default_prices',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ? AND franchisee_id = ?',
-      whereArgs: [localId, franchiseeId],
-    );
+    return db.transaction((transaction) async {
+      final changed = await transaction.update(
+        'default_prices',
+        {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
+        where: 'local_id = ? AND franchisee_id = ?',
+        whereArgs: [localId, franchiseeId],
+      );
+      if (changed == 1) {
+        await _markLocalLwwMutation(transaction, 'default_prices', localId);
+      }
+      return changed;
+    });
   }
 
   // Warranty CRUD
@@ -382,17 +2338,58 @@ class DbService {
 
   Future<List<Warranty>> getWarrantiesByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('warranties',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
+  }
+
+  Future<List<Warranty>> getWarrantiesByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.*
+      FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE w.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND w.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    return [for (final map in maps) Warranty.fromMap(map)];
   }
 
   Future<Warranty?> getWarrantyByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('warranties', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Warranty.fromMap(maps.first);
+  }
+
+  Future<Warranty?> getWarrantyByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.* FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE w.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Warranty.fromMap(maps.first);
   }
 
   Future<int> updateWarranty(Warranty warranty) async {
@@ -405,14 +2402,288 @@ class DbService {
     );
   }
 
-  Future<int> softDeleteWarranty(int localId) async {
+  Future<int> hardDeleteWarranty(int localId) async {
     final db = await database;
-    return await db.update(
+    return db.delete('warranties', where: 'local_id = ?', whereArgs: [localId]);
+  }
+
+  Future<int> hardDeleteWarrantyByRemoteId(String remoteId) async {
+    final db = await database;
+    return db
+        .delete('warranties', where: 'remote_id = ?', whereArgs: [remoteId]);
+  }
+
+  Future<int> hardDeleteWarrantyByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    return db.delete(
       'warranties',
-      {'deleted_at': DateTime.now().toIso8601String(), 'is_dirty': 1},
-      where: 'local_id = ?',
-      whereArgs: [localId],
+      where: '''
+        remote_id = ?
+        AND client_id IN (
+          SELECT local_id FROM clients WHERE franchisee_id = ?
+        )
+      ''',
+      whereArgs: [remoteId, franchiseeId],
     );
+  }
+
+  Future<void> replaceWarrantyFromServer(Warranty warranty) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      await transaction.delete(
+        'warranties',
+        where: 'client_id = ? AND remote_id <> ?',
+        whereArgs: [warranty.clientId, warranty.remoteId],
+      );
+      final existing = await transaction.query(
+        'warranties',
+        columns: ['local_id'],
+        where: 'remote_id = ?',
+        whereArgs: [warranty.remoteId],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        await transaction.insert('warranties', warranty.toMap());
+      } else {
+        await transaction.update(
+          'warranties',
+          warranty.copyWith(localId: existing.first['local_id'] as int).toMap(),
+          where: 'remote_id = ?',
+          whereArgs: [warranty.remoteId],
+        );
+      }
+    });
+  }
+
+  /// Mirrors a server-authoritative warranty only within its owning tenant.
+  ///
+  /// A remote-id collision owned by another tenant is quarantined: neither
+  /// tenant's row is guessed, replaced, or deleted.  This is intentionally a
+  /// separate entry point so old, pre-session test schemas can retain their
+  /// historical helper while session-bound UI never uses the global lookup.
+  Future<bool> replaceWarrantyFromServerForSession(
+    Warranty warranty, {
+    required String franchiseeId,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final owner = await transaction.query(
+        'clients',
+        columns: ['local_id'],
+        where: 'local_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
+        whereArgs: [warranty.clientId, franchiseeId],
+        limit: 1,
+      );
+      if (owner.isEmpty) return false;
+      final foreign = await transaction.rawQuery(
+        '''
+        SELECT w.local_id
+        FROM warranties w
+        JOIN clients c ON c.local_id = w.client_id
+        WHERE w.remote_id = ? AND c.franchisee_id <> ?
+        LIMIT 1
+        ''',
+        [warranty.remoteId, franchiseeId],
+      );
+      if (foreign.isNotEmpty) return false;
+      final existing = await transaction.rawQuery(
+        '''
+        SELECT w.local_id
+        FROM warranties w
+        JOIN clients c ON c.local_id = w.client_id
+        WHERE w.remote_id = ? AND c.franchisee_id = ?
+        LIMIT 1
+        ''',
+        [warranty.remoteId, franchiseeId],
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      await transaction.delete(
+        'warranties',
+        where: 'client_id = ? AND remote_id <> ?',
+        whereArgs: [warranty.clientId, warranty.remoteId],
+      );
+      if (existing.isEmpty) {
+        await transaction.insert('warranties', warranty.toMap());
+      } else {
+        await transaction.update(
+          'warranties',
+          warranty.copyWith(localId: existing.first['local_id'] as int).toMap(),
+          where: 'local_id = ?',
+          whereArgs: [existing.first['local_id']],
+        );
+      }
+      // This runs in the transaction callback after the final write, so an
+      // invalidation during SQLite I/O rolls every mutation back.
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return true;
+    });
+  }
+
+  Future<int> applyWarrantyFromServerIfUnchanged(
+    Warranty warranty, {
+    required String submittedUpdatedAt,
+  }) async {
+    final db = await database;
+    return db.update(
+      'warranties',
+      warranty.toMap(),
+      where: 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      whereArgs: [warranty.remoteId, submittedUpdatedAt],
+    );
+  }
+
+  Future<void> applyWarrantyTombstone(
+    WarrantyDeletionTombstone tombstone,
+  ) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      await transaction.insert(
+        'warranty_deletion_tombstones',
+        tombstone.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      final hasClients = (await transaction.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'clients'",
+      ))
+          .isNotEmpty;
+      await transaction.delete(
+        'warranties',
+        where: hasClients
+            ? '''
+                remote_id = ?
+                AND client_id IN (
+                  SELECT local_id FROM clients WHERE franchisee_id = ?
+                )
+              '''
+            // Only compatibility tests/migration fixtures lack ownership
+            // metadata. The production schema always takes the scoped path.
+            : 'remote_id = ?',
+        whereArgs: hasClients
+            ? [tombstone.warrantyId, tombstone.franchiseeId]
+            : [tombstone.warrantyId],
+      );
+    });
+  }
+
+  String _warrantyTombstoneCursorKey(String franchiseeId) =>
+      'warranty_tombstone_cursor:$franchiseeId';
+
+  Future<String> getWarrantyTombstoneCursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_warrantyTombstoneCursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? '0' : rows.first['value'] as String;
+  }
+
+  Future<void> applyWarrantyTombstonesAndCursor(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+  }) =>
+      _applyWarrantyTombstonesAndCursor(
+        tombstones,
+        franchiseeId: franchiseeId,
+        cursor: cursor,
+      );
+
+  Future<void> applyWarrantyTombstonesAndCursorForSession(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _applyWarrantyTombstonesAndCursor(
+        tombstones,
+        franchiseeId: franchiseeId,
+        cursor: cursor,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _applyWarrantyTombstonesAndCursor(
+    List<WarrantyDeletionTombstone> tombstones, {
+    required String franchiseeId,
+    required String cursor,
+    bool Function()? isSessionCurrent,
+  }) async {
+    if (isSessionCurrent?.call() == false) {
+      throw StateError('A stale session cannot apply warranty tombstones.');
+    }
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
+      }
+      final hasClients = (await transaction.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'clients'",
+      ))
+          .isNotEmpty;
+      for (final tombstone in tombstones) {
+        if (isSessionCurrent?.call() == false) {
+          throw StateError('A stale session cannot apply warranty tombstones.');
+        }
+        if (tombstone.franchiseeId != franchiseeId) {
+          throw ArgumentError('A tombstone cannot cross the active franchisee');
+        }
+        await transaction.insert(
+          'warranty_deletion_tombstones',
+          tombstone.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await transaction.delete(
+          'warranties',
+          where: hasClients
+              ? '''
+                  remote_id = ?
+                  AND client_id IN (
+                    SELECT local_id FROM clients WHERE franchisee_id = ?
+                  )
+                '''
+              : 'remote_id = ?',
+          whereArgs: hasClients
+              ? [tombstone.warrantyId, franchiseeId]
+              : [tombstone.warrantyId],
+        );
+      }
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
+      }
+      await transaction.insert(
+          'sync_state',
+          {
+            'key': _warrantyTombstoneCursorKey(franchiseeId),
+            'value': cursor,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply warranty tombstones.');
+      }
+    });
+  }
+
+  Future<bool> hasWarrantyTombstone(
+    String warrantyId, {
+    required String franchiseeId,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'warranty_deletion_tombstones',
+      columns: ['warranty_id'],
+      where: 'franchisee_id = ? AND warranty_id = ?',
+      whereArgs: [franchiseeId, warrantyId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
   }
 
   // Proposal CRUD
@@ -423,17 +2694,58 @@ class DbService {
 
   Future<List<Proposal>> getProposalsByClientId(int clientId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('proposals',
-        where: 'client_id = ? AND deleted_at IS NULL', whereArgs: [clientId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'client_id = ? AND deleted_at IS NULL',
+      whereArgs: [clientId],
+    );
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
+  }
+
+  Future<List<Proposal>> getProposalsByClientIdForFranchisee(
+    int clientId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.*
+      FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE p.client_id = ? AND c.franchisee_id = ? AND c.deleted_at IS NULL
+        AND p.deleted_at IS NULL
+      ''',
+      [clientId, franchiseeId],
+    );
+    return [for (final map in maps) Proposal.fromMap(map)];
   }
 
   Future<Proposal?> getProposalByRemoteId(String remoteId) async {
     final db = await database;
-    final List<Map<String, dynamic>> maps = await db
-        .query('proposals', where: 'remote_id = ?', whereArgs: [remoteId]);
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'remote_id = ?',
+      whereArgs: [remoteId],
+    );
     if (maps.isEmpty) return null;
     return Proposal.fromMap(maps.first);
+  }
+
+  Future<Proposal?> getProposalByRemoteIdForFranchisee(
+    String remoteId,
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.* FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE p.remote_id = ? AND c.franchisee_id = ?
+      LIMIT 1
+      ''',
+      [remoteId, franchiseeId],
+    );
+    return maps.isEmpty ? null : Proposal.fromMap(maps.first);
   }
 
   Future<int> updateProposal(Proposal proposal) async {
@@ -457,25 +2769,1118 @@ class DbService {
   }
 
   // Sync helpers
+  String _syncV2CursorKey(String franchiseeId) =>
+      'sync_v2_cursor:$franchiseeId';
+  String _syncV2EnabledKey(String franchiseeId) =>
+      'sync_v2_enabled:$franchiseeId';
+  String _syncV1CursorKey(String franchiseeId) =>
+      'sync_v1_cursor:$franchiseeId';
+
+  /// V1 compatibility cursors live in APP-111's tenant-scoped sync state,
+  /// never in device-wide SharedPreferences.
+  Future<String?> getSyncV1Cursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV1CursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['value'] as String;
+  }
+
+  Future<void> setSyncV1CursorForSession(
+    String franchiseeId,
+    String cursor, {
+    required String? expectedCursor,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) {
+      throw StateError('A stale session cannot advance a sync cursor.');
+    }
+    final db = await database;
+    await db.transaction((transaction) async {
+      if (!isSessionCurrent()) {
+        throw StateError('A stale session cannot advance a sync cursor.');
+      }
+      final existing = await transaction.query(
+        'sync_state',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [_syncV1CursorKey(franchiseeId)],
+        limit: 1,
+      );
+      final current = existing.isEmpty ? null : existing.single['value'];
+      if (current != expectedCursor) {
+        throw StateError('The V1 sync cursor advanced concurrently.');
+      }
+      await transaction.insert(
+        'sync_state',
+        {'key': _syncV1CursorKey(franchiseeId), 'value': cursor},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      if (!isSessionCurrent()) {
+        throw StateError('A stale session cannot advance a sync cursor.');
+      }
+    });
+  }
+
+  Future<bool> isSyncV2Enabled(String franchiseeId) async {
+    final db = await database;
+    if (!await _supportsLww(db, 'clients')) return false;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV2EnabledKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isNotEmpty && rows.first['value'] == '1';
+  }
+
+  Future<bool> supportsSyncV2() async {
+    final db = await database;
+    return _supportsLww(db, 'clients');
+  }
+
+  Future<String> getSyncV2Cursor(String franchiseeId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [_syncV2CursorKey(franchiseeId)],
+      limit: 1,
+    );
+    return rows.isEmpty ? '0' : rows.first['value'] as String;
+  }
+
+  Map<String, dynamic> _pendingEnvelopeRecord(
+    String collection,
+    Map<String, Object?> row,
+  ) {
+    final pendingRank = row['pending_operation_rank'];
+    final currentRank = _operationRankForRow(row);
+    final pendingHash = row['pending_payload_hash']?.toString();
+    final payload = _lwwMutablePayload(collection, row, currentRank);
+    final currentHash = canonicalLwwPayloadHash(payload);
+    if ((pendingRank != 0 && pendingRank != 1) ||
+        pendingRank != currentRank ||
+        pendingHash == null ||
+        !_payloadHashPattern.hasMatch(pendingHash) ||
+        pendingHash != currentHash) {
+      throw StateError(
+        'The pending $collection payload changed without a logical mutation.',
+      );
+    }
+    final operation = pendingRank == 1 ? 'delete' : 'upsert';
+    return {
+      'remote_id': row['remote_id'],
+      'operation': operation,
+      'base_generation': row['pending_base_generation'].toString(),
+      'generation': row['pending_generation'].toString(),
+      'branch_seq': row['pending_branch_seq'],
+      'writer_id': row['pending_writer_id'],
+      'change_id': row['pending_change_id'],
+      if (row['parent_remote_id'] != null) 'parent_id': row['parent_remote_id'],
+      'payload': payload,
+      if (collection == 'rectangles' && operation == 'upsert')
+        'media': {'image_data': row['image_data']},
+      'device_timestamp': row['updated_at'],
+    };
+  }
+
+  Future<Map<String, List<Map<String, dynamic>>>> getPendingLwwChanges(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    if (!await _supportsLww(db, 'clients')) {
+      return {for (final table in _lwwTables) table: <Map<String, dynamic>>[]};
+    }
+    final clients = await db.rawQuery(
+      '''
+      SELECT c.*
+      FROM clients c
+      WHERE c.franchisee_id = ?
+        AND c.is_dirty = 1
+        AND c.pending_change_id IS NOT NULL
+      ORDER BY c.local_id
+      ''',
+      [franchiseeId],
+    );
+    final items = await db.rawQuery(
+      '''
+      SELECT i.*, c.remote_id AS parent_remote_id
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ?
+        AND i.is_dirty = 1
+        AND i.pending_change_id IS NOT NULL
+      ORDER BY i.local_id
+      ''',
+      [franchiseeId],
+    );
+    final rectangles = await db.rawQuery(
+      '''
+      SELECT r.*, i.remote_id AS parent_remote_id
+      FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ?
+        AND r.is_dirty = 1
+        AND r.pending_change_id IS NOT NULL
+      ORDER BY r.local_id
+      ''',
+      [franchiseeId],
+    );
+    final defaultPrices = await db.rawQuery(
+      '''
+      SELECT d.*
+      FROM default_prices d
+      WHERE d.franchisee_id = ?
+        AND d.is_dirty = 1
+        AND d.pending_change_id IS NOT NULL
+      ORDER BY d.local_id
+      ''',
+      [franchiseeId],
+    );
+    return {
+      'clients':
+          clients.map((row) => _pendingEnvelopeRecord('clients', row)).toList(),
+      'items':
+          items.map((row) => _pendingEnvelopeRecord('items', row)).toList(),
+      'rectangles': rectangles
+          .map((row) => _pendingEnvelopeRecord('rectangles', row))
+          .toList(),
+      'default_prices': defaultPrices
+          .map((row) => _pendingEnvelopeRecord('default_prices', row))
+          .toList(),
+    };
+  }
+
+  Map<String, Object?> _serverMetadata(Map<String, dynamic> record) => {
+        'server_generation': record['generation'].toString(),
+        'server_branch_seq': record['branch_seq'],
+        'server_operation_rank': record['operation'] == 'delete' ? 1 : 0,
+        'server_writer_id': record['writer_id'],
+        'server_change_id': record['change_id'],
+        'server_payload_hash': record['payload_hash'],
+        'server_cursor': record['row_cursor'].toString(),
+      };
+
+  Future<Map<String, Object?>?> _existingRemoteRow(
+    DatabaseExecutor executor,
+    String table,
+    String remoteId, {
+    required String franchiseeId,
+  }) async {
+    final rows = switch (table) {
+      'clients' || 'default_prices' => await executor.query(
+          table,
+          where: 'remote_id = ? AND franchisee_id = ?',
+          whereArgs: [remoteId, franchiseeId],
+          limit: 1,
+        ),
+      'items' => await executor.rawQuery(
+          '''
+          SELECT i.* FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE i.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'rectangles' => await executor.rawQuery(
+          '''
+          SELECT r.* FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE r.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'warranties' => await executor.rawQuery(
+          '''
+          SELECT w.* FROM warranties w
+          JOIN clients c ON c.local_id = w.client_id
+          WHERE w.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'proposals' => await executor.rawQuery(
+          '''
+          SELECT p.* FROM proposals p
+          JOIN clients c ON c.local_id = p.client_id
+          WHERE p.remote_id = ? AND c.franchisee_id = ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      _ => throw ArgumentError('Unknown tenant-owned table: $table'),
+    };
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  /// A server identity collision cannot be safely attached to another tenant.
+  /// The caller discards it rather than selecting, reassigning, or deleting
+  /// the foreign row. This only returns an existence bit, never foreign data.
+  Future<bool> _hasForeignRemoteRow(
+    DatabaseExecutor executor,
+    String table,
+    String remoteId, {
+    required String franchiseeId,
+  }) async {
+    final rows = switch (table) {
+      'clients' || 'default_prices' => await executor.query(
+          table,
+          columns: ['local_id'],
+          where: 'remote_id = ? AND franchisee_id <> ?',
+          whereArgs: [remoteId, franchiseeId],
+          limit: 1,
+        ),
+      'items' => await executor.rawQuery(
+          '''
+          SELECT i.local_id FROM items i
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE i.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'rectangles' => await executor.rawQuery(
+          '''
+          SELECT r.local_id FROM rectangles r
+          JOIN items i ON i.local_id = r.item_id
+          JOIN clients c ON c.local_id = i.client_id
+          WHERE r.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'warranties' => await executor.rawQuery(
+          '''
+          SELECT w.local_id FROM warranties w
+          JOIN clients c ON c.local_id = w.client_id
+          WHERE w.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      'proposals' => await executor.rawQuery(
+          '''
+          SELECT p.local_id FROM proposals p
+          JOIN clients c ON c.local_id = p.client_id
+          WHERE p.remote_id = ? AND c.franchisee_id <> ?
+          LIMIT 1
+          ''',
+          [remoteId, franchiseeId],
+        ),
+      _ => throw ArgumentError('Unknown tenant-owned table: $table'),
+    };
+    return rows.isNotEmpty;
+  }
+
+  Future<int> _ownedParentLocalId(
+    DatabaseExecutor executor,
+    String collection,
+    String parentRemoteId,
+    String franchiseeId,
+  ) async {
+    if (collection == 'items') {
+      final parents = await executor.query(
+        'clients',
+        columns: ['local_id'],
+        where: 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
+        whereArgs: [parentRemoteId, franchiseeId],
+        limit: 1,
+      );
+      if (parents.isEmpty) {
+        throw const FormatException('V2 item parent is unavailable.');
+      }
+      return parents.first['local_id'] as int;
+    }
+    final parents = await executor.rawQuery(
+      '''
+      SELECT i.local_id
+      FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE i.remote_id = ? AND c.franchisee_id = ?
+        AND i.deleted_at IS NULL AND c.deleted_at IS NULL
+      LIMIT 1
+      ''',
+      [parentRemoteId, franchiseeId],
+    );
+    if (parents.isEmpty) {
+      throw const FormatException('V2 rectangle parent is unavailable.');
+    }
+    return parents.first['local_id'] as int;
+  }
+
+  int _compareV2Tuple(
+    Map<String, dynamic> incoming,
+    Map<String, Object?> existing,
+  ) {
+    final incomingGeneration = BigInt.parse(incoming['generation'].toString());
+    final currentGeneration =
+        BigInt.tryParse(existing['server_generation']?.toString() ?? '0') ??
+            BigInt.zero;
+    if (incomingGeneration != currentGeneration) {
+      return incomingGeneration < currentGeneration ? -1 : 1;
+    }
+    final incomingBranch = incoming['branch_seq'] as int;
+    final currentBranch = existing['server_branch_seq'] as int? ?? 0;
+    if (incomingBranch != currentBranch) {
+      return incomingBranch < currentBranch ? -1 : 1;
+    }
+    final incomingRank = incoming['operation'] == 'delete' ? 1 : 0;
+    final currentRank = existing['server_operation_rank'] as int? ?? 0;
+    if (incomingRank != currentRank) {
+      return incomingRank < currentRank ? -1 : 1;
+    }
+    for (final pair in [
+      [
+        incoming['writer_id'].toString(),
+        existing['server_writer_id']?.toString() ?? '',
+      ],
+      [
+        incoming['change_id'].toString(),
+        existing['server_change_id']?.toString() ?? '',
+      ],
+    ]) {
+      if (pair[0] != pair[1]) return pair[0].compareTo(pair[1]);
+    }
+    return 0;
+  }
+
+  List<String> _serverPhotos(Map<String, dynamic> record) {
+    final media = Map<String, dynamic>.from(record['media'] as Map);
+    return List<String>.from(media['photos'] as List);
+  }
+
+  Future<List<String>> _mergePendingClientPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> serverPhotos,
+    required List<String> legacyFallback,
+  }) async {
+    final pendingPaths = <String>[];
+    if (await _supportsPendingClientPhotos(executor)) {
+      final durableUploads = await _supportsDurablePhotoUploads(executor);
+      final rows = await executor.query(
+        'pending_client_photos',
+        columns: ['local_path'],
+        where: durableUploads
+            ? "franchisee_id = ? AND client_remote_id = ? AND status = 'pending'"
+            : 'franchisee_id = ? AND client_remote_id = ?',
+        whereArgs: [franchiseeId, remoteId],
+        orderBy: 'rowid',
+      );
+      pendingPaths.addAll(rows.map((row) => row['local_path'] as String));
+    } else {
+      pendingPaths.addAll(
+        legacyFallback.where(
+          (photo) => !_isCanonicalClientPhotoPath(photo, remoteId: remoteId),
+        ),
+      );
+    }
+    return [
+      ...serverPhotos,
+      for (final photo in pendingPaths)
+        if (!serverPhotos.contains(photo)) photo,
+    ];
+  }
+
+  Future<void> _deletePendingClientPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+  }) async {
+    if (!await _supportsPendingClientPhotos(executor)) return;
+    await executor.delete(
+      'pending_client_photos',
+      where: 'franchisee_id = ? AND client_remote_id = ?',
+      whereArgs: [franchiseeId, remoteId],
+    );
+  }
+
+  Future<void> _completeAcknowledgedPhotoUploads(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> serverPhotos,
+  }) async {
+    if (!await _supportsDurablePhotoUploads(executor)) return;
+    for (final canonicalPath in serverPhotos) {
+      await executor.delete(
+        'pending_client_photos',
+        where: '''
+          franchisee_id = ? AND client_remote_id = ?
+          AND status = 'uploaded' AND canonical_url = ?
+        ''',
+        whereArgs: [franchiseeId, remoteId, canonicalPath],
+      );
+    }
+  }
+
+  Future<void> _applyV2Record(
+    DatabaseExecutor executor,
+    String collection,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+    required Map<String, String> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+  }) async {
+    final table = collection;
+    final remoteId = record['remote_id'] as String;
+    if ((collection == 'clients' || collection == 'default_prices') &&
+        record['franchisee_id'] != franchiseeId) {
+      throw const FormatException('V2 response crossed tenant ownership.');
+    }
+    final existing = await _existingRemoteRow(
+      executor,
+      table,
+      remoteId,
+      franchiseeId: franchiseeId,
+    );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          table,
+          remoteId,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
+    final submittedChangeId = submittedChangeIds[remoteId];
+    final localPendingChangeId = existing?['pending_change_id']?.toString();
+    final exactSubmitted =
+        submittedChangeId != null && submittedChangeId == localPendingChangeId;
+    const terminalStatuses = {
+      'applied',
+      'already_applied',
+      'superseded',
+      'permanently_deleted',
+    };
+    final terminal = submittedChangeId != null &&
+        terminalStatuses.contains(outcomeStatuses[submittedChangeId]);
+    final localDirty = existing?['is_dirty'] == 1;
+    final replaceMutable =
+        existing == null || !localDirty || (exactSubmitted && terminal);
+    final tupleComparison =
+        existing == null ? 1 : _compareV2Tuple(record, existing);
+    if (tupleComparison < 0) return;
+    final incomingCursor = BigInt.parse(record['row_cursor'].toString());
+    final currentRowCursor =
+        BigInt.tryParse(existing?['server_cursor']?.toString() ?? '0') ??
+            BigInt.zero;
+    if (existing != null &&
+        tupleComparison > 0 &&
+        incomingCursor < currentRowCursor) {
+      throw const FormatException(
+        'V2 response advanced a tuple behind the stored row cursor.',
+      );
+    }
+    if (existing != null && tupleComparison == 0) {
+      if (record['payload_hash'] != existing['server_payload_hash']) {
+        throw const FormatException(
+          'V2 response reused an authoritative tuple with another payload.',
+        );
+      }
+      if (incomingCursor < currentRowCursor) return;
+      final values = <String, Object?>{
+        ..._serverMetadata(record),
+        'updated_at': record['server_timestamp'],
+      };
+      if (collection == 'clients') {
+        final serverPhotos = _serverPhotos(record);
+        final localPhotos = _decodeClientPhotos(existing['photos']);
+        if (record['operation'] == 'delete' && !localDirty) {
+          await _deletePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+          );
+          values['photos'] = '[]';
+        } else {
+          values['photos'] = jsonEncode(
+            await _mergePendingClientPhotos(
+              executor,
+              franchiseeId: franchiseeId,
+              remoteId: remoteId,
+              serverPhotos: serverPhotos,
+              legacyFallback: localPhotos,
+            ),
+          );
+        }
+      } else if (collection == 'rectangles' && !localDirty) {
+        final media = Map<String, dynamic>.from(record['media'] as Map);
+        values['image_data'] = media['image_data'];
+      }
+      await executor.update(
+        table,
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+      return;
+    }
+
+    int? parentLocalId;
+    if (collection == 'items' || collection == 'rectangles') {
+      parentLocalId = await _ownedParentLocalId(
+        executor,
+        collection,
+        record['parent_id'] as String,
+        franchiseeId,
+      );
+      final existingParentColumn =
+          collection == 'items' ? 'client_id' : 'item_id';
+      if (existing != null && existing[existingParentColumn] != parentLocalId) {
+        throw const FormatException('V2 response changed an immutable parent.');
+      }
+    }
+    final metadata = _serverMetadata(record);
+    if (!replaceMutable) {
+      final dirtyMetadata = <String, Object?>{...metadata};
+      if (collection == 'clients') {
+        final serverPhotos = _serverPhotos(record);
+        final localPhotos = _decodeClientPhotos(existing['photos']);
+        dirtyMetadata['photos'] = jsonEncode(
+          await _mergePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+            serverPhotos: serverPhotos,
+            legacyFallback: localPhotos,
+          ),
+        );
+      }
+      await executor.update(
+        table,
+        dirtyMetadata,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+      return;
+    }
+
+    final payload = Map<String, dynamic>.from(
+      record['payload'] as Map<dynamic, dynamic>,
+    );
+    final values = <String, Object?>{
+      'remote_id': remoteId,
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': record['deleted_at'],
+      ...metadata,
+      ..._clearPendingLww,
+    };
+    switch (collection) {
+      case 'clients':
+        final serverPhotos = _serverPhotos(record);
+        final localPhotos = existing == null
+            ? const <String>[]
+            : _decodeClientPhotos(existing['photos']);
+        final deleting = record['operation'] == 'delete';
+        if (deleting) {
+          await _deletePendingClientPhotos(
+            executor,
+            franchiseeId: franchiseeId,
+            remoteId: remoteId,
+          );
+        }
+        values.addAll({
+          'franchisee_id': franchiseeId,
+          'name': payload['name'] ?? '',
+          'address': payload['address'],
+          'site_address': payload['site_address'],
+          'email': payload['email'],
+          'phone': payload['phone'],
+          'latitude': payload['latitude'],
+          'longitude': payload['longitude'],
+          'discounted_price': payload['discounted_price'],
+          'photos': jsonEncode(
+            deleting
+                ? const <String>[]
+                : await _mergePendingClientPhotos(
+                    executor,
+                    franchiseeId: franchiseeId,
+                    remoteId: remoteId,
+                    serverPhotos: serverPhotos,
+                    legacyFallback: localPhotos,
+                  ),
+          ),
+        });
+      case 'items':
+        values.addAll({
+          'client_id': parentLocalId,
+          'name': payload['name'] ?? '',
+          'price': payload['price'] ?? 0,
+          'enabled': payload['enabled'] == true ? 1 : 0,
+        });
+      case 'rectangles':
+        values.addAll({
+          'item_id': parentLocalId,
+          'length': payload['length'] ?? 1,
+          'width': payload['width'] ?? 1,
+          'image_data':
+              (record['media'] as Map<dynamic, dynamic>)['image_data'],
+        });
+      case 'default_prices':
+        values.addAll({
+          'franchisee_id': franchiseeId,
+          'price': payload['price'] ?? 0,
+          'enabled': payload['enabled'] == true ? 1 : 0,
+        });
+    }
+    if (existing == null) {
+      await executor.insert(table, values);
+    } else {
+      await executor.update(
+        table,
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> _applyV2Warranty(
+    DatabaseExecutor executor,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+  }) async {
+    final parentRows = await executor.query(
+      'clients',
+      columns: ['local_id'],
+      where: 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL',
+      whereArgs: [record['client_id'], franchiseeId],
+      limit: 1,
+    );
+    if (parentRows.isEmpty) {
+      throw const FormatException('V2 warranty parent is unavailable.');
+    }
+    final tombstones = await executor.query(
+      'warranty_deletion_tombstones',
+      columns: ['warranty_id'],
+      where: 'franchisee_id = ? AND warranty_id = ?',
+      whereArgs: [franchiseeId, record['remote_id']],
+      limit: 1,
+    );
+    if (tombstones.isNotEmpty) return;
+    final existing = await _existingRemoteRow(
+      executor,
+      'warranties',
+      record['remote_id'] as String,
+      franchiseeId: franchiseeId,
+    );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          'warranties',
+          record['remote_id'] as String,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
+    if (existing != null &&
+        existing['client_id'] != parentRows.first['local_id']) {
+      throw const FormatException('V2 warranty changed an immutable parent.');
+    }
+    final values = <String, Object?>{
+      'remote_id': record['remote_id'],
+      'client_id': parentRows.first['local_id'],
+      'warranty_card_number': record['warranty_card_number'],
+      'start_date': record['start_date'],
+      'duration_years': record['duration_years'],
+      'pdf_url': record['pdf_url'],
+      'server_version': record['version'],
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': null,
+    };
+    if (existing == null) {
+      await executor.insert('warranties', values);
+    } else {
+      await executor.update(
+        'warranties',
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> _applyV2Proposal(
+    DatabaseExecutor executor,
+    Map<String, dynamic> record, {
+    required String franchiseeId,
+  }) async {
+    final parentRows = await executor.query(
+      'clients',
+      columns: ['local_id'],
+      where: record['deleted_at'] == null
+          ? 'remote_id = ? AND franchisee_id = ? AND deleted_at IS NULL'
+          : 'remote_id = ? AND franchisee_id = ?',
+      whereArgs: [record['client_id'], franchiseeId],
+      limit: 1,
+    );
+    if (parentRows.isEmpty) {
+      throw const FormatException('V2 proposal parent is unavailable.');
+    }
+    final existing = await _existingRemoteRow(
+      executor,
+      'proposals',
+      record['remote_id'] as String,
+      franchiseeId: franchiseeId,
+    );
+    if (existing == null &&
+        await _hasForeignRemoteRow(
+          executor,
+          'proposals',
+          record['remote_id'] as String,
+          franchiseeId: franchiseeId,
+        )) {
+      return;
+    }
+    if (existing != null &&
+        existing['client_id'] != parentRows.first['local_id']) {
+      throw const FormatException('V2 proposal changed an immutable parent.');
+    }
+    if (existing != null &&
+        existing['is_dirty'] == 1 &&
+        existing['deleted_at'] != null &&
+        record['deleted_at'] == null) {
+      return;
+    }
+    final values = <String, Object?>{
+      'remote_id': record['remote_id'],
+      'client_id': parentRows.first['local_id'],
+      'pdf_url': record['pdf_url'],
+      'is_dirty': 0,
+      'updated_at': record['server_timestamp'],
+      'deleted_at': record['deleted_at'],
+    };
+    if (existing == null) {
+      await executor.insert('proposals', values);
+    } else {
+      await executor.update(
+        'proposals',
+        values,
+        where: 'local_id = ?',
+        whereArgs: [existing['local_id']],
+      );
+    }
+  }
+
+  Future<void> _assertSyncStateCursor(
+    DatabaseExecutor executor,
+    String key,
+    String expected,
+  ) async {
+    final rows = await executor.query(
+      'sync_state',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    final current = rows.isEmpty ? '0' : rows.first['value'] as String;
+    if (current != expected) {
+      throw StateError(
+        'A delayed sync response lost its cursor compare-and-set.',
+      );
+    }
+  }
+
+  Future<void> _casSyncStateCursor(
+    DatabaseExecutor executor,
+    String key,
+    String expected,
+    String next,
+  ) async {
+    if (BigInt.parse(next) < BigInt.parse(expected)) {
+      throw StateError('A sync response cursor cannot move backwards.');
+    }
+    if (expected == '0') {
+      await executor.insert(
+          'sync_state',
+          {
+            'key': key,
+            'value': '0',
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+    final changed = await executor.update(
+      'sync_state',
+      {'value': next},
+      where: 'key = ? AND value = ?',
+      whereArgs: [key, expected],
+    );
+    if (changed != 1) {
+      throw StateError(
+        'A delayed sync response lost its cursor compare-and-set.',
+      );
+    }
+  }
+
+  Future<void> applySyncV2Response({
+    required String franchiseeId,
+    required String requestCursor,
+    required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+  }) =>
+      _applySyncV2Response(
+        franchiseeId: franchiseeId,
+        requestCursor: requestCursor,
+        responseCursor: responseCursor,
+        requestWarrantyTombstoneCursor: requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor: warrantyTombstoneCursor,
+        records: records,
+        warranties: warranties,
+        proposals: proposals,
+        warrantyTombstones: warrantyTombstones,
+        submittedChangeIds: submittedChangeIds,
+        outcomeStatuses: outcomeStatuses,
+        activateProtocol: activateProtocol,
+      );
+
+  Future<void> applySyncV2ResponseForSession({
+    required String franchiseeId,
+    required String requestCursor,
+    required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+    required bool Function() isSessionCurrent,
+  }) =>
+      _applySyncV2Response(
+        franchiseeId: franchiseeId,
+        requestCursor: requestCursor,
+        responseCursor: responseCursor,
+        requestWarrantyTombstoneCursor: requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor: warrantyTombstoneCursor,
+        records: records,
+        warranties: warranties,
+        proposals: proposals,
+        warrantyTombstones: warrantyTombstones,
+        submittedChangeIds: submittedChangeIds,
+        outcomeStatuses: outcomeStatuses,
+        activateProtocol: activateProtocol,
+        isSessionCurrent: isSessionCurrent,
+      );
+
+  Future<void> _applySyncV2Response({
+    required String franchiseeId,
+    required String requestCursor,
+    required String responseCursor,
+    required String requestWarrantyTombstoneCursor,
+    required String warrantyTombstoneCursor,
+    required Map<String, List<Map<String, dynamic>>> records,
+    required List<Map<String, dynamic>> warranties,
+    required List<Map<String, dynamic>> proposals,
+    required List<WarrantyDeletionTombstone> warrantyTombstones,
+    required Map<String, Map<String, String>> submittedChangeIds,
+    required Map<String, String> outcomeStatuses,
+    required bool activateProtocol,
+    bool Function()? isSessionCurrent,
+  }) async {
+    void requireCurrent() {
+      if (isSessionCurrent?.call() == false) {
+        throw StateError('A stale session cannot apply a sync response.');
+      }
+    }
+
+    requireCurrent();
+    final db = await database;
+    await db.transaction((transaction) async {
+      requireCurrent();
+      await _assertSyncStateCursor(
+        transaction,
+        _syncV2CursorKey(franchiseeId),
+        requestCursor,
+      );
+      await _assertSyncStateCursor(
+        transaction,
+        _warrantyTombstoneCursorKey(franchiseeId),
+        requestWarrantyTombstoneCursor,
+      );
+      for (final tombstone in warrantyTombstones) {
+        requireCurrent();
+        if (tombstone.franchiseeId != franchiseeId) {
+          throw ArgumentError('A tombstone cannot cross the active franchisee');
+        }
+        await transaction.insert(
+          'warranty_deletion_tombstones',
+          tombstone.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await transaction.delete(
+          'warranties',
+          where: '''
+            remote_id = ?
+            AND client_id IN (
+              SELECT local_id FROM clients WHERE franchisee_id = ?
+            )
+          ''',
+          whereArgs: [tombstone.warrantyId, franchiseeId],
+        );
+      }
+      for (final collection in _lwwTables) {
+        for (final record in records[collection] ?? const []) {
+          requireCurrent();
+          await _applyV2Record(
+            transaction,
+            collection,
+            record,
+            franchiseeId: franchiseeId,
+            submittedChangeIds:
+                submittedChangeIds[collection] ?? const <String, String>{},
+            outcomeStatuses: outcomeStatuses,
+          );
+          if (collection == 'clients') {
+            await _completeAcknowledgedPhotoUploads(
+              transaction,
+              franchiseeId: franchiseeId,
+              remoteId: record['remote_id'] as String,
+              serverPhotos: _serverPhotos(record),
+            );
+          }
+        }
+      }
+      for (final warranty in warranties) {
+        requireCurrent();
+        await _applyV2Warranty(
+          transaction,
+          warranty,
+          franchiseeId: franchiseeId,
+        );
+      }
+      for (final proposal in proposals) {
+        requireCurrent();
+        await _applyV2Proposal(
+          transaction,
+          proposal,
+          franchiseeId: franchiseeId,
+        );
+      }
+      requireCurrent();
+      await _casSyncStateCursor(
+        transaction,
+        _syncV2CursorKey(franchiseeId),
+        requestCursor,
+        responseCursor,
+      );
+      requireCurrent();
+      await _casSyncStateCursor(
+        transaction,
+        _warrantyTombstoneCursorKey(franchiseeId),
+        requestWarrantyTombstoneCursor,
+        warrantyTombstoneCursor,
+      );
+      if (activateProtocol) {
+        requireCurrent();
+        await transaction.insert(
+            'sync_state',
+            {
+              'key': _syncV2EnabledKey(franchiseeId),
+              'value': '1',
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      // This is the final check inside the transaction callback. Throwing
+      // here aborts every response/cursor mutation rather than committing a
+      // result that belongs to a logged-out session.
+      requireCurrent();
+    });
+    // Check again after SQLite finishes the transaction/commit boundary. The
+    // caller then treats a concurrent sign-out as stale even if it happened
+    // while the database runtime was completing the final commit.
+    requireCurrent();
+  }
+
   Future<List<Client>> getDirtyClients() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('clients', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'clients',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Client.fromMap(maps[i]));
+  }
+
+  Future<List<Client>> getDirtyClientsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.query(
+      'clients',
+      where: 'franchisee_id = ? AND is_dirty = 1',
+      whereArgs: [franchiseeId],
+    );
+    return [for (final map in maps) Client.fromMap(map)];
   }
 
   Future<List<Item>> getDirtyItems() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('items', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'items',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Item.fromMap(maps[i]));
+  }
+
+  Future<List<Item>> getDirtyItemsForFranchisee(String franchiseeId) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT i.* FROM items i
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ? AND i.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Item.fromMap(map)];
   }
 
   Future<List<Rectangle>> getDirtyRectangles() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('rectangles', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'rectangles',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Rectangle.fromMap(maps[i]));
+  }
+
+  Future<List<Rectangle>> getDirtyRectanglesForFranchisee(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT r.* FROM rectangles r
+      JOIN items i ON i.local_id = r.item_id
+      JOIN clients c ON c.local_id = i.client_id
+      WHERE c.franchisee_id = ? AND r.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Rectangle.fromMap(map)];
   }
 
   Future<List<DefaultPrice>> getDirtyDefaultPrices(String franchiseeId) async {
@@ -489,7 +3894,9 @@ class DbService {
   }
 
   Future<DefaultPrice?> getDefaultPriceByRemoteId(
-      String remoteId, String franchiseeId) async {
+    String remoteId,
+    String franchiseeId,
+  ) async {
     final db = await database;
     final maps = await db.query(
       'default_prices',
@@ -502,32 +3909,240 @@ class DbService {
 
   Future<List<Warranty>> getDirtyWarranties() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('warranties', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'warranties',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Warranty.fromMap(maps[i]));
+  }
+
+  Future<List<Warranty>> getDirtyWarrantiesForFranchisee(
+    String franchiseeId,
+  ) async {
+    final db = await database;
+    final maps = await db.rawQuery(
+      '''
+      SELECT w.* FROM warranties w
+      JOIN clients c ON c.local_id = w.client_id
+      WHERE c.franchisee_id = ? AND w.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Warranty.fromMap(map)];
   }
 
   Future<List<Proposal>> getDirtyProposals() async {
     final db = await database;
-    final List<Map<String, dynamic>> maps =
-        await db.query('proposals', where: 'is_dirty = 1');
+    final List<Map<String, dynamic>> maps = await db.query(
+      'proposals',
+      where: 'is_dirty = 1',
+    );
     return List.generate(maps.length, (i) => Proposal.fromMap(maps[i]));
   }
 
-  Future<void> markAsSynced(String table, String remoteId,
-      {String? franchiseeId}) async {
+  Future<List<Proposal>> getDirtyProposalsForFranchisee(
+    String franchiseeId,
+  ) async {
     final db = await database;
-    final tenantScoped = table == 'default_prices';
-    if (tenantScoped && (franchiseeId == null || franchiseeId.isEmpty)) {
-      throw ArgumentError('A franchisee is required for default-price sync');
-    }
-    await db.update(
+    final maps = await db.rawQuery(
+      '''
+      SELECT p.* FROM proposals p
+      JOIN clients c ON c.local_id = p.client_id
+      WHERE c.franchisee_id = ? AND p.is_dirty = 1
+      ''',
+      [franchiseeId],
+    );
+    return [for (final map in maps) Proposal.fromMap(map)];
+  }
+
+  Future<int> markAsSynced(
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+  }) async {
+    final db = await database;
+    return _markAsSyncedWithExecutor(
+      db,
       table,
-      {'is_dirty': 0},
-      where: tenantScoped
-          ? 'remote_id = ? AND franchisee_id = ?'
-          : 'remote_id = ?',
-      whereArgs: tenantScoped ? [remoteId, franchiseeId] : [remoteId],
+      remoteId,
+      franchiseeId: franchiseeId,
+      submittedUpdatedAt: submittedUpdatedAt,
+    );
+  }
+
+  Future<int> markAsSyncedForSession(
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed = await _markAsSyncedWithExecutor(
+        transaction,
+        table,
+        remoteId,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  /// V1 has no APP-111 authoritative record echo for a successfully applied
+  /// client mutation. Its applied outcome nevertheless confirms the exact
+  /// canonical photo list sent in the V1 payload. Complete only the matching
+  /// uploaded operations in the same transaction as the client CAS; a local
+  /// N+1 edit or stale session therefore retains its queue rows for retry.
+  Future<int> markClientSyncedAndCompleteAcknowledgedPhotoUploads(
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    final db = await database;
+    return db.transaction((transaction) =>
+        _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+          transaction,
+          remoteId,
+          franchiseeId: franchiseeId,
+          submittedUpdatedAt: submittedUpdatedAt,
+          confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+        ));
+  }
+
+  Future<int> markClientSyncedAndCompleteAcknowledgedPhotoUploadsForSession(
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+    required bool Function() isSessionCurrent,
+  }) async {
+    if (!isSessionCurrent()) throw const StaleSessionException();
+    final db = await database;
+    return db.transaction((transaction) async {
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      final changed =
+          await _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+        transaction,
+        remoteId,
+        franchiseeId: franchiseeId,
+        submittedUpdatedAt: submittedUpdatedAt,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+      if (!isSessionCurrent()) throw const StaleSessionException();
+      return changed;
+    });
+  }
+
+  Future<int> _markClientSyncedAndCompleteAcknowledgedPhotoUploadsWithExecutor(
+    DatabaseExecutor executor,
+    String remoteId, {
+    required String franchiseeId,
+    required String submittedUpdatedAt,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    final changed = await _markAsSyncedWithExecutor(
+      executor,
+      'clients',
+      remoteId,
+      franchiseeId: franchiseeId,
+      submittedUpdatedAt: submittedUpdatedAt,
+    );
+    if (changed == 1) {
+      await _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+        executor,
+        franchiseeId: franchiseeId,
+        remoteId: remoteId,
+        confirmedCanonicalPhotos: confirmedCanonicalPhotos,
+      );
+    }
+    return changed;
+  }
+
+  Future<void> _completeAcknowledgedPhotoUploadsForCanonicalPhotos(
+    DatabaseExecutor executor, {
+    required String franchiseeId,
+    required String remoteId,
+    required List<String> confirmedCanonicalPhotos,
+  }) async {
+    if (!await _supportsDurablePhotoUploads(executor)) return;
+    final confirmed = {
+      for (final photo in confirmedCanonicalPhotos)
+        if (_isCanonicalClientPhotoPath(photo, remoteId: remoteId)) photo,
+    };
+    if (confirmed.isEmpty) return;
+    final placeholders = List.filled(confirmed.length, '?').join(', ');
+    await executor.delete(
+      'pending_client_photos',
+      where: '''
+        franchisee_id = ? AND client_remote_id = ?
+        AND status = 'uploaded' AND canonical_url IN ($placeholders)
+      ''',
+      whereArgs: [franchiseeId, remoteId, ...confirmed],
+    );
+  }
+
+  Future<int> _markAsSyncedWithExecutor(
+    DatabaseExecutor db,
+    String table,
+    String remoteId, {
+    String? franchiseeId,
+    required String submittedUpdatedAt,
+  }) async {
+    final tenantScoped = franchiseeId != null && franchiseeId.isNotEmpty;
+    final values = <String, Object?>{'is_dirty': 0};
+    if (await _supportsLww(db, table)) {
+      values.addAll(_clearPendingLww);
+    }
+    final where = switch (table) {
+      'clients' || 'default_prices' => tenantScoped
+          ? 'remote_id = ? AND franchisee_id = ? AND updated_at = ? AND is_dirty = 1'
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'items' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND client_id IN (
+                SELECT local_id FROM clients WHERE franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'rectangles' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND item_id IN (
+                SELECT i.local_id
+                FROM items i
+                JOIN clients c ON c.local_id = i.client_id
+                WHERE c.franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      'warranties' || 'proposals' => tenantScoped
+          ? '''
+              remote_id = ?
+              AND client_id IN (
+                SELECT local_id FROM clients WHERE franchisee_id = ?
+              )
+              AND updated_at = ? AND is_dirty = 1
+            '''
+          : 'remote_id = ? AND updated_at = ? AND is_dirty = 1',
+      _ => throw ArgumentError('Unknown sync table: $table'),
+    };
+    return db.update(
+      table,
+      values,
+      where: where,
+      whereArgs: tenantScoped
+          ? [remoteId, franchiseeId, submittedUpdatedAt]
+          : [remoteId, submittedUpdatedAt],
     );
   }
 }

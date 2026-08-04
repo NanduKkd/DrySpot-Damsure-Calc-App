@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:app_client/src/services/api_service.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -82,4 +83,90 @@ void main() {
       );
     },
   );
+
+  test('uploadClientPhoto accepts only the requested client canonical URL',
+      () async {
+    const clientId = '40000000-0000-4000-8000-000000000001';
+    const otherClientId = '40000000-0000-4000-8000-000000000002';
+    const filename = '40000000-0000-4000-8000-000000000003.jpg';
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    var requestCount = 0;
+    server.listen((request) async {
+      requestCount += 1;
+      expect(request.method, 'POST');
+      expect(request.uri.path, '/api/photos/client/$clientId');
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.created;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'url': requestCount == 1
+            ? '/api/photos/client/$otherClientId/$filename'
+            : '/api/photos/client/$clientId/$filename',
+      }));
+      await request.response.close();
+    });
+
+    final tempDir = await Directory.systemTemp.createTemp('photo-api-test');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final photo = File('${tempDir.path}/photo.jpg');
+    await photo.writeAsBytes([0xff, 0xd8, 0xff, 0xd9]);
+    final apiService = ApiService(
+      serverUrl: 'http://${server.address.host}:${server.port}',
+    );
+
+    await expectLater(
+      apiService.uploadClientPhoto(clientId, photo.path),
+      throwsA(isA<ApiException>()),
+    );
+    expect(
+      await apiService.uploadClientPhoto(clientId, photo.path),
+      '/api/photos/client/$clientId/$filename',
+    );
+  });
+
+  test('deleteWarranty sends version-bound confirmation and idempotency key',
+      () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    Map<String, dynamic>? body;
+    String? idempotencyKey;
+
+    server.listen((request) async {
+      expect(request.method, 'DELETE');
+      expect(request.uri.path, '/api/warranty/warranty-1');
+      idempotencyKey = request.headers.value('Idempotency-Key');
+      body = jsonDecode(await utf8.decoder.bind(request).join())
+          as Map<String, dynamic>;
+      request.response.statusCode = HttpStatus.ok;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'status': 'deleted',
+        'warranty_id': 'warranty-1',
+        'deletion_sequence': '42',
+        'replayed': false,
+      }));
+      await request.response.close();
+    });
+
+    final apiService = ApiService(
+      serverUrl: 'http://${server.address.host}:${server.port}',
+    );
+    final result = await apiService.deleteWarranty(
+      id: 'warranty-1',
+      warrantyCardNumber: 'CARD-1',
+      warrantyVersion: 3,
+      irreversibleConfirmation: 'PERMANENTLY DELETE WARRANTY CARD-1',
+      idempotencyKey: 'delete-request-key-001',
+    );
+
+    expect(idempotencyKey, 'delete-request-key-001');
+    expect(result['deletion_sequence'], '42');
+    expect(body, {
+      'confirmed_warranty_id': 'warranty-1',
+      'confirmed_warranty_card_number': 'CARD-1',
+      'confirmed_warranty_version': 3,
+      'irreversible_confirmation': 'PERMANENTLY DELETE WARRANTY CARD-1',
+    });
+  });
 }

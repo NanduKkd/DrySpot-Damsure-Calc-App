@@ -5,6 +5,7 @@ import 'src/services/api_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  AppConfig.validateBuildConfiguration();
 
   final apiService = ApiService();
   if (AppConfig.showBackendUrlButton) {

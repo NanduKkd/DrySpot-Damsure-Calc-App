@@ -1,18 +1,138 @@
 import { Response } from 'express';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { Warranty, Client, sequelize } from '../models';
-import { removeStoredPdf, removeUploadedFile } from '../middleware/uploadMiddleware';
+import { Warranty, Client } from '../models';
+import { removeUploadedFile } from '../middleware/uploadMiddleware';
+import {
+	createOrReplaceConfirmedWarranty,
+	deleteConfirmedWarranty,
+	triggerWarrantyFileCleanup,
+	validIdempotencyKey,
+	warrantyRequestDigest,
+	WarrantyConfirmation,
+	WarrantyLifecycleError,
+	warrantyReplacementConflict,
+} from '../services/warrantyLifecycle';
 
 const pdfUrlFor = (id: string) => `/api/warranty/${id}/download`;
+
+const confirmationFields = [
+	'confirmed_warranty_id',
+	'confirmed_warranty_card_number',
+	'confirmed_warranty_version',
+	'irreversible_confirmation',
+] as const;
+
+const confirmationFrom = (
+	body: Record<string, unknown>,
+): { present: boolean; confirmation?: WarrantyConfirmation } => {
+	const present = confirmationFields.some((field) =>
+		Object.prototype.hasOwnProperty.call(body, field),
+	);
+	if (!present) return { present: false };
+	const warrantyId = body.confirmed_warranty_id;
+	const canonicalWarrantyId = canonicalConfirmedWarrantyUuid(warrantyId);
+	const warrantyCardNumber = body.confirmed_warranty_card_number;
+	const rawWarrantyVersion = body.confirmed_warranty_version;
+	const warrantyVersion =
+		typeof rawWarrantyVersion === 'number'
+			? rawWarrantyVersion
+			: typeof rawWarrantyVersion === 'string' && /^[1-9]\d*$/.test(rawWarrantyVersion)
+				? Number(rawWarrantyVersion)
+				: Number.NaN;
+	const irreversibleConfirmation = body.irreversible_confirmation;
+	if (
+		!canonicalWarrantyId ||
+		typeof warrantyCardNumber !== 'string' ||
+		!warrantyCardNumber.trim() ||
+		!Number.isSafeInteger(warrantyVersion) ||
+		warrantyVersion < 1 ||
+		typeof irreversibleConfirmation !== 'string' ||
+		!irreversibleConfirmation.trim()
+	) {
+		return { present: true };
+	}
+	return {
+		present: true,
+		confirmation: {
+			warrantyId: canonicalWarrantyId,
+			warrantyCardNumber,
+			warrantyVersion,
+			irreversibleConfirmation,
+		},
+	};
+};
+
+function canonicalConfirmedWarrantyUuid(value: unknown) {
+	if (
+		typeof value !== 'string' ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+	) {
+		return undefined;
+	}
+	return value.toLowerCase();
+}
+
+function canonicalWarrantyUuid(value: unknown) {
+	if (
+		typeof value !== 'string' ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+	) {
+		return undefined;
+	}
+	return value.toLowerCase();
+}
+
+const invalidConfirmationResponse = (res: Response) =>
+	res.status(422).json({
+		error: 'Named, version-bound irreversible confirmation is required',
+		code: 'confirmation_invalid',
+	});
+
+const replacementConflictResponse = (res: Response) =>
+	res.status(409).json({
+		error: warrantyReplacementConflict.message,
+		code: warrantyReplacementConflict.code,
+	});
+
+const isDatabaseWarrantyConflict = (error: unknown) => {
+	if (typeof error !== 'object' || error === null) return false;
+	const candidate = error as {
+		name?: unknown;
+		original?: { code?: unknown };
+		parent?: { code?: unknown };
+	};
+	return (
+		candidate.name === 'SequelizeUniqueConstraintError' ||
+		candidate.original?.code === '23505' ||
+		candidate.parent?.code === '23505' ||
+		candidate.original?.code === 'SQLITE_CONSTRAINT' ||
+		candidate.parent?.code === 'SQLITE_CONSTRAINT'
+	);
+};
+
+const lifecycleErrorResponse = (res: Response, error: unknown) => {
+	if (!(error instanceof WarrantyLifecycleError)) return false;
+	const status =
+		error.code === 'not_found'
+			? 404
+			: error.code === 'tenant_forbidden'
+				? 403
+				: error.code === 'invariant_violation'
+					? 500
+					: error.code === 'confirmation_required'
+						? 422
+						: 409;
+	res.status(status).json({ error: error.message, code: error.code });
+	return true;
+};
 
 export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 	const { client_id, start_date, duration_years, warranty_card_number } = req.body;
 	const franchiseeId = req.user?.franchiseeId;
 	const file = req.file;
-	const replaceExisting =
-		req.body.replace_existing === 'true' || req.body.replace_existing === true;
 	const reject = async (status: number, error: string) => {
 		await removeUploadedFile(file);
 		return res.status(status).json({ error });
@@ -32,75 +152,74 @@ export const uploadWarranty = async (req: AuthRequest, res: Response) => {
 	if (typeof warranty_card_number !== 'string' || !warranty_card_number.trim()) {
 		return reject(400, 'warranty_card_number is required');
 	}
+	const confirmationEnvelope = confirmationFrom(req.body);
+	const targetWarrantyId = canonicalWarrantyUuid(req.body.replacement_warranty_id);
+	const replacementRequested =
+		confirmationEnvelope.present ||
+		Object.prototype.hasOwnProperty.call(req.body, 'replacement_warranty_id');
+	if (replacementRequested && (!confirmationEnvelope.confirmation || !targetWarrantyId)) {
+		await removeUploadedFile(file);
+		return invalidConfirmationResponse(res);
+	}
+	const confirmation = confirmationEnvelope.confirmation;
+	const idempotencyKey = req.get('Idempotency-Key');
+	if (confirmation && !validIdempotencyKey(idempotencyKey)) {
+		return reject(400, 'A valid Idempotency-Key header is required for replacement');
+	}
 
 	try {
-		const client = await Client.findByPk(client_id, {
-			paranoid: false,
-			attributes: ['id', 'franchiseeId', 'deletedAt'],
+		const pdfSha256 = createHash('sha256')
+			.update(await fs.promises.readFile(file.path))
+			.digest('hex');
+		const id = confirmation ? targetWarrantyId! : randomUUID();
+		const result = await createOrReplaceConfirmedWarranty({
+			franchiseeId,
+			idempotencyKey: validIdempotencyKey(idempotencyKey) ? idempotencyKey : undefined,
+			confirmation,
+			requestDigest: confirmation
+				? warrantyRequestDigest({
+						action: 'replace',
+						confirmation,
+						replacement: {
+							clientId: client_id,
+							startDate: parsedStartDate,
+							durationYears: parsedDurationYears,
+							warrantyCardNumber: warranty_card_number.trim(),
+							pdfSha256,
+							targetWarrantyId: id,
+						},
+					})
+				: undefined,
+			values: {
+				id,
+				clientId: client_id,
+				startDate: parsedStartDate,
+				durationYears: parsedDurationYears,
+				pdfUrl: pdfUrlFor(id),
+				pdfFileName: file.filename,
+				warrantyCardNumber: warranty_card_number.trim(),
+			},
 		});
-		if (!client) return reject(404, 'Client not found. Please sync client data and try again');
-		if (client.franchiseeId !== franchiseeId)
-			return reject(403, 'Unauthorized: Client does not belong to your franchisee');
-		if (client.deletedAt) return reject(409, 'Client is deleted and cannot receive a warranty');
-
-		const id = randomUUID();
-		const replacedPdfs: Array<{ pdfUrl: string; pdfFileName?: string }> = [];
-		const warranty = await sequelize.transaction(async (transaction) => {
-			// A warranty replaced by the pre-migration process during a rolling
-			// deploy has active_client_id = NULL. Treat every non-deleted warranty
-			// for the client as active so the new process can replace it safely.
-			const active = await Warranty.findAll({
-				where: { clientId: client.id },
-				transaction,
-				lock: transaction.LOCK.UPDATE,
-			});
-			if (active.length && !replaceExisting) {
-				const error = new Error('ACTIVE_WARRANTY_EXISTS');
-				throw error;
-			}
-			// The old process soft-deletes a migrated warranty without clearing
-			// active_client_id. Clear the marker across history before creating
-			// the replacement so either a full or partial unique index is safe.
-			await Warranty.update(
-				{ activeClientId: null },
-				{
-					where: { clientId: client.id },
-					paranoid: false,
-					transaction,
-				},
-			);
-			for (const existing of active) {
-				replacedPdfs.push({ pdfUrl: existing.pdfUrl, pdfFileName: existing.pdfFileName });
-				await existing.destroy({ transaction });
-			}
-			return Warranty.create(
-				{
-					id,
-					clientId: client.id,
-					activeClientId: client.id,
-					startDate: parsedStartDate,
-					durationYears: parsedDurationYears,
-					pdfUrl: pdfUrlFor(id),
-					pdfFileName: file.filename,
-					warrantyCardNumber: warranty_card_number.trim(),
-				},
-				{ transaction },
-			);
+		if (result.replayed) await removeUploadedFile(file);
+		triggerWarrantyFileCleanup(result.cleanupStorageKeys);
+		return res.status(201).json({
+			...result.warranty.toJSON(),
+			replayed: result.replayed,
 		});
-		await Promise.all(
-			replacedPdfs.map(({ pdfUrl, pdfFileName }) => removeStoredPdf(pdfUrl, pdfFileName)),
-		);
-		return res.status(201).json(warranty);
 	} catch (error: any) {
 		await removeUploadedFile(file);
-		if (error?.message === 'ACTIVE_WARRANTY_EXISTS') {
-			return res.status(409).json({
-				error: 'An active warranty already exists. Set replace_existing to true to replace it.',
-			});
+		if (
+			(error instanceof WarrantyLifecycleError &&
+				error.code === warrantyReplacementConflict.code) ||
+			(confirmation && isDatabaseWarrantyConflict(error))
+		) {
+			return replacementConflictResponse(res);
 		}
+		if (lifecycleErrorResponse(res, error)) return;
 		if (error?.name === 'SequelizeUniqueConstraintError') {
 			return res.status(409).json({
-				error: 'An active warranty already exists. Please confirm replacement and try again.',
+				error: 'An active warranty already exists. Refresh and confirm the exact warranty before replacing it.',
+				code: 'active_warranty_exists',
 			});
 		}
 		console.error('Warranty upload error:', error);
@@ -134,14 +253,36 @@ export const downloadWarranty = async (req: AuthRequest, res: Response) => {
 };
 
 export const deleteWarranty = async (req: AuthRequest, res: Response) => {
-	const warranty = await Warranty.findOne({
-		where: { id: req.params.id },
-		include: [{ model: Client, where: { franchiseeId: req.user?.franchiseeId } }],
-	});
-	if (!warranty) return res.status(404).json({ error: 'Warranty not found or unauthorized' });
-	const pdfUrl = warranty.pdfUrl;
-	await warranty.update({ activeClientId: null });
-	await warranty.destroy();
-	await removeStoredPdf(pdfUrl, warranty.pdfFileName);
-	return res.status(204).send();
+	const franchiseeId = req.user?.franchiseeId;
+	if (!franchiseeId) return res.status(401).json({ error: 'Unauthorized' });
+	const confirmation = confirmationFrom(req.body).confirmation;
+	if (!confirmation) return invalidConfirmationResponse(res);
+	const idempotencyKey = req.get('Idempotency-Key');
+	if (!validIdempotencyKey(idempotencyKey)) {
+		return res.status(400).json({ error: 'A valid Idempotency-Key header is required' });
+	}
+	try {
+		const requestDigest = warrantyRequestDigest({
+			action: 'delete',
+			confirmation,
+		});
+		const result = await deleteConfirmedWarranty({
+			warrantyId: req.params.id,
+			franchiseeId,
+			idempotencyKey,
+			confirmation,
+			requestDigest,
+		});
+		triggerWarrantyFileCleanup([result.storageKey]);
+		return res.status(200).json({
+			status: 'deleted',
+			warranty_id: result.tombstone.warrantyId,
+			deletion_sequence: result.tombstone.deletionSequence.toString(),
+			replayed: result.replayed,
+		});
+	} catch (error) {
+		if (lifecycleErrorResponse(res, error)) return;
+		console.error('Warranty deletion error:', error);
+		return res.status(500).json({ error: 'An error occurred during warranty deletion' });
+	}
 };

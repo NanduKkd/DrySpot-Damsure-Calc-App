@@ -10,9 +10,11 @@ const storage = multer.diskStorage({
 		}
 		cb(null, uploadPath);
 	},
-	filename: (_req, file, cb) => {
+	filename: (_req, _file, cb) => {
 		const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-		cb(null, `${uniqueSuffix}${path.extname(file.originalname)}`);
+		// All accepted uploads are PDFs. A canonical managed key keeps APP-109
+		// cleanup independent of the client's original filename/casing.
+		cb(null, `${uniqueSuffix}.pdf`);
 	},
 });
 

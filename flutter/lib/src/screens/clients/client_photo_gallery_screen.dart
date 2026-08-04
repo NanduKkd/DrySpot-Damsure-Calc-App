@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/client.dart';
 import '../../providers/client_provider.dart';
+import '../../providers/auth_provider.dart';
 import '../../services/client_photo_service.dart';
 import '../../services/api_service.dart';
 import 'client_photo_preview_screen.dart';
@@ -68,6 +69,9 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
   }
 
   Future<void> _addPhoto(ImageSource source) async {
+    final auth = Provider.of<AuthProvider?>(context, listen: false);
+    final session = auth?.sessionSnapshot;
+    if (auth != null && session == null) return;
     final client = _currentClient;
     final clientLocalId = client.localId;
     if (clientLocalId == null) {
@@ -80,16 +84,27 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
     setState(() => _isProcessing = true);
 
     try {
-      final savedPath = await widget.photoService.addPhoto(
-        clientLocalId: clientLocalId,
-        source: source,
-      );
+      final savedPath = session == null
+          ? await widget.photoService.addPhoto(
+              clientLocalId: clientLocalId,
+              source: source,
+            )
+          : await widget.photoService.addPhotoForSession(
+              clientLocalId: clientLocalId,
+              source: source,
+              session: session,
+              isSessionCurrent: () => auth!.isCurrentSession(session),
+            );
 
       if (savedPath == null) {
         return;
       }
 
-      if (!mounted) return;
+      if (!mounted ||
+          (session != null &&
+              auth?.sessionSnapshot?.generation != session.generation)) {
+        return;
+      }
 
       final provider = context.read<ClientProvider>();
       if (client.photos.contains(savedPath)) {
@@ -145,20 +160,45 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
     if (confirm != true) {
       return false;
     }
+    if (!mounted) return false;
 
     setState(() => _isProcessing = true);
 
     try {
+      final auth = Provider.of<AuthProvider?>(context, listen: false);
+      final session = auth?.sessionSnapshot;
+      if (auth != null && session == null) return false;
       final client = _currentClient;
-      if (!mounted) return false;
 
       if (widget.photoService.isRemotePhotoPath(photoPath)) {
-        await context.read<ApiService>().deleteClientPhoto(photoPath);
+        final api = context.read<ApiService>();
+        if (session == null) {
+          await api.deleteClientPhoto(photoPath);
+        } else {
+          await api.deleteClientPhotoForSession(
+            photoPath,
+            session,
+            isSessionCurrent: () =>
+                auth?.sessionSnapshot?.generation == session.generation,
+          );
+        }
       } else {
-        await widget.photoService.deletePhoto(photoPath);
+        if (session == null) {
+          await widget.photoService.deletePhoto(photoPath);
+        } else {
+          await widget.photoService.deletePhotoForSession(
+            photoPath,
+            session: session,
+            isSessionCurrent: () => auth!.isCurrentSession(session),
+          );
+        }
       }
 
-      if (!mounted) return false;
+      if (!mounted ||
+          (session != null &&
+              auth?.sessionSnapshot?.generation != session.generation)) {
+        return false;
+      }
       await context.read<ClientProvider>().updateClient(
             client.copyWith(
               photos:
@@ -203,6 +243,9 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
   Widget build(BuildContext context) {
     return Consumer<ClientProvider>(
       builder: (context, provider, _) {
+        final auth = Provider.of<AuthProvider?>(context, listen: false);
+        final session = auth?.sessionSnapshot;
+        final apiService = context.read<ApiService?>();
         final client = provider.clients.firstWhere(
           (entry) => entry.localId == widget.client.localId,
           orElse: () => widget.client,
@@ -284,11 +327,20 @@ class _ClientPhotoGalleryScreenState extends State<ClientPhotoGalleryScreen> {
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(16),
                                   child: Image(
-                                    image:
-                                        widget.photoService.buildImageProvider(
-                                      photoPath,
-                                      apiService: context.read<ApiService?>(),
-                                    ),
+                                    image: session == null || apiService == null
+                                        ? widget.photoService
+                                            .buildImageProvider(
+                                            photoPath,
+                                            apiService: apiService,
+                                          )
+                                        : widget.photoService
+                                            .buildImageProviderForSession(
+                                            photoPath,
+                                            apiService: apiService,
+                                            session: session,
+                                            isSessionCurrent: () =>
+                                                auth!.isCurrentSession(session),
+                                          ),
                                     fit: BoxFit.cover,
                                     errorBuilder: (context, error, stackTrace) {
                                       return const Center(

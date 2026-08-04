@@ -1,16 +1,44 @@
 import { Response } from 'express';
 import { Op } from 'sequelize';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { Client, Item, Rectangle, DefaultPrice, Warranty, Proposal, sequelize } from '../models';
-import { removeStoredPdf } from '../middleware/uploadMiddleware';
-import { removeStoredPhoto } from '../middleware/photoUploadMiddleware';
+import {
+	Client,
+	Item,
+	Rectangle,
+	DefaultPrice,
+	Warranty,
+	WarrantyDeletionSequence,
+	Proposal,
+	sequelize,
+} from '../models';
+import {
+	queueManagedFileCleanup,
+	reconcileManagedFileCleanupByStorageKeys,
+} from '../services/managedFileCleanup';
+import {
+	backfillLegacySoftDeletedWarranties,
+	findReservedWarrantyId,
+	tombstoneClientWarranties,
+	warrantyTombstonesAfter,
+} from '../services/warrantyLifecycle';
+import { stampLegacySyncChanges } from '../services/lwwSync';
+import { lockTenantSyncState } from '../services/tenantSyncCursor';
+import { terminalizeClientPhotoUploadReceipts } from '../services/clientPhotoUploadReceipt';
 
 class OwnershipError extends Error {}
 class ParentNotFoundError extends Error {}
-class ActiveWarrantyConflictError extends Error {}
 
-const assertOwnedClient = async (id: string, franchiseeId: string, transaction: any) => {
-	const client = await Client.findByPk(id, { paranoid: false, transaction });
+const assertOwnedClient = async (
+	id: string,
+	franchiseeId: string,
+	transaction: any,
+	lock = false,
+) => {
+	const client = await Client.findByPk(id, {
+		paranoid: false,
+		transaction,
+		...(lock ? { lock: transaction.LOCK.UPDATE } : {}),
+	});
 	if (!client) throw new ParentNotFoundError('Client not found');
 	if (client.franchiseeId !== franchiseeId)
 		throw new OwnershipError('Client belongs to another franchisee');
@@ -30,37 +58,22 @@ const assertActiveOwnedClient = async (id: string, franchiseeId: string, transac
 	return client;
 };
 
-const enforceActiveWarranty = async (
-	warrantyId: string,
-	clientId: string,
-	replaceExisting: boolean,
+const lockActiveOwnedWarrantyClient = async (
+	id: unknown,
+	franchiseeId: string,
 	transaction: any,
 ) => {
-	// During a rolling deploy, the pre-migration process can legitimately
-	// replace a warranty without populating active_client_id. Any non-deleted
-	// warranty for the client is therefore active, regardless of which
-	// application version created it.
-	const active = await Warranty.findAll({
-		where: { clientId, id: { [Op.ne]: warrantyId } },
+	if (typeof id !== 'string' || !id) return null;
+	const client = await Client.findByPk(id, {
+		paranoid: false,
 		transaction,
 		lock: transaction.LOCK.UPDATE,
 	});
-	if (active.length && !replaceExisting) throw new ActiveWarrantyConflictError();
-	// The old process soft-deletes a migrated warranty without clearing the
-	// newly added active_client_id column. Clear the marker across history so a
-	// full unique index cannot be held by that rollout-window tombstone.
-	await Warranty.update(
-		{ activeClientId: null },
-		{
-			where: { clientId },
-			paranoid: false,
-			transaction,
-		},
-	);
-	for (const current of active) {
-		await current.destroy({ transaction });
+	if (!client) return null;
+	if (client.franchiseeId !== franchiseeId) {
+		throw new OwnershipError('Client belongs to another franchisee');
 	}
-	return active;
+	return client.deletedAt ? null : client;
 };
 
 const managedPdfUrl = (resource: 'warranty' | 'proposal', id: string) =>
@@ -100,15 +113,90 @@ const canonicalPhotos = (photos: unknown, clientId: string) =>
 export const sync = async (req: AuthRequest, res: Response) => {
 	const { last_sync_time, changes } = req.body;
 	const franchiseeId = req.user?.franchiseeId;
+	const requestedTombstoneCursor = String(req.body.warranty_tombstone_cursor ?? '0');
 
 	if (!franchiseeId) {
 		return res.status(401).json({ error: 'Franchisee ID not found in token' });
+	}
+	if (process.env.SYNC_MIN_PROTOCOL_VERSION === '2') {
+		return res.status(426).json({
+			error: 'This server requires sync protocol v2.',
+			code: 'sync_protocol_upgrade_required',
+			min_protocol_version: 2,
+		});
+	}
+	if (!/^\d+$/.test(requestedTombstoneCursor)) {
+		return res
+			.status(400)
+			.json({ error: 'warranty_tombstone_cursor must be a non-negative integer' });
+	}
+	const parsedTombstoneCursor = BigInt(requestedTombstoneCursor);
+	if (parsedTombstoneCursor > 9223372036854775807n) {
+		return res.status(400).json({
+			error: 'warranty_tombstone_cursor exceeds the PostgreSQL BIGINT range',
+		});
+	}
+	const authoritativeWarrantySequence = await WarrantyDeletionSequence.findByPk(1);
+	if (parsedTombstoneCursor > BigInt(authoritativeWarrantySequence?.lastValue ?? '0')) {
+		return res.status(409).json({
+			error: 'warranty_tombstone_cursor is ahead of the authoritative sequence',
+			code: 'future_warranty_tombstone_cursor',
+		});
+	}
+	const normalizedTombstoneCursor = parsedTombstoneCursor.toString();
+	const syncTime =
+		last_sync_time === undefined || last_sync_time === null
+			? new Date(0)
+			: new Date(last_sync_time);
+	if (Number.isNaN(syncTime.getTime())) {
+		return res.status(400).json({ error: 'last_sync_time must be a valid date' });
 	}
 
 	const transaction = await sequelize.transaction();
 	let committed = false;
 	const storedPdfsToRemove: string[] = [];
+	const queuedWarrantyPdfsToRemove: string[] = [];
 	const storedPhotosToRemove: string[] = [];
+	const outcomes: Record<string, Array<Record<string, unknown>>> = {
+		clients: [],
+		items: [],
+		rectangles: [],
+		default_prices: [],
+		warranties: [],
+		proposals: [],
+	};
+	const legacySyncVisibleAppliedIds: Record<
+		'clients' | 'items' | 'rectangles' | 'default_prices' | 'warranties' | 'proposals',
+		string[]
+	> = {
+		clients: [],
+		items: [],
+		rectangles: [],
+		default_prices: [],
+		warranties: [],
+		proposals: [],
+	};
+	const recordOutcome = (
+		collection: string,
+		remoteId: unknown,
+		status: 'applied' | 'rejected' | 'tombstoned',
+		code?: string,
+	) => {
+		outcomes[collection].push({
+			remote_id: String(remoteId ?? ''),
+			status,
+			...(code ? { code } : {}),
+		});
+		if (
+			status === 'applied' &&
+			collection in legacySyncVisibleAppliedIds &&
+			typeof remoteId === 'string'
+		) {
+			legacySyncVisibleAppliedIds[
+				collection as keyof typeof legacySyncVisibleAppliedIds
+			].push(remoteId);
+		}
+	};
 	const queueStoredPdfRemoval = (pdfFileName?: string | null) => {
 		// Only a server-generated basename may select a file for deletion. Synced
 		// metadata is deliberately never permitted to populate this field.
@@ -122,6 +210,9 @@ export const sync = async (req: AuthRequest, res: Response) => {
 	};
 
 	try {
+		// Protocol v1 uses the same PostgreSQL order as v2: tenant cursor first,
+		// then entity/parent rows. This prevents v1/v2 lock inversion.
+		await lockTenantSyncState(franchiseeId, transaction);
 		const serverTime = new Date().toISOString();
 
 		// 1. Process incoming changes from client
@@ -150,22 +241,29 @@ export const sync = async (req: AuthRequest, res: Response) => {
 
 					if (deleted_at) {
 						if (existing) {
-							// A client tombstone makes its managed assets unreachable. Remove
-							// their metadata in the same transaction, then clean files only
-							// after the tombstone commits.
-							canonicalPhotoUrls(existing.photos, existing.id).forEach(
-								queueStoredPhotoRemoval,
-							);
-							const warranties = await Warranty.findAll({
-								where: { clientId: existing.id },
+							await existing.reload({
+								paranoid: false,
 								transaction,
 								lock: transaction.LOCK.UPDATE,
 							});
-							for (const warranty of warranties) {
-								queueStoredPdfRemoval(warranty.pdfFileName);
-								await warranty.update({ activeClientId: null }, { transaction });
-								await warranty.destroy({ transaction });
-							}
+							// A client tombstone makes its managed assets unreachable. Remove
+							// their metadata in the same transaction, then clean files only
+							// after the tombstone commits.
+							const removedPhotos = canonicalPhotoUrls(existing.photos, existing.id);
+							await terminalizeClientPhotoUploadReceipts({
+								franchiseeId,
+								clientId: existing.id,
+								canonicalUrls: removedPhotos,
+								transaction,
+							});
+							removedPhotos.forEach(queueStoredPhotoRemoval);
+							queuedWarrantyPdfsToRemove.push(
+								...(await tombstoneClientWarranties({
+									clientId: existing.id,
+									franchiseeId,
+									transaction,
+								})),
+							);
 							const proposals = await Proposal.findAll({
 								where: { clientId: existing.id },
 								transaction,
@@ -174,6 +272,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 							for (const proposal of proposals) {
 								queueStoredPdfRemoval(proposal.pdfFileName);
 								await proposal.destroy({ transaction });
+								legacySyncVisibleAppliedIds.proposals.push(proposal.id);
 							}
 							await existing.destroy({ transaction });
 						}
@@ -190,9 +289,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 										)
 									: [];
 						if (syncedPhotos) {
-							existingPhotos
-								.filter((photo) => !syncedPhotos.includes(photo))
-								.forEach(queueStoredPhotoRemoval);
+							const removedPhotos = existingPhotos.filter(
+								(photo) => !syncedPhotos.includes(photo),
+							);
+							if (existing && removedPhotos.length) {
+								await terminalizeClientPhotoUploadReceipts({
+									franchiseeId,
+									clientId: existing.id,
+									canonicalUrls: removedPhotos,
+									transaction,
+								});
+							}
+							removedPhotos.forEach(queueStoredPhotoRemoval);
 						}
 						const values = {
 							...rest,
@@ -207,6 +315,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						if (existing) await existing.update(values, { transaction });
 						else await Client.create(values, { transaction });
 					}
+					recordOutcome('clients', remote_id, 'applied');
 				}
 			}
 
@@ -229,6 +338,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						if (existing) await existing.update(values, { transaction });
 						else await Item.create(values, { transaction });
 					}
+					recordOutcome('items', remote_id, 'applied');
 				}
 			}
 
@@ -255,6 +365,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						if (existing) await existing.update(values, { transaction });
 						else await Rectangle.create(values, { transaction });
 					}
+					recordOutcome('rectangles', remote_id, 'applied');
 				}
 			}
 
@@ -277,10 +388,13 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						if (existing) await existing.update(values, { transaction });
 						else await DefaultPrice.create(values, { transaction });
 					}
+					recordOutcome('default_prices', remote_id, 'applied');
 				}
 			}
 
-			// Upsert Warranties
+			// Upsert live warranty metadata. Permanent deletion/replacement is
+			// online-only through the confirmed warranty API, never inferred from
+			// a generic sync mutation.
 			if (changes.warranties && changes.warranties.length > 0) {
 				for (const wData of changes.warranties) {
 					const {
@@ -299,36 +413,91 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						pdfFileName: _camelPdfFileName,
 						active_client_id: _activeClientId,
 						activeClientId: _camelActiveClientId,
-						replace_existing,
+						replace_existing: _replaceExisting,
+						version: _clientVersion,
+						server_version: _serverVersion,
+						local_id: _localId,
+						is_dirty: _isDirty,
+						updated_at: _clientUpdatedAt,
 						...rest
 					} = wData;
-					const existing = await Warranty.findByPk(remote_id, {
+					const candidate = await Warranty.findByPk(remote_id, {
 						paranoid: false,
 						transaction,
 					});
-					if (existing)
-						await assertOwnedClient(existing.clientId, franchiseeId, transaction);
+					if (
+						candidate &&
+						!(await lockActiveOwnedWarrantyClient(
+							candidate.clientId,
+							franchiseeId,
+							transaction,
+						))
+					) {
+						recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
+						continue;
+					}
+					if (
+						!(await lockActiveOwnedWarrantyClient(
+							deleted_at ? (candidate?.clientId ?? client_id) : client_id,
+							franchiseeId,
+							transaction,
+						))
+					) {
+						recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
+						continue;
+					}
+					// A confirmed delete/replacement may have committed while this
+					// mutation waited for the client lock.
+					const reservation = await findReservedWarrantyId(remote_id, transaction);
+					if (reservation) {
+						if (reservation.franchiseeId === franchiseeId) {
+							recordOutcome(
+								'warranties',
+								remote_id,
+								'tombstoned',
+								'warranty_deleted',
+							);
+						} else {
+							// Do not disclose whether the opaque UUID is reserved, deleted,
+							// or owned by another tenant.
+							recordOutcome('warranties', remote_id, 'rejected', 'warranty_conflict');
+						}
+						continue;
+					}
+					const existing = await Warranty.findByPk(remote_id, {
+						paranoid: false,
+						transaction,
+						lock: transaction.LOCK.UPDATE,
+					});
 
 					if (deleted_at) {
-						if (existing) {
-							queueStoredPdfRemoval(existing.pdfFileName);
-							await existing.update({ activeClientId: null }, { transaction });
-							await existing.destroy({ transaction });
-						}
-					} else {
-						await assertActiveOwnedClient(client_id, franchiseeId, transaction);
-						const replaced = await enforceActiveWarranty(
+						recordOutcome(
+							'warranties',
 							remote_id,
-							client_id,
-							replace_existing === true,
-							transaction,
+							'rejected',
+							'online_delete_required',
 						);
-						replaced.forEach((current) => queueStoredPdfRemoval(current.pdfFileName));
+					} else {
+						const otherActive = await Warranty.findOne({
+							where: { clientId: client_id, id: { [Op.ne]: remote_id } },
+							transaction,
+							lock: transaction.LOCK.UPDATE,
+						});
+						if (otherActive) {
+							recordOutcome(
+								'warranties',
+								remote_id,
+								'rejected',
+								'active_warranty_exists',
+							);
+							continue;
+						}
 						const values = {
 							...rest,
 							id: remote_id,
 							clientId: client_id,
 							activeClientId: client_id,
+							version: existing ? existing.version + 1 : 1,
 							startDate: start_date,
 							durationYears: duration_years,
 							warrantyCardNumber: warranty_card_number,
@@ -341,6 +510,7 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						};
 						if (existing) await existing.update(values, { transaction });
 						else await Warranty.create(values, { transaction });
+						recordOutcome('warranties', remote_id, 'applied');
 					}
 				}
 			}
@@ -386,17 +556,33 @@ export const sync = async (req: AuthRequest, res: Response) => {
 						if (existing) await existing.update(values, { transaction });
 						else await Proposal.create(values, { transaction });
 					}
+					recordOutcome('proposals', remote_id, 'applied');
 				}
 			}
 		}
 
+		for (const filename of storedPdfsToRemove) {
+			await queueManagedFileCleanup('pdf', filename, transaction);
+		}
+		for (const filename of storedPhotosToRemove) {
+			await queueManagedFileCleanup('photo', filename, transaction);
+		}
+		queuedWarrantyPdfsToRemove.push(
+			...(await backfillLegacySoftDeletedWarranties({
+				franchiseeId,
+				transaction,
+			})),
+		);
+		await stampLegacySyncChanges(franchiseeId, legacySyncVisibleAppliedIds, transaction);
 		await transaction.commit();
 		committed = true;
-		await Promise.all(storedPdfsToRemove.map((filename) => removeStoredPdf('', filename)));
-		await Promise.all(storedPhotosToRemove.map(removeStoredPhoto));
-
-		// 2. Fetch updates for the client
-		const syncTime = last_sync_time ? new Date(last_sync_time) : new Date(0);
+		void reconcileManagedFileCleanupByStorageKeys([
+			...storedPdfsToRemove,
+			...queuedWarrantyPdfsToRemove,
+			...storedPhotosToRemove,
+		]).catch((error) => {
+			console.error('Unable to run post-commit sync file reconciliation:', error);
+		});
 
 		const updatedClients = await Client.findAll({
 			where: {
@@ -460,9 +646,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			},
 			paranoid: false,
 		});
+		const warrantyTombstones = await warrantyTombstonesAfter(
+			franchiseeId,
+			normalizedTombstoneCursor,
+		);
+		const warrantyTombstoneCursor = warrantyTombstones.length
+			? warrantyTombstones.at(-1)!.deletionSequence.toString()
+			: normalizedTombstoneCursor;
 
 		return res.json({
 			server_time: serverTime,
+			warranty_tombstone_cursor: warrantyTombstoneCursor,
+			outcomes,
 			updates: {
 				clients: updatedClients.map((c) => ({
 					remote_id: c.id,
@@ -507,12 +702,18 @@ export const sync = async (req: AuthRequest, res: Response) => {
 				warranties: updatedWarranties.map((w) => ({
 					remote_id: w.id,
 					client_id: w.clientId,
+					version: w.version,
 					start_date: w.startDate.toISOString(),
 					duration_years: w.durationYears,
 					pdf_url: w.pdfUrl,
 					warranty_card_number: w.warrantyCardNumber,
 					updated_at: w.updatedAt.toISOString(),
 					deleted_at: w.deletedAt ? w.deletedAt.toISOString() : null,
+				})),
+				warranty_tombstones: warrantyTombstones.map((tombstone) => ({
+					warranty_id: tombstone.warrantyId,
+					deletion_sequence: tombstone.deletionSequence.toString(),
+					deleted_at: tombstone.deletedAt.toISOString(),
 				})),
 				proposals: updatedProposals.map((p) => ({
 					remote_id: p.id,
@@ -532,11 +733,6 @@ export const sync = async (req: AuthRequest, res: Response) => {
 			return res
 				.status(400)
 				.json({ error: 'Sync mutation references a missing parent record' });
-		}
-		if (error instanceof ActiveWarrantyConflictError) {
-			return res.status(409).json({
-				error: 'An active warranty already exists. Set replace_existing to true to replace it.',
-			});
 		}
 		console.error('Sync error:', error);
 		return res.status(500).json({ error: 'An error occurred during sync' });

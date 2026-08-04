@@ -10,13 +10,21 @@ import '../../utils/warranty_date_utils.dart';
 
 class WarrantyFormScreen extends StatefulWidget {
   final Client client;
-  final bool replaceExisting;
+  final Warranty? warrantyToReplace;
+  final String? replacementIdempotencyKey;
+  final String? replacementTargetWarrantyId;
 
   const WarrantyFormScreen({
     super.key,
     required this.client,
-    this.replaceExisting = false,
-  });
+    this.warrantyToReplace,
+    this.replacementIdempotencyKey,
+    this.replacementTargetWarrantyId,
+  }) : assert(
+          warrantyToReplace == null ||
+              (replacementIdempotencyKey != null &&
+                  replacementTargetWarrantyId != null),
+        );
 
   @override
   State<WarrantyFormScreen> createState() => _WarrantyFormScreenState();
@@ -92,10 +100,11 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
     if (!_formKey.currentState!.validate()) return;
 
     final auth = context.read<AuthProvider>();
+    final session = auth.sessionSnapshot;
     final activeFranchiseeId = auth.franchiseeId;
-    if (widget.client.franchiseeId != null &&
-        activeFranchiseeId != null &&
-        widget.client.franchiseeId != activeFranchiseeId) {
+    if (session == null ||
+        widget.client.franchiseeId != activeFranchiseeId ||
+        widget.client.franchiseeId != session.franchiseeId) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
@@ -139,16 +148,40 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         durationYears: _durationYears,
         franchiseeName: franchiseeName,
         warrantyCardNumber: _cardNumberController.text,
+        session: session,
+        isSessionCurrent: () => auth.isCurrentSession(session),
       );
 
+      if (!mounted || auth.sessionSnapshot?.generation != session.generation) {
+        return;
+      }
+
       // Upload to API
-      final response = await apiService.uploadWarranty(file.path, {
+      final replacement = widget.warrantyToReplace;
+      final fields = <String, String>{
         'client_id': widget.client.remoteId,
         'start_date': startDate.toIso8601String(),
         'duration_years': _durationYears.toString(),
         'warranty_card_number': _cardNumberController.text,
-        'replace_existing': widget.replaceExisting.toString(),
-      });
+        if (replacement != null) ...{
+          'confirmed_warranty_id': replacement.remoteId,
+          'confirmed_warranty_card_number': replacement.warrantyCardNumber,
+          'confirmed_warranty_version': replacement.version.toString(),
+          'irreversible_confirmation': irreversibleWarrantyConfirmationText(
+            replacement.warrantyCardNumber,
+          ),
+          'replacement_warranty_id': widget.replacementTargetWarrantyId!,
+        },
+      };
+      final response = await apiService.uploadWarrantyForSession(
+        file.path,
+        fields,
+        session,
+        idempotencyKey: widget.replacementIdempotencyKey,
+        isSessionCurrent: () =>
+            auth.sessionSnapshot?.generation == session.generation,
+      );
+      if (auth.sessionSnapshot?.generation != session.generation) return;
 
       // Save to local DB
       final warranty = Warranty(
@@ -158,6 +191,7 @@ class _WarrantyFormScreenState extends State<WarrantyFormScreen> {
         startDate: startDate,
         durationYears: _durationYears,
         pdfUrl: response['pdfUrl'],
+        version: response['version'] as int? ?? 1,
         isDirty: false,
         updatedAt: DateTime.parse(response['updatedAt']),
       );

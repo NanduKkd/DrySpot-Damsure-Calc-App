@@ -1,0 +1,6 @@
+#!/bin/sh
+# Install root:root 0750 at /usr/local/sbin/damsure-user-admin.  Restrict sudo to this exact path.
+set -eu
+APP_VERSION=$(/usr/bin/git -C /root/DrySpot-Damsure-Calc-App rev-parse --verify HEAD)
+export APP_VERSION
+exec /usr/bin/node /root/DrySpot-Damsure-Calc-App/backend/dist/cli/userAdmin.js "$@"

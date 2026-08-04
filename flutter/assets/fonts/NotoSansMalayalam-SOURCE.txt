@@ -1,0 +1,14 @@
+Noto Sans Malayalam Regular
+
+Source:
+https://raw.githubusercontent.com/notofonts/noto-fonts/main/hinted/ttf/NotoSansMalayalam/NotoSansMalayalam-Regular.ttf
+
+Source repository:
+https://github.com/notofonts/noto-fonts
+
+License: SIL Open Font License, Version 1.1 (see NotoSansMalayalam-LICENSE.txt)
+Copyright: 2018 The Noto Project Authors
+
+Retrieved: 2026-07-30
+SHA-256:
+42eb462ff13e820ebbeaaec4e7b426bd1de145d02cef8b634f5a3efd376b513c

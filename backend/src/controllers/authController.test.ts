@@ -23,19 +23,19 @@ describe('authController', () => {
       await User.create({
         id: 'u1-id',
         name: 'Test User',
-        email: 'test@example.com',
+        email: 'Legacy@Example.COM',
         password: hashedPassword,
         franchiseeId: franchisee.id,
       });
 
       const response = await request(app)
         .post('/api/auth/login')
-        .send({ email: 'test@example.com', password: password });
+        .send({ email: ' legacy@example.com ', password: password });
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('token');
       expect(response.body.user).toMatchObject({
-        email: 'test@example.com',
+        email: 'Legacy@Example.COM',
         franchisee_id: franchisee.id,
         franchisee_name: franchisee.name,
       });
